@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Myraa AI</string>
+    <string name="accessibility_service_label">Myraa AI Device Controller</string>
+    <string name="accessibility_service_description">Enables Myraa AI voice assistant to interact with on-screen elements, navigate apps, and execute voice commands on your behalf.</string>
+</resources>

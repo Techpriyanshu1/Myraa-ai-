@@ -1,0 +1,6 @@
+{
+  "name": "Myraa AI",
+  "description": "Voice-controlled device automation AI companion with animated avatar, Gemini intelligence, ElevenLabs voice, and full system management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
