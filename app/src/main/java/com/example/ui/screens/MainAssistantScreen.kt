@@ -41,6 +41,8 @@ import androidx.compose.material.icons.automirrored.filled.ScreenShare
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.StopScreenShare
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Mic
@@ -95,6 +97,7 @@ import com.example.ui.components.AnimatedAiOrb
 import com.example.ui.components.AuroraWaveGlow
 import com.example.ui.components.InitializationDiagnosticsDialog
 import com.example.ui.components.InstalledAppsDialog
+import com.example.ui.components.VideoAvatarPlayer
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.AuroraPink
 import com.example.ui.theme.CyanPrimary
@@ -141,6 +144,7 @@ fun MainAssistantScreen(
     }
 
     var textInput by remember { mutableStateOf("") }
+    var isAvatarMode by remember { mutableStateOf(prefs.isAvatarModeEnabled()) }
 
     val isSessionActive by coordinator.isSessionActive.collectAsState()
     val isListeningPaused by coordinator.isListeningPaused.collectAsState()
@@ -412,21 +416,100 @@ fun MainAssistantScreen(
                     }
                 }
 
-                // Clean Centered Animated AI Orb (Tap while listening to send utterance immediately)
-                Box(
+                // Sleek Orb <-> AI Avatar Switch Pill
+                Row(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .height(260.dp)
-                        .clickable(enabled = isSessionActive && companionState == CompanionState.LISTENING) {
-                            coordinator.finishUtteranceNow()
-                        },
-                    contentAlignment = Alignment.Center
+                        .clip(RoundedCornerShape(50))
+                        .background(DarkSurfaceElevated)
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    AnimatedAiOrb(
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (!isAvatarMode) CyanPrimary.copy(alpha = 0.22f) else Color.Transparent)
+                            .clickable {
+                                isAvatarMode = false
+                                prefs.setAvatarModeEnabled(false)
+                            }
+                            .padding(horizontal = 16.dp, vertical = 10.dp)
+                            .testTag("switch_to_orb_button"),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = "AI Orb Mode",
+                            tint = if (!isAvatarMode) CyanPrimary else TextSecondary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "AI Orb",
+                            color = if (!isAvatarMode) CyanPrimary else TextSecondary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (isAvatarMode) AuroraPink.copy(alpha = 0.22f) else Color.Transparent)
+                            .clickable {
+                                isAvatarMode = true
+                                prefs.setAvatarModeEnabled(true)
+                            }
+                            .padding(horizontal = 16.dp, vertical = 10.dp)
+                            .testTag("switch_to_avatar_button"),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Face,
+                            contentDescription = "AI Avatar Mode",
+                            tint = if (isAvatarMode) AuroraPink else TextSecondary,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "AI Avatar",
+                            color = if (isAvatarMode) AuroraPink else TextSecondary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                if (isAvatarMode) {
+                    VideoAvatarPlayer(
                         companionState = companionState,
-                        rmsLevel = rmsLevel,
-                        size = 230.dp
+                        isScreenShareActive = isRealScreenSharing,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = isSessionActive && companionState == CompanionState.LISTENING) {
+                                coordinator.finishUtteranceNow()
+                            }
+                            .testTag("video_avatar_player")
                     )
+                } else {
+                    // Clean Centered Animated AI Orb (Tap while listening to send utterance immediately)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(250.dp)
+                            .clickable(enabled = isSessionActive && companionState == CompanionState.LISTENING) {
+                                coordinator.finishUtteranceNow()
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AnimatedAiOrb(
+                            companionState = companionState,
+                            rmsLevel = rmsLevel,
+                            size = 220.dp
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))

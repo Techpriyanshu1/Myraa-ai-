@@ -144,6 +144,14 @@ class SecurePreferences(private val context: Context) {
         prefs.edit().putBoolean("continuous_listening", enabled).apply()
     }
 
+    fun isAvatarModeEnabled(): Boolean {
+        return prefs.getBoolean("avatar_mode_enabled", false)
+    }
+
+    fun setAvatarModeEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("avatar_mode_enabled", enabled).apply()
+    }
+
     fun getPreferredLanguage(): String {
         return prefs.getString("preferred_language", "auto") ?: "auto"
     }

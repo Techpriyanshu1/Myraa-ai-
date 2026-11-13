@@ -475,4 +475,13 @@ class MyraaCoreVerificationTest {
         assertFalse(coordinator.isSessionActive.value)
         assertFalse(coordinator.isListeningPaused.value)
     }
+
+    @Test
+    fun `SecurePreferences persists AI Avatar switch state`() {
+        assertFalse(prefs.isAvatarModeEnabled())
+        prefs.setAvatarModeEnabled(true)
+        assertTrue(prefs.isAvatarModeEnabled())
+        prefs.setAvatarModeEnabled(false)
+        assertFalse(prefs.isAvatarModeEnabled())
+    }
 }
