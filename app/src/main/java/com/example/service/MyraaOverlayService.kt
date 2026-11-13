@@ -12,22 +12,30 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
-import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.data.pref.SecurePreferences
+import com.example.voice.CompanionState
+import com.example.voice.MyraaSessionCoordinator
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.launch
 
 class MyraaOverlayService : Service() {
 
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var windowManager: WindowManager? = null
-    private var overlayView: View? = null
+    private var overlayView: FrameLayout? = null
+    private var overlayLabelView: TextView? = null
     private var initialX = 0
     private var initialY = 0
     private var initialTouchX = 0f
@@ -38,7 +46,7 @@ class MyraaOverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        val notification = buildForegroundNotification("MYRAA AI is active in background")
+        val notification = buildForegroundNotification("MYRAA AI voice is active over apps")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
@@ -89,23 +97,46 @@ class MyraaOverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = 120
+            y = 140
         }
 
-        // Programmatic sleek Aurora floating pill container
         val frame = FrameLayout(this).apply {
-            setPadding(32, 18, 32, 18)
-            background = createAuroraPillDrawable()
+            setPadding(34, 18, 34, 18)
+            background = createAuroraPillDrawable(0xFF00E5FF.toInt())
         }
 
         val textView = TextView(this).apply {
-            text = "✨ Myraa AI • Active"
+            text = "✨ MYRAA • Sun rahi hoon"
             setTextColor(0xFF00E5FF.toInt())
-            textSize = 14f
+            textSize = 13.5f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
 
         frame.addView(textView)
+        overlayLabelView = textView
+
+        val coordinator = MyraaSessionCoordinator.getInstance(applicationContext)
+        serviceScope.launch {
+            combine(
+                coordinator.isSessionActive,
+                coordinator.isListeningPaused,
+                coordinator.companionState
+            ) { active, paused, state ->
+                Triple(active, paused, state)
+            }.collect { (active, paused, state) ->
+                val (label, accentColor) = when {
+                    active && paused -> "✨ MYRAA • Paused (Tap=Open)" to 0xFFFF4D9D.toInt()
+                    active && state == CompanionState.LISTENING -> "🎙️ MYRAA • Sun rahi hoon (Tap=Send)" to 0xFF00E5FF.toInt()
+                    active && state == CompanionState.THINKING -> "⚡ MYRAA • Soch rahi hoon..." to 0xFFB388FF.toInt()
+                    active && state == CompanionState.TALKING -> "🔊 MYRAA • Bol rahi hoon" to 0xFF00E676.toInt()
+                    active && state == CompanionState.ERROR -> "⚠️ MYRAA • Tap to open" to 0xFFFF5252.toInt()
+                    else -> "✨ MYRAA AI • Active" to 0xFF00E5FF.toInt()
+                }
+                overlayLabelView?.text = label
+                overlayLabelView?.setTextColor(accentColor)
+                overlayView?.background = createAuroraPillDrawable(accentColor)
+            }
+        }
 
         // Drag & click listener
         frame.setOnTouchListener { view, event ->
@@ -126,14 +157,20 @@ class MyraaOverlayService : Service() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
-                    val diffX = Math.abs(event.rawX - initialTouchX)
-                    val diffY = Math.abs(event.rawY - initialTouchY)
-                    if (diffX < 10 && diffY < 10) {
-                        // Click: open MainActivity
-                        val launchIntent = Intent(this, MainActivity::class.java).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    val diffX = kotlin.math.abs(event.rawX - initialTouchX)
+                    val diffY = kotlin.math.abs(event.rawY - initialTouchY)
+                    if (diffX < 12 && diffY < 12) {
+                        if (coordinator.isSessionActive.value &&
+                            !coordinator.isListeningPaused.value &&
+                            coordinator.companionState.value == CompanionState.LISTENING
+                        ) {
+                            coordinator.finishUtteranceNow()
+                        } else {
+                            val launchIntent = Intent(this, MainActivity::class.java).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                            }
+                            startActivity(launchIntent)
                         }
-                        startActivity(launchIntent)
                     }
                     true
                 }
@@ -149,15 +186,15 @@ class MyraaOverlayService : Service() {
         }
     }
 
-    private fun createAuroraPillDrawable(): android.graphics.drawable.GradientDrawable {
+    private fun createAuroraPillDrawable(strokeColor: Int): android.graphics.drawable.GradientDrawable {
         return android.graphics.drawable.GradientDrawable().apply {
             shape = android.graphics.drawable.GradientDrawable.RECTANGLE
             cornerRadius = 999f
             colors = intArrayOf(
-                0xE60D1117.toInt(), // Dark Cyber base
+                0xE60D1117.toInt(),
                 0xE6161F30.toInt()
             )
-            setStroke(3, 0xFF00E5FF.toInt())
+            setStroke(3, strokeColor)
         }
     }
 
@@ -166,6 +203,7 @@ class MyraaOverlayService : Service() {
             if (overlayView != null && windowManager != null) {
                 windowManager?.removeView(overlayView)
                 overlayView = null
+                overlayLabelView = null
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -208,6 +246,7 @@ class MyraaOverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        serviceScope.cancel()
         removeFloatingAurora()
     }
 
@@ -231,10 +270,12 @@ class MyraaOverlayService : Service() {
 
         fun stop(context: Context) {
             isRunning = false
-            val intent = Intent(context, MyraaOverlayService::class.java).apply {
-                action = ACTION_STOP_OVERLAY
-            }
-            context.stopService(intent)
+            try {
+                val intent = Intent(context, MyraaOverlayService::class.java).apply {
+                    action = ACTION_STOP_OVERLAY
+                }
+                context.stopService(intent)
+            } catch (_: Exception) {}
         }
     }
 }

@@ -2,11 +2,14 @@ package com.example.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Context
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.util.DisplayMetrics
 import android.util.Log
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,13 +60,13 @@ class MyraaAccessibilityService : AccessibilityService() {
     }
 
     // Physical tap injection at screen coordinates (x, y)
-    fun dispatchClickAt(x: Float, y: Float, onComplete: () -> Unit = {}) {
+    fun dispatchClickAt(x: Float, y: Float, onComplete: () -> Unit = {}): Boolean {
         val path = Path().apply {
             moveTo(x, y)
         }
         val stroke = GestureDescription.StrokeDescription(path, 0, 50)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, object : GestureResultCallback() {
+        return dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 super.onCompleted(gestureDescription)
                 onComplete()
@@ -75,15 +78,22 @@ class MyraaAccessibilityService : AccessibilityService() {
         }, null)
     }
 
-    // Physical swipe injection (e.g. scroll up/down or swipe left/right)
-    fun dispatchSwipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 300L, onComplete: () -> Unit = {}) {
+    // Physical swipe injection (e.g. scroll up/down, next YouTube Short / Reel, or swipe left/right)
+    fun dispatchSwipe(
+        startX: Float,
+        startY: Float,
+        endX: Float,
+        endY: Float,
+        durationMs: Long = 260L,
+        onComplete: () -> Unit = {}
+    ): Boolean {
         val path = Path().apply {
             moveTo(startX, startY)
             lineTo(endX, endY)
         }
         val stroke = GestureDescription.StrokeDescription(path, 0, durationMs)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, object : GestureResultCallback() {
+        return dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 super.onCompleted(gestureDescription)
                 onComplete()
@@ -93,6 +103,38 @@ class MyraaAccessibilityService : AccessibilityService() {
                 onComplete()
             }
         }, null)
+    }
+
+    /**
+     * Smart screen scroll that works reliably across YouTube Shorts, Reels, feeds, and lists:
+     * dispatches a real physical vertical swipe gesture scaled to device dimensions, with node scroll fallback.
+     */
+    fun scrollSmart(forward: Boolean): Boolean {
+        val (w, h) = getScreenDimensions()
+        val cx = w * 0.5f
+        val startY = if (forward) h * 0.78f else h * 0.25f
+        val endY = if (forward) h * 0.22f else h * 0.78f
+
+        val swiped = dispatchSwipe(cx, startY, cx, endY, durationMs = 240L)
+        if (swiped) return true
+        return scroll(forward)
+    }
+
+    private fun getScreenDimensions(): Pair<Float, Float> {
+        return try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bounds = wm.currentWindowMetrics.bounds
+                Pair(bounds.width().coerceAtLeast(720).toFloat(), bounds.height().coerceAtLeast(1280).toFloat())
+            } else {
+                val metrics = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                wm.defaultDisplay.getRealMetrics(metrics)
+                Pair(metrics.widthPixels.coerceAtLeast(720).toFloat(), metrics.heightPixels.coerceAtLeast(1280).toFloat())
+            }
+        } catch (_: Exception) {
+            Pair(1080f, 2200f)
+        }
     }
 
     // AI Virtual Keyboard text injection into focused field
@@ -125,6 +167,22 @@ class MyraaAccessibilityService : AccessibilityService() {
         val elements = mutableListOf<ScreenUiElement>()
         collectNodes(root, elements)
         return elements
+    }
+
+    fun getCompactScreenContextSummary(): String {
+        val activePkg = rootInActiveWindow?.packageName?.toString().orEmpty()
+        val labels = getVisibleScreenElements()
+            .asSequence()
+            .map { it.text.trim() }
+            .filter { it.isNotBlank() && it.length <= 60 }
+            .distinct()
+            .take(18)
+            .toList()
+        if (activePkg.isBlank() && labels.isEmpty()) return ""
+        return buildString {
+            if (activePkg.isNotBlank()) append("Active app package: $activePkg. ")
+            if (labels.isNotEmpty()) append("Visible UI elements: ${labels.joinToString(" | ")}")
+        }.trim()
     }
 
     private fun collectNodes(node: AccessibilityNodeInfo?, list: MutableList<ScreenUiElement>) {

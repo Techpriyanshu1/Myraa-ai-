@@ -140,6 +140,7 @@ class DeviceActionExecutor(private val context: Context) {
             "VOLUME" -> adjustVolume(command.target)
             "ACCESSIBILITY" -> performAccessibilityAction(command.target)
             "WEB_SEARCH" -> performWebSearch(command.target)
+            "YOUTUBE_SEARCH" -> searchYouTube(command.target)
             "DIAL" -> dialPhoneNumber(command.target)
             "PAUSE_LISTENING" -> ExecutionResult(true, "PAUSE_LISTENING", "voice", "Voice listening paused by user")
             "RESUME_LISTENING" -> ExecutionResult(true, "RESUME_LISTENING", "voice", "Voice listening resumed by user")
@@ -174,7 +175,7 @@ class DeviceActionExecutor(private val context: Context) {
 
     private fun resolveAgentName(actionType: String): String = when (actionType) {
         "OPEN_APP", "LIST_APPS" -> "App Launcher Agent"
-        "OPEN_CAMERA", "OPEN_CALCULATOR", "OPEN_CLOCK", "OPEN_SETTINGS", "SETTINGS", "FLASHLIGHT", "VOLUME", "DIAL", "WEB_SEARCH" -> "Device Action Agent"
+        "OPEN_CAMERA", "OPEN_CALCULATOR", "OPEN_CLOCK", "OPEN_SETTINGS", "SETTINGS", "FLASHLIGHT", "VOLUME", "DIAL", "WEB_SEARCH", "YOUTUBE_SEARCH" -> "Device Action Agent"
         "ACCESSIBILITY", "SCREEN_CLICK", "SCREEN_TYPE" -> "Accessibility Agent"
         "PAUSE_LISTENING", "RESUME_LISTENING", "STOP_AI" -> "Voice Recognition Agent"
         "SHOW_HISTORY" -> "Activity Logger Agent"
@@ -616,8 +617,8 @@ class DeviceActionExecutor(private val context: Context) {
             "notifications" -> service.openNotifications()
             "quick_settings" -> service.openQuickSettings()
             "lock" -> service.lockScreen()
-            "scroll_down" -> service.scroll(forward = true)
-            "scroll_up" -> service.scroll(forward = false)
+            "scroll_down", "next_short", "next_video", "swipe_up" -> service.scrollSmart(forward = true)
+            "scroll_up", "previous_short", "previous_video", "swipe_down" -> service.scrollSmart(forward = false)
             else -> false
         }
 
@@ -626,8 +627,70 @@ class DeviceActionExecutor(private val context: Context) {
             actionType = "ACCESSIBILITY",
             target = target,
             details = if (success) "Executed accessibility action: $target" else "Accessibility action $target could not be dispatched",
-            spokenFeedback = if (success) "$target action complete ho gaya." else "Accessibility action $target fail ho gaya."
+            spokenFeedback = if (success) "Ho gaya." else "Accessibility action $target fail ho gaya."
         )
+    }
+
+    private fun searchYouTube(query: String): ExecutionResult {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) {
+            return openApp("youtube")
+        }
+        val ytPackage = "com.google.android.youtube"
+        val encoded = Uri.encode(cleanQuery)
+        return try {
+            val searchIntent = Intent(Intent.ACTION_SEARCH).apply {
+                setPackage(ytPackage)
+                putExtra(SearchManager.QUERY, cleanQuery)
+                putExtra("query", cleanQuery)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (searchIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(searchIntent)
+                return ExecutionResult(
+                    success = true,
+                    actionType = "YOUTUBE_SEARCH",
+                    target = cleanQuery,
+                    details = "Searched YouTube for '$cleanQuery' via ACTION_SEARCH",
+                    spokenFeedback = "YouTube pe '$cleanQuery' search kar rahi hoon."
+                )
+            }
+
+            val viewAppIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=$encoded")).apply {
+                setPackage(ytPackage)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (viewAppIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(viewAppIntent)
+                return ExecutionResult(
+                    success = true,
+                    actionType = "YOUTUBE_SEARCH",
+                    target = cleanQuery,
+                    details = "Opened YouTube search URL in YouTube app for '$cleanQuery'",
+                    spokenFeedback = "YouTube pe '$cleanQuery' search kar rahi hoon."
+                )
+            }
+
+            val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=$encoded")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(browserIntent)
+            ExecutionResult(
+                success = true,
+                actionType = "YOUTUBE_SEARCH",
+                target = cleanQuery,
+                details = "Opened YouTube search URL in browser for '$cleanQuery'",
+                spokenFeedback = "YouTube pe '$cleanQuery' search kar rahi hoon."
+            )
+        } catch (e: Exception) {
+            ExecutionResult(
+                success = false,
+                actionType = "YOUTUBE_SEARCH",
+                target = cleanQuery,
+                details = "YouTube search failed: ${e.message}",
+                spokenFeedback = "YouTube pe search nahi ho paaya."
+            )
+        }
     }
 
     private fun performWebSearch(query: String): ExecutionResult {

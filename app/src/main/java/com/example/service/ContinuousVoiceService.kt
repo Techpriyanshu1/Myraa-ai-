@@ -92,45 +92,56 @@ class ContinuousVoiceService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val coordinator = com.example.voice.MyraaSessionCoordinator.getInstance(applicationContext)
         when (intent?.action) {
             ACTION_STOP_LISTENING -> {
+                coordinator.stopSessionFromService()
                 terminateService()
                 return START_NOT_STICKY
             }
             ACTION_PAUSE_LISTENING -> {
                 _isPaused.value = true
+                coordinator.pauseListeningFromService()
                 updateNotification("Listening paused by user")
                 return START_STICKY
             }
             ACTION_RESUME_LISTENING -> {
                 _isPaused.value = false
-                updateNotification("Listening for your voice commands in Hindi and English...")
+                coordinator.resumeListeningFromService()
+                updateNotification("Listening continuously in Hindi and English...")
                 return START_STICKY
             }
             ACTION_START_LISTENING, null -> {
                 _isListeningLive.value = true
                 _isPaused.value = false
 
-                val notification = buildForegroundNotification("MYRAA AI is listening for commands...")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(
-                        NOTIFICATION_ID,
-                        notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                    )
-                } else {
-                    startForeground(NOTIFICATION_ID, notification)
+                val notification = buildForegroundNotification("MYRAA AI is listening in background (YouTube & apps ready)...")
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(
+                            NOTIFICATION_ID,
+                            notification,
+                            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                        )
+                    } else {
+                        startForeground(NOTIFICATION_ID, notification)
+                    }
+                } catch (e: Exception) {
+                    Log.w("ContinuousVoiceService", "Foreground microphone start fallback", e)
                 }
+                return START_STICKY
             }
         }
 
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun terminateService() {
         _isListeningLive.value = false
         _isPaused.value = false
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {}
         stopSelf()
     }
 

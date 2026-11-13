@@ -5,8 +5,6 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
-import android.provider.Settings
-import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -73,7 +71,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -92,28 +89,12 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.example.agents.AgentFleetManager
-import com.example.agents.InitializationPreflightReport
-import com.example.agents.InitializationVerifier
-import com.example.automation.ActionSecurityPolicy
-import com.example.automation.DeviceActionExecutor
-import com.example.automation.ExecutionResult
-import com.example.automation.LaunchableAppInfo
-import com.example.data.api.ElevenLabsClient
-import com.example.data.api.GeminiClient
-import com.example.data.api.ParsedCommand
-import com.example.data.db.AppDatabase
-import com.example.data.pref.SecurePreferences
-import com.example.memory.MemoryCoreManager
-import com.example.service.ContinuousVoiceService
-import com.example.service.MyraaOverlayService
 import com.example.service.RealScreenCaptureService
 import com.example.ui.components.ActionConfirmationDialog
 import com.example.ui.components.AnimatedAiOrb
 import com.example.ui.components.AuroraWaveGlow
 import com.example.ui.components.InitializationDiagnosticsDialog
 import com.example.ui.components.InstalledAppsDialog
-import com.example.ui.components.PendingConfirmationAction
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.AuroraPink
 import com.example.ui.theme.CyanPrimary
@@ -126,8 +107,7 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VioletSecondary
 import com.example.voice.CompanionState
-import com.example.voice.VoiceRecognitionManager
-import kotlinx.coroutines.launch
+import com.example.voice.MyraaSessionCoordinator
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -140,15 +120,10 @@ fun MainAssistantScreen(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val coroutineScope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
-    val prefs = remember { SecurePreferences(context) }
-    val geminiClient = remember { GeminiClient() }
-    val elevenLabsClient = remember { ElevenLabsClient(context) }
-    val actionExecutor = remember { DeviceActionExecutor(context) }
-    val fleetManager = remember { AgentFleetManager.getInstance(context, prefs) }
-    val initVerifier = remember { InitializationVerifier(context, prefs, geminiClient, fleetManager) }
-    val memoryManager = remember { MemoryCoreManager(AppDatabase.getInstance(context)) }
+
+    val coordinator = remember(context) { MyraaSessionCoordinator.getInstance(context) }
+    val prefs = coordinator.prefs
 
     val projectionManager = remember {
         context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -156,7 +131,6 @@ fun MainAssistantScreen(
 
     val isRealScreenSharing by RealScreenCaptureService.isSharingActive.collectAsState()
     val screenShareError by RealScreenCaptureService.lastError.collectAsState()
-    val servicePaused by ContinuousVoiceService.isPaused.collectAsState()
 
     val screenShareLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -166,479 +140,69 @@ fun MainAssistantScreen(
         }
     }
 
-    var isSessionActive by remember { mutableStateOf(false) }
-    var isListeningPaused by remember { mutableStateOf(false) }
-    var isStartingSession by remember { mutableStateOf(false) }
-    var isProcessingCommand by remember { mutableStateOf(false) }
-    var lastProcessedCommandKey by remember { mutableStateOf("") }
-    var lastProcessedCommandAt by remember { mutableStateOf(0L) }
     var textInput by remember { mutableStateOf("") }
-    var currentSpeechTranscript by remember { mutableStateOf("") }
-    var currentAiReply by remember {
-        mutableStateOf("Namaste! Main MYRAA AI hoon. Mic button dabakar seedhe apni awaaz me baat karein.")
-    }
-    var lastExecutedAction by remember { mutableStateOf<String?>(null) }
-    var lastActionSuccess by remember { mutableStateOf(true) }
 
-    var showAppsDialog by remember { mutableStateOf(false) }
-    var launchableApps by remember { mutableStateOf<List<LaunchableAppInfo>>(emptyList()) }
-    var pendingConfirmation by remember { mutableStateOf<PendingConfirmationAction?>(null) }
-    var preflightReportDialog by remember { mutableStateOf<InitializationPreflightReport?>(null) }
-
-    lateinit var voiceManagerRef: VoiceRecognitionManager
-
-    fun speakMahiResponse(text: String) {
-        coroutineScope.launch {
-            voiceManagerRef.setCompanionState(CompanionState.TALKING)
-            elevenLabsClient.speakText(
-                text = text,
-                apiKey = prefs.getVoiceApiKey(),
-                voiceId = prefs.getSelectedVoiceId(),
-                modelId = prefs.getSelectedVoiceModel(),
-                speechSpeed = prefs.getSpeechSpeed(),
-                onPlaybackStarted = {
-                    voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                },
-                onPlaybackCompleted = {
-                    if (isSessionActive && !isListeningPaused) {
-                        voiceManagerRef.resumeListeningAfterSpeech()
-                    } else {
-                        voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                    }
-                },
-                onError = { err ->
-                    fleetManager.recordAgentError("mahi_voice_output", err)
-                    if (isSessionActive && !isListeningPaused) {
-                        voiceManagerRef.resumeListeningAfterSpeech()
-                    } else {
-                        voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                    }
-                }
-            )
-        }
-    }
-
-    fun activateSessionAfterVerification() {
-        isSessionActive = true
-        isListeningPaused = false
-        coroutineScope.launch {
-            try {
-                val summary = fleetManager.initializeAndStartEligibleAgents()
-                voiceManagerRef.prepareSessionForGreeting()
-                ContinuousVoiceService.start(context)
-                if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(context)) {
-                    MyraaOverlayService.start(context)
-                }
-
-                val mandatoryUnavailable = summary.unavailableAgents.filter { !it.isOptional }
-                val greeting = "Namaste! Main MYRAA AI hoon, aapki Mahi voice ready hai. Boliye main aapki kya madad karu?"
-                currentAiReply = if (mandatoryUnavailable.isEmpty()) {
-                    greeting
-                } else {
-                    val coreReasons = mandatoryUnavailable.joinToString("; ") { "${it.name}: ${it.errorReason ?: it.detailMessage}" }
-                    "$greeting\n($coreReasons)"
-                }
-                speakMahiResponse(greeting)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                Log.e("MainAssistantScreen", "Unable to start listening", e)
-                isSessionActive = false
-                voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                currentAiReply = "Unable to start listening: ${e.localizedMessage ?: "Service failure"}"
-            }
-        }
-    }
-
-    fun startMyraaSession() {
-        if (isStartingSession || isSessionActive) return
-        isStartingSession = true
-        coroutineScope.launch {
-            try {
-                voiceManagerRef.setCompanionState(CompanionState.THINKING)
-                val report = initVerifier.verifyAll(checkLiveConnectivity = true)
-                if (!report.canStartVoiceSession) {
-                    voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                    currentAiReply = report.buildSummaryMessage()
-                    preflightReportDialog = report
-                    return@launch
-                }
-                if (report.warningMessages.isNotEmpty()) {
-                    currentAiReply = report.warningMessages.joinToString("\n")
-                }
-                activateSessionAfterVerification()
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                currentAiReply = "Initialization check failed: ${e.localizedMessage}"
-            } finally {
-                isStartingSession = false
-            }
-        }
-    }
-
-    fun stopMyraaSession() {
-        isSessionActive = false
-        isListeningPaused = false
-        voiceManagerRef.stopContinuousListening()
-        elevenLabsClient.stopSpeaking()
-        ContinuousVoiceService.stop(context)
-        MyraaOverlayService.stop(context)
-        coroutineScope.launch {
-            fleetManager.stopAllAgents()
-        }
-    }
-
-    fun pauseListeningSession() {
-        if (!isSessionActive) return
-        isListeningPaused = true
-        voiceManagerRef.pauseListening()
-        ContinuousVoiceService.pause(context)
-    }
-
-    fun resumeListeningSession() {
-        if (!isSessionActive) {
-            startMyraaSession()
-            return
-        }
-        isListeningPaused = false
-        voiceManagerRef.resumeListening()
-        ContinuousVoiceService.resume(context)
-    }
-
-    LaunchedEffect(servicePaused, isSessionActive) {
-        if (isSessionActive && servicePaused != isListeningPaused) {
-            isListeningPaused = servicePaused
-            if (servicePaused) voiceManagerRef.pauseListening() else voiceManagerRef.resumeListening()
-        }
-    }
-
-    fun executeValidatedAndRespond(
-        parsed: ParsedCommand,
-        confirmationStatus: String = "AUTO_APPROVED"
-    ) {
-        coroutineScope.launch {
-            try {
-                when (parsed.actionType.uppercase()) {
-                    "PAUSE_LISTENING" -> {
-                        val res = actionExecutor.executeCommand(parsed, confirmationStatus)
-                        lastExecutedAction = res.actionType
-                        lastActionSuccess = res.success
-                        currentAiReply = parsed.spokenResponse
-                        pauseListeningSession()
-                        speakMahiResponse(parsed.spokenResponse)
-                        return@launch
-                    }
-                    "RESUME_LISTENING" -> {
-                        val res = actionExecutor.executeCommand(parsed, confirmationStatus)
-                        lastExecutedAction = res.actionType
-                        lastActionSuccess = res.success
-                        currentAiReply = parsed.spokenResponse
-                        resumeListeningSession()
-                        speakMahiResponse(parsed.spokenResponse)
-                        return@launch
-                    }
-                    "STOP_AI" -> {
-                        actionExecutor.executeCommand(parsed, confirmationStatus)
-                        lastExecutedAction = "STOP_AI"
-                        lastActionSuccess = true
-                        currentAiReply = parsed.spokenResponse
-                        voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                        elevenLabsClient.speakText(
-                            text = parsed.spokenResponse,
-                            apiKey = prefs.getVoiceApiKey(),
-                            voiceId = prefs.getSelectedVoiceId(),
-                            modelId = prefs.getSelectedVoiceModel(),
-                            speechSpeed = prefs.getSpeechSpeed(),
-                            onPlaybackCompleted = { stopMyraaSession() }
-                        )
-                        return@launch
-                    }
-                    "LIST_APPS" -> {
-                        val res = actionExecutor.executeCommand(parsed, confirmationStatus)
-                        launchableApps = actionExecutor.getInstalledLaunchableApps()
-                        showAppsDialog = true
-                        lastExecutedAction = res.actionType
-                        lastActionSuccess = res.success
-                        currentAiReply = parsed.spokenResponse
-                        speakMahiResponse(parsed.spokenResponse)
-                        return@launch
-                    }
-                    "SHOW_HISTORY" -> {
-                        actionExecutor.executeCommand(parsed, confirmationStatus)
-                        lastExecutedAction = "SHOW_HISTORY"
-                        lastActionSuccess = true
-                        onNavigateToLogs()
-                        return@launch
-                    }
-                }
-
-                val result: ExecutionResult = actionExecutor.executeCommand(parsed, confirmationStatus)
-                lastExecutedAction = result.actionType
-                lastActionSuccess = result.success
-
-                val finalSpeech = when {
-                    !result.success -> result.spokenFeedback ?: result.details
-                    !result.spokenFeedback.isNullOrBlank() && parsed.actionType != "CHAT" -> result.spokenFeedback
-                    else -> parsed.spokenResponse
-                }
-                currentAiReply = finalSpeech
-                if (!result.success) {
-                    voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                }
-                speakMahiResponse(finalSpeech)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                Log.e("MainAssistantScreen", "Execution pipeline failed", e)
-                fleetManager.recordAgentError("device_action", e.localizedMessage ?: "Execution error")
-                lastExecutedAction = parsed.actionType
-                lastActionSuccess = false
-                currentAiReply = "Action execute karte waqt error aaya: ${e.localizedMessage}"
-                voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                speakMahiResponse("Maaf kijiye, action execute nahi ho paaya.")
-            }
-        }
-    }
-
-    fun handleParsedPipelineResult(parsed: ParsedCommand, rawLabel: String) {
-        val validation = ActionSecurityPolicy.validate(parsed)
-        if (!validation.allowed) {
-            val rejectMsg = validation.rejectionReason ?: "Security policy blocked this action."
-            coroutineScope.launch {
-                actionExecutor.logPipelineOutcome(
-                    rawPrompt = rawLabel,
-                    recognizedIntent = parsed.intent,
-                    actionType = "BLOCKED",
-                    target = parsed.target,
-                    agentInvolved = "Permission Manager Agent",
-                    permissionStatus = "BLOCKED_BY_POLICY",
-                    confirmationStatus = "REJECTED",
-                    status = "BLOCKED",
-                    spokenResponse = rejectMsg,
-                    details = rejectMsg,
-                    errorInfo = rejectMsg
-                )
-            }
-            lastExecutedAction = "BLOCKED"
-            lastActionSuccess = false
-            currentAiReply = rejectMsg
-            voiceManagerRef.setCompanionState(CompanionState.ERROR)
-            speakMahiResponse("Suraksha kaaran se yeh action block kiya gaya hai.")
-            return
-        }
-
-        if (validation.requiresConfirmation) {
-            pendingConfirmation = PendingConfirmationAction(parsed, validation)
-            voiceManagerRef.setCompanionState(CompanionState.IDLE)
-            return
-        }
-
-        executeValidatedAndRespond(parsed, "AUTO_APPROVED")
-    }
-
-    // Text Command Pipeline (with Memory Core context)
-    fun processCommand(commandText: String) {
-        val trimmed = commandText.trim()
-        if (trimmed.isBlank()) return
-
-        val now = System.currentTimeMillis()
-        val dedupeKey = trimmed.lowercase()
-        if (isProcessingCommand) return
-        if (dedupeKey == lastProcessedCommandKey && (now - lastProcessedCommandAt) < 1800L) return
-
-        isProcessingCommand = true
-        lastProcessedCommandKey = dedupeKey
-        lastProcessedCommandAt = now
-        currentSpeechTranscript = trimmed
-
-        coroutineScope.launch {
-            try {
-                voiceManagerRef.setCompanionState(CompanionState.THINKING)
-                val apiKey = prefs.getGeminiApiKey()
-                val model = prefs.getSelectedGeminiModel()
-                val screenSnapshot = if (isRealScreenSharing) {
-                    RealScreenCaptureService.latestScreenFrameBase64.value
-                } else {
-                    null
-                }
-                val memoryContext = memoryManager.buildPromptMemoryContext()
-                val parsed = geminiClient.interpretCommand(
-                    prompt = trimmed,
-                    apiKey = apiKey,
-                    preferredModel = model,
-                    screenImageBase64 = screenSnapshot,
-                    memoryContext = memoryContext,
-                    onModelAutoUpdated = { workingModel ->
-                        if (workingModel != model) {
-                            prefs.setSelectedGeminiModel(workingModel)
-                        }
-                    }
-                )
-                if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connect nahi ho paaya", ignoreCase = true)) {
-                    fleetManager.clearAgentError("gemini_intelligence")
-                }
-
-                handleParsedPipelineResult(parsed, trimmed)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                Log.e("MainAssistantScreen", "Error in command pipeline", e)
-                fleetManager.recordAgentError("gemini_intelligence", e.localizedMessage ?: "Pipeline error")
-                lastExecutedAction = "ERROR"
-                lastActionSuccess = false
-                voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                currentAiReply = "Command process karne me error aaya: ${e.localizedMessage}"
-                if (isSessionActive && !isListeningPaused) {
-                    voiceManagerRef.resumeListeningAfterSpeech()
-                }
-            } finally {
-                isProcessingCommand = false
-            }
-        }
-    }
-
-    // Direct Voice-to-Gemini Audio Pipeline (NO Android Speech-to-Text!)
-    fun processVoiceAudio(audioWavBytes: ByteArray) {
-        if (isProcessingCommand || audioWavBytes.size < 100) {
-            if (isSessionActive && !isListeningPaused) {
-                voiceManagerRef.resumeListeningAfterSpeech()
-            }
-            return
-        }
-
-        isProcessingCommand = true
-        currentSpeechTranscript = "Voice message captured..."
-
-        coroutineScope.launch {
-            try {
-                voiceManagerRef.setCompanionState(CompanionState.THINKING)
-                val apiKey = prefs.getGeminiApiKey()
-                val model = prefs.getSelectedGeminiModel()
-                val screenSnapshot = if (isRealScreenSharing) {
-                    RealScreenCaptureService.latestScreenFrameBase64.value
-                } else {
-                    null
-                }
-                val memoryContext = memoryManager.buildPromptMemoryContext()
-                val parsed = geminiClient.interpretAudioCommand(
-                    audioWavBytes = audioWavBytes,
-                    apiKey = apiKey,
-                    preferredModel = model,
-                    screenImageBase64 = screenSnapshot,
-                    memoryContext = memoryContext,
-                    onModelAutoUpdated = { workingModel ->
-                        if (workingModel != model) {
-                            prefs.setSelectedGeminiModel(workingModel)
-                        }
-                    }
-                )
-                currentSpeechTranscript = parsed.heardSummary.ifBlank { "Voice command" }
-                if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connect nahi ho paaya", ignoreCase = true)) {
-                    fleetManager.clearAgentError("gemini_intelligence")
-                }
-
-                handleParsedPipelineResult(parsed, currentSpeechTranscript)
-            } catch (ce: kotlinx.coroutines.CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                Log.e("MainAssistantScreen", "Direct voice audio pipeline error", e)
-                fleetManager.recordAgentError("gemini_intelligence", e.localizedMessage ?: "Audio pipeline error")
-                lastExecutedAction = "ERROR"
-                lastActionSuccess = false
-                voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                currentAiReply = "Voice samajhne me error aaya: ${e.localizedMessage}"
-                if (isSessionActive && !isListeningPaused) {
-                    voiceManagerRef.resumeListeningAfterSpeech()
-                }
-            } finally {
-                isProcessingCommand = false
-            }
-        }
-    }
-
-    val voiceManager = remember {
-        VoiceRecognitionManager(
-            context = context,
-            onAudioCaptured = { wavBytes ->
-                fleetManager.clearAgentError("voice_recognition")
-                processVoiceAudio(wavBytes)
-            }
-        ).also {
-            voiceManagerRef = it
-        }
-    }
-
-    val companionState by voiceManager.companionState.collectAsState()
-    val rmsLevel by voiceManager.rmsLevel.collectAsState()
-    val liveVoiceStatus by voiceManager.lastRecognizedText.collectAsState()
-    val voiceError by voiceManager.errorMessage.collectAsState()
+    val isSessionActive by coordinator.isSessionActive.collectAsState()
+    val isListeningPaused by coordinator.isListeningPaused.collectAsState()
+    val companionState by coordinator.companionState.collectAsState()
+    val rmsLevel by coordinator.rmsLevel.collectAsState()
+    val liveVoiceStatus by coordinator.liveVoiceStatus.collectAsState()
+    val voiceError by coordinator.voiceError.collectAsState()
+    val currentSpeechTranscript by coordinator.currentSpeechTranscript.collectAsState()
+    val currentAiReply by coordinator.currentAiReply.collectAsState()
+    val lastExecutedAction by coordinator.lastExecutedAction.collectAsState()
+    val lastActionSuccess by coordinator.lastActionSuccess.collectAsState()
+    val showAppsDialog by coordinator.showAppsDialog.collectAsState()
+    val launchableApps by coordinator.launchableApps.collectAsState()
+    val pendingConfirmation by coordinator.pendingConfirmation.collectAsState()
+    val preflightReportDialog by coordinator.preflightReportDialog.collectAsState()
 
     val micLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            fleetManager.clearAgentError("voice_recognition")
-            startMyraaSession()
+            coordinator.fleetManager.clearAgentError("voice_recognition")
+            coordinator.startSession()
         } else {
-            fleetManager.refreshFleetStatus()
-            currentAiReply = "Voice control ke liye Microphone permission zaroori hai. Settings -> Permission Center me jakar enable karein."
+            coordinator.fleetManager.refreshFleetStatus()
+            coordinator.setErrorMessage(
+                "Voice control ke liye Microphone permission zaroori hai. Settings -> Permission Center me jakar enable karein."
+            )
         }
     }
 
-    LaunchedEffect(Unit) {
-        memoryManager.ensurePermanentMemorySeeded()
-        fleetManager.refreshFleetStatus(clearErrors = true)
+    LaunchedEffect(coordinator) {
+        coordinator.initializeOnScreenAppear()
+        coordinator.navigateToLogsEvent.collect {
+            onNavigateToLogs()
+        }
     }
 
     LaunchedEffect(screenShareError) {
         if (!screenShareError.isNullOrBlank()) {
-            currentAiReply = screenShareError!!
+            coordinator.setErrorMessage(screenShareError!!)
         }
     }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                fleetManager.refreshFleetStatus(clearErrors = true)
+                coordinator.refreshFleetOnResume()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            // Intentionally do NOT destroy voiceManager or stop ContinuousVoiceService here:
+            // Voice Mode stays continuously active in background across app switches (YouTube, Screen Share, etc.).
             lifecycleOwner.lifecycle.removeObserver(observer)
-            voiceManager.destroy()
-            elevenLabsClient.shutdown()
-            ContinuousVoiceService.stop(context)
         }
     }
 
     pendingConfirmation?.let { pending ->
         ActionConfirmationDialog(
             pending = pending,
-            onConfirm = {
-                pendingConfirmation = null
-                executeValidatedAndRespond(pending.command, "USER_CONFIRMED")
-            },
-            onCancel = {
-                pendingConfirmation = null
-                coroutineScope.launch {
-                    actionExecutor.logPipelineOutcome(
-                        rawPrompt = pending.command.rawPrompt,
-                        recognizedIntent = pending.command.intent,
-                        actionType = pending.command.actionType,
-                        target = pending.command.target,
-                        agentInvolved = "Permission Manager Agent",
-                        confirmationStatus = "USER_CANCELLED",
-                        status = "CANCELLED",
-                        spokenResponse = "Action cancelled by user.",
-                        details = "User declined confirmation for ${pending.command.actionType}"
-                    )
-                }
-                val cancelMsg = "Theek hai, yeh action cancel kar diya hai."
-                currentAiReply = cancelMsg
-                speakMahiResponse(cancelMsg)
-            }
+            onConfirm = { coordinator.confirmPendingAction() },
+            onCancel = { coordinator.cancelPendingAction() }
         )
     }
 
@@ -646,33 +210,18 @@ fun MainAssistantScreen(
         InitializationDiagnosticsDialog(
             report = report,
             onContinueAnyway = if (report.canStartVoiceSession) {
-                {
-                    preflightReportDialog = null
-                    activateSessionAfterVerification()
-                }
+                { coordinator.continueAnywayAfterPreflight() }
             } else null,
-            onDismiss = { preflightReportDialog = null }
+            onDismiss = { coordinator.dismissPreflightDialog() }
         )
     }
 
     if (showAppsDialog) {
         InstalledAppsDialog(
             apps = launchableApps,
-            onLaunchApp = { app ->
-                showAppsDialog = false
-                coroutineScope.launch {
-                    val result = actionExecutor.launchSpecificPackage(app.packageName, app.label)
-                    lastExecutedAction = result.actionType
-                    lastActionSuccess = result.success
-                    currentAiReply = result.spokenFeedback ?: result.details
-                    speakMahiResponse(currentAiReply)
-                }
-            },
-            onToggleSelectApp = { app ->
-                prefs.toggleSelectedApp(app.packageName)
-                launchableApps = actionExecutor.getInstalledLaunchableApps()
-            },
-            onDismiss = { showAppsDialog = false }
+            onLaunchApp = { app -> coordinator.launchInstalledApp(app) },
+            onToggleSelectApp = { app -> coordinator.toggleSelectedApp(app.packageName) },
+            onDismiss = { coordinator.dismissAppsDialog() }
         )
     }
 
@@ -705,7 +254,7 @@ fun MainAssistantScreen(
                             Text(
                                 text = when {
                                     isSessionActive && isListeningPaused -> "Voice Paused"
-                                    isSessionActive -> "Direct Voice • AI Audio"
+                                    isSessionActive -> "Direct Voice • Background Active"
                                     else -> "Ready"
                                 },
                                 fontSize = 10.sp,
@@ -729,12 +278,14 @@ fun MainAssistantScreen(
                         onClick = {
                             if (isRealScreenSharing) {
                                 RealScreenCaptureService.stop(context)
-                                currentAiReply = "Screen share band kar diya gaya hai."
+                                coordinator.setErrorMessage("Screen share band kar diya gaya hai.")
                             } else {
                                 try {
                                     screenShareLauncher.launch(projectionManager.createScreenCaptureIntent())
                                 } catch (e: Exception) {
-                                    currentAiReply = "Screen share launch nahi ho paaya: ${e.localizedMessage ?: "Unsupported"}"
+                                    coordinator.setErrorMessage(
+                                        "Screen share launch nahi ho paaya: ${e.localizedMessage ?: "Unsupported"}"
+                                    )
                                 }
                             }
                         },
@@ -867,7 +418,7 @@ fun MainAssistantScreen(
                         .fillMaxWidth()
                         .height(260.dp)
                         .clickable(enabled = isSessionActive && companionState == CompanionState.LISTENING) {
-                            voiceManager.finishUtteranceNow()
+                            coordinator.finishUtteranceNow()
                         },
                     contentAlignment = Alignment.Center
                 ) {
@@ -922,7 +473,7 @@ fun MainAssistantScreen(
                                 )
                             }
                             IconButton(
-                                onClick = { speakMahiResponse(currentAiReply) },
+                                onClick = { coordinator.replayCurrentReply() },
                                 modifier = Modifier
                                     .size(40.dp)
                                     .testTag("replay_voice_button")
@@ -980,7 +531,7 @@ fun MainAssistantScreen(
                                     val cmd = textInput
                                     textInput = ""
                                     focusManager.clearFocus()
-                                    processCommand(cmd)
+                                    coordinator.processTextCommand(cmd)
                                 }
                             },
                             modifier = Modifier.testTag("send_command_button")
@@ -995,7 +546,7 @@ fun MainAssistantScreen(
                                 val cmd = textInput
                                 textInput = ""
                                 focusManager.clearFocus()
-                                processCommand(cmd)
+                                coordinator.processTextCommand(cmd)
                             }
                         }
                     ),
@@ -1044,12 +595,12 @@ fun MainAssistantScreen(
                             )
                             .clickable {
                                 if (isSessionActive) {
-                                    stopMyraaSession()
+                                    coordinator.stopSession()
                                 } else {
                                     val hasMic = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
                                         PackageManager.PERMISSION_GRANTED
                                     if (hasMic) {
-                                        startMyraaSession()
+                                        coordinator.startSession()
                                     } else {
                                         micLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                     }
@@ -1068,7 +619,7 @@ fun MainAssistantScreen(
 
                     if (isSessionActive && companionState == CompanionState.LISTENING) {
                         OutlinedButton(
-                            onClick = { voiceManager.finishUtteranceNow() },
+                            onClick = { coordinator.finishUtteranceNow() },
                             border = BorderStroke(1.dp, CyanPrimary),
                             colors = ButtonDefaults.outlinedButtonColors(
                                 containerColor = DarkSurfaceElevated
@@ -1094,7 +645,7 @@ fun MainAssistantScreen(
                     if (isSessionActive) {
                         OutlinedButton(
                             onClick = {
-                                if (isListeningPaused) resumeListeningSession() else pauseListeningSession()
+                                if (isListeningPaused) coordinator.resumeListening() else coordinator.pauseListening()
                             },
                             border = BorderStroke(1.dp, if (isListeningPaused) AuroraEmerald else AuroraPink),
                             colors = ButtonDefaults.outlinedButtonColors(

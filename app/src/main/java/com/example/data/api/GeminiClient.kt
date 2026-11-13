@@ -2,11 +2,11 @@ package com.example.data.api
 
 import android.util.Base64
 import android.util.Log
+import com.example.core.SharedHttpClient
 import com.example.memory.MemoryCoreManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -14,11 +14,10 @@ import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 
 data class ParsedCommand(
     val spokenResponse: String,
-    val actionType: String, // Allowlisted action e.g. OPEN_APP, OPEN_SETTINGS, OPEN_CAMERA, OPEN_CALCULATOR, OPEN_CLOCK, CHAT
+    val actionType: String, // Allowlisted action e.g. OPEN_APP, YOUTUBE_SEARCH, ACCESSIBILITY, SCREEN_CLICK, CHAT
     val target: String,
     val extraData: String = "",
     val rawPrompt: String,
@@ -35,11 +34,7 @@ sealed class ConnectionTestResult {
 
 class GeminiClient {
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(22, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
-        .build()
+    private val client = SharedHttpClient.instance
 
     companion object {
         val AVAILABLE_MODELS = listOf(
@@ -273,6 +268,7 @@ class GeminiClient {
         preferredModel: String = AVAILABLE_MODELS.first(),
         screenImageBase64: String? = null,
         memoryContext: String = "",
+        screenContextSummary: String = "",
         onModelAutoUpdated: ((String) -> Unit)? = null
     ): ParsedCommand = withContext(Dispatchers.IO) {
         val trimmed = prompt.trim()
@@ -323,7 +319,7 @@ class GeminiClient {
                     val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
 
                     val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
-                    val systemPrompt = buildGeminiSystemPrompt(effectiveMemory)
+                    val systemPrompt = buildGeminiSystemPrompt(effectiveMemory, screenContextSummary)
 
                     val userParts = JSONArray().apply {
                         put(JSONObject().put("text", "$systemPrompt\n\nUser command: $trimmed"))
@@ -446,11 +442,12 @@ class GeminiClient {
         preferredModel: String = AVAILABLE_MODELS.first(),
         screenImageBase64: String? = null,
         memoryContext: String = "",
+        screenContextSummary: String = "",
         onModelAutoUpdated: ((String) -> Unit)? = null
     ): ParsedCommand = withContext(Dispatchers.IO) {
         if (audioWavBytes.size < 100) {
             return@withContext ParsedCommand(
-                spokenResponse = "Awaaz clear nahi aayi, please ek baar phir boliye.",
+                spokenResponse = "Awaaz clear nahi aayi, phir boliye.",
                 actionType = "CHAT",
                 target = "",
                 rawPrompt = "Voice command",
@@ -461,7 +458,7 @@ class GeminiClient {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) {
             return@withContext ParsedCommand(
-                spokenResponse = "Direct voice AI ke liye Settings me Gemini API key add karein, ya neeche text box use karein.",
+                spokenResponse = "Voice AI ke liye Settings me Gemini API key add karein.",
                 actionType = "CHAT",
                 target = "",
                 rawPrompt = "Voice command",
@@ -489,7 +486,7 @@ class GeminiClient {
         var lastApiError: String? = null
 
         val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
-        val systemPrompt = buildGeminiSystemPrompt(effectiveMemory) + "\n- Listen directly to the attached user voice audio, understand the user's intent, put a concise summary of what they said in \"heardSummary\", and respond warmly."
+        val systemPrompt = buildGeminiSystemPrompt(effectiveMemory, screenContextSummary) + "\n- Listen directly to the attached user voice audio, understand intent, put a concise summary of what they said in \"heardSummary\", and respond warmly."
 
         while (queue.isNotEmpty()) {
             val model = queue.removeFirst()
@@ -637,28 +634,35 @@ class GeminiClient {
         }
     }
 
-    private fun buildGeminiSystemPrompt(memoryBlock: String): String {
+    private fun buildGeminiSystemPrompt(memoryBlock: String, screenContextSummary: String = ""): String {
+        val screenSection = if (screenContextSummary.isNotBlank()) {
+            "\n[CURRENT ACTIVE SCREEN UI]:\n$screenContextSummary\n"
+        } else ""
         return """
             You are MYRAA AI, a warm, loving, respectful Indian AI smartphone assistant speaking in Mahi's voice.
             
             $memoryBlock
-            
+            $screenSection
             Respond ONLY with a valid single JSON object (no markdown fences, no prose outside JSON) using this exact schema:
             {
               "heardSummary": "Brief summary or transcript of what the user asked",
-              "intent": "open_app|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
-              "actionType": "OPEN_APP|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
-              "target": "target app, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, or search query",
+              "intent": "open_app|youtube_search|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
+              "actionType": "OPEN_APP|YOUTUBE_SEARCH|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
+              "target": "target app, YouTube song/video search query, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, accessibility target (home|back|scroll_down|scroll_up|lock), or search query",
               "extraData": "optional text to type or extra info",
               "riskLevel": "LOW|MEDIUM|HIGH",
               "requiresConfirmation": false,
-              "spokenResponse": "Natural 1-2 sentence reply in Hindi, Hinglish, or English matching user language, max 40 words, no markdown or emojis"
+              "spokenResponse": "Crisp 1-sentence reply in Hindi, Hinglish, or English matching user language, max 18 words so voice plays super fast, no markdown or emojis"
             }
             STRICT RULES:
             - ALWAYS remember and honor the Permanent Core Memory and User Personal Preferences above. Never contradict, ignore, or forget them.
+            - Use YOUTUBE_SEARCH when the user asks to search, find, or play any song or video on YouTube, putting ONLY the clean song/video query in "target".
+            - Use ACCESSIBILITY with target="scroll_down" when the user asks to scroll down, swipe up, scroll shorts/reels, or go to the next short/video; use target="scroll_up" for previous short/scroll up.
+            - Use SCREEN_CLICK (with exact visible UI label in "target") or SCREEN_TYPE (with text in "extraData") to interact with buttons/fields currently visible on screen.
             - Never output executable code or shell commands.
             - For OPEN_SETTINGS, NEVER claim the setting was toggled ON/OFF; say the settings screen is being opened so the user can change it.
             - Set requiresConfirmation=true and riskLevel="HIGH" for irreversible or sensitive actions (like locking screen, deleting, uninstalling, sending/paying).
+            - Keep spokenResponse ultra concise (under 18 words for fast AI voice playback) unless the user specifically asks for a long explanation.
             - If a live screenshot is attached, inspect it carefully to answer screen questions or identify visible UI labels to tap/describe.
         """.trimIndent()
     }
@@ -967,9 +971,15 @@ class GeminiClient {
                 requiresConfirmation = true
             )
         }
-        if (lower in listOf("scroll down", "neeche scroll", "neeche karo")) {
+        if (lower in listOf(
+                "scroll down", "neeche scroll", "neeche karo", "scroll karo", "short video scroll",
+                "short video scroll karo", "shorts scroll", "shorts scroll karo", "next short",
+                "next video", "next reel", "agla short", "agla video", "agla reel", "reel scroll",
+                "reel scroll karo", "swipe up", "upar swipe"
+            ) || (lower.contains("scroll") && (lower.contains("short") || lower.contains("reel") || lower.contains("video")) && !lower.contains("up") && !lower.contains("pichl"))
+        ) {
             return ParsedCommand(
-                spokenResponse = "Screen neeche scroll kar rahi hoon.",
+                spokenResponse = "Next video scroll kar rahi hoon.",
                 actionType = "ACCESSIBILITY",
                 target = "scroll_down",
                 rawPrompt = rawPrompt,
@@ -977,15 +987,37 @@ class GeminiClient {
                 riskLevel = "MEDIUM"
             )
         }
-        if (lower in listOf("scroll up", "upar scroll", "upar karo")) {
+        if (lower in listOf(
+                "scroll up", "upar scroll", "upar karo", "previous short", "previous video",
+                "previous reel", "pichla short", "pichla video", "swipe down"
+            )
+        ) {
             return ParsedCommand(
-                spokenResponse = "Screen upar scroll kar rahi hoon.",
+                spokenResponse = "Upar scroll kar rahi hoon.",
                 actionType = "ACCESSIBILITY",
                 target = "scroll_up",
                 rawPrompt = rawPrompt,
                 intent = "accessibility_scroll",
                 riskLevel = "MEDIUM"
             )
+        }
+
+        // YouTube Song / Video Search & Play ("youtube pe kesariya song search karo", "search lofi beats on youtube")
+        if (lower.contains("youtube") && (lower.contains("search") || lower.contains("play") || lower.contains("bajao") || lower.contains("chalao") || lower.contains("lagao") || lower.contains("song") || lower.contains("gana") || lower.contains("video"))) {
+            val cleanedQuery = normalized
+                .replace(Regex("\\b(on youtube|in youtube|youtube pe|youtube par|youtube me|youtube mein|youtube search|youtube)\\b", RegexOption.IGNORE_CASE), " ")
+                .replace(Regex("\\b(search karo|search|play|bajao|chalao|lagao|ek|koi|karo|karna|for|please)\\b", RegexOption.IGNORE_CASE), " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            if (cleanedQuery.isNotBlank() && cleanedQuery !in listOf("song", "gana", "video", "music")) {
+                return ParsedCommand(
+                    spokenResponse = "YouTube pe $cleanedQuery search kar rahi hoon.",
+                    actionType = "YOUTUBE_SEARCH",
+                    target = cleanedQuery,
+                    rawPrompt = rawPrompt,
+                    intent = "youtube_search"
+                )
+            }
         }
 
         // Volume

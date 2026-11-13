@@ -423,4 +423,56 @@ class MyraaCoreVerificationTest {
         val promptContext = memoryManager.buildPromptMemoryContext()
         assertTrue(promptContext.contains(com.example.memory.MemoryCoreManager.PERMANENT_MEMORY_CONTENT))
     }
+
+    @Test
+    fun `YouTube song search and Shorts scroll commands parse accurately and pass security policy`() = runTest {
+        val gemini = GeminiClient()
+
+        val ytSearch1 = gemini.interpretCommand("youtube pe kesariya song search karo", "")
+        assertEquals("YOUTUBE_SEARCH", ytSearch1.actionType)
+        assertTrue(ytSearch1.target.contains("kesariya", ignoreCase = true))
+        val ytValidation = ActionSecurityPolicy.validate(ytSearch1)
+        assertTrue(ytValidation.allowed)
+        assertEquals(ActionRiskLevel.LOW, ytValidation.riskLevel)
+
+        val ytSearch2 = gemini.interpretCommand("play arijit singh song on youtube", "")
+        assertEquals("YOUTUBE_SEARCH", ytSearch2.actionType)
+        assertTrue(ytSearch2.target.contains("arijit singh", ignoreCase = true))
+
+        val shortScroll = gemini.interpretCommand("short video scroll karo", "")
+        assertEquals("ACCESSIBILITY", shortScroll.actionType)
+        assertEquals("scroll_down", shortScroll.target)
+
+        val nextShort = gemini.interpretCommand("next short", "")
+        assertEquals("ACCESSIBILITY", nextShort.actionType)
+        assertEquals("scroll_down", nextShort.target)
+
+        val prevShort = gemini.interpretCommand("previous short", "")
+        assertEquals("ACCESSIBILITY", prevShort.actionType)
+        assertEquals("scroll_up", prevShort.target)
+    }
+
+    @Test
+    fun `ElevenLabsClient splitIntoFastSpeechChunks splits long multi-sentence text for parallel TTS`() {
+        val client = ElevenLabsClient(context)
+        val shortChunks = client.splitIntoFastSpeechChunks("Namaste! YouTube open kar diya hai.")
+        assertEquals(1, shortChunks.size)
+
+        val longText = "Namaste Priyanshu! Mainne aapka YouTube app open kar diya hai. " +
+            "Ab aapka pasandida song search ho raha hai aur Shorts scroll bhi ready hai. Boliye next kya karun?"
+        val multiChunks = client.splitIntoFastSpeechChunks(longText)
+        assertTrue(multiChunks.size >= 2)
+        assertTrue(multiChunks.all { it.isNotBlank() })
+        client.shutdown()
+    }
+
+    @Test
+    fun `MyraaSessionCoordinator singleton preserves state and handles pause and stop cleanly`() {
+        val coordinator = com.example.voice.MyraaSessionCoordinator.getInstance(context)
+        coordinator.initializeOnScreenAppear()
+        coordinator.pauseListening(notifyService = false)
+        coordinator.stopSession(notifyService = false)
+        assertFalse(coordinator.isSessionActive.value)
+        assertFalse(coordinator.isListeningPaused.value)
+    }
 }
