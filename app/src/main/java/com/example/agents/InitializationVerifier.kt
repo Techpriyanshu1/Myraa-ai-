@@ -3,10 +3,10 @@ package com.example.agents
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.os.Build
 import android.provider.Settings
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import com.example.data.api.ConnectionTestResult
 import com.example.data.api.GeminiClient
 import com.example.data.pref.SecurePreferences
@@ -124,21 +124,19 @@ class InitializationVerifier(
             )
         }
 
-        // 3. Voice API configuration
+        // 3. Pure AI Voice API configuration (ElevenLabs or Gemini Neural TTS — no Android native TTS)
         val hasVoiceKey = prefs.getVoiceApiKey().isNotBlank()
-        val hasFallback = prefs.isNativeTtsFallbackEnabled()
         checks += PreflightCheckItem(
             id = "voice_api_config",
-            title = "3. Voice API Configuration",
+            title = "3. AI Voice Configuration",
             severity = when {
-                hasVoiceKey -> PreflightSeverity.OK
-                hasFallback -> PreflightSeverity.WARNING
+                hasVoiceKey || hasGeminiKey -> PreflightSeverity.OK
                 else -> PreflightSeverity.WARNING
             },
             message = when {
-                hasVoiceKey -> "ElevenLabs Voice API configured."
-                hasFallback -> "ElevenLabs key missing; Android Native TTS fallback active."
-                else -> "Voice API not configured and native fallback is disabled."
+                hasVoiceKey -> "ElevenLabs Neural AI Voice configured."
+                hasGeminiKey -> "Gemini Neural AI Voice (Mahi) active with Gemini key."
+                else -> "AI Voice requires a Gemini or ElevenLabs API key."
             }
         )
 
@@ -174,10 +172,9 @@ class InitializationVerifier(
             else "Notification permission disabled; foreground controls may not display."
         )
 
-        // 7. Foreground-service eligibility & speech recognition availability
-        val speechAvail = SpeechRecognizer.isRecognitionAvailable(context)
-        val dialogAvail = try {
-            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).resolveActivity(context.packageManager) != null
+        // 7. Foreground-service eligibility & Direct AudioRecord capture availability
+        val audioReady = try {
+            AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) > 0
         } catch (_: Exception) {
             false
         }
@@ -185,17 +182,16 @@ class InitializationVerifier(
             context.checkSelfPermission(android.Manifest.permission.FOREGROUND_SERVICE) == PackageManager.PERMISSION_GRANTED)
         checks += PreflightCheckItem(
             id = "foreground_service",
-            title = "7. Foreground-Service Eligibility",
+            title = "7. Direct Audio & Foreground Service",
             severity = when {
                 !fgEligible -> PreflightSeverity.BLOCKING_ERROR
-                !speechAvail && !dialogAvail -> PreflightSeverity.WARNING
+                !audioReady -> PreflightSeverity.WARNING
                 else -> PreflightSeverity.OK
             },
             message = when {
                 !fgEligible -> "Unable to start listening: foreground microphone permission not eligible."
-                !speechAvail && !dialogAvail -> "System speech service unavailable; text command mode active."
-                !speechAvail -> "Voice dialog fallback & foreground mic ready."
-                else -> "Microphone foreground service eligible and ready."
+                !audioReady -> "Direct microphone audio stream unavailable; text mode active."
+                else -> "Direct AudioRecord stream & foreground service ready."
             }
         )
 

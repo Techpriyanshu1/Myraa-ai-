@@ -63,8 +63,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -150,7 +148,6 @@ fun SetupWizardScreen(
     val voiceModel by remember { mutableStateOf(prefs.getSelectedVoiceModel()) }
     var isTestingVoice by remember { mutableStateOf(false) }
     var voiceTestResult by remember { mutableStateOf<VoiceTestResult?>(null) }
-    var nativeTtsFallback by remember { mutableStateOf(prefs.isNativeTtsFallbackEnabled()) }
 
     // Permissions State
     var isMicPermissionGranted by remember {
@@ -200,7 +197,7 @@ fun SetupWizardScreen(
         prefs.setVoiceApiKey(voiceKey.trim())
         prefs.setSelectedVoiceId(mahiVoiceId)
         prefs.setSelectedVoiceModel(voiceModel)
-        prefs.setNativeTtsFallbackEnabled(nativeTtsFallback)
+        prefs.setNativeTtsFallbackEnabled(false)
         prefs.setSetupCompleted(true)
         fleetManager.refreshFleetStatus(clearErrors = true)
         onSetupCompleted()
@@ -634,7 +631,7 @@ fun SetupWizardScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Android Mahi TTS is active by default • Tap to add ElevenLabs or Accessibility",
+                                text = "Gemini AI Voice (Mahi) active automatically • Tap for ElevenLabs or Accessibility",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary,
                                 fontSize = 11.sp
@@ -714,7 +711,7 @@ fun SetupWizardScreen(
                                     .fillMaxWidth()
                                     .testTag("voice_key_input"),
                                 label = { Text("ElevenLabs API Key (Optional)") },
-                                placeholder = { Text("sk_... (blank = Native TTS)") },
+                                placeholder = { Text("sk_... (blank = Gemini Neural AI Voice)") },
                                 visualTransformation = if (showVoiceKey) VisualTransformation.None else PasswordVisualTransformation(),
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                                 trailingIcon = {
@@ -762,36 +759,12 @@ fun SetupWizardScreen(
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "Native Android TTS Fallback",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = TextPrimary,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                    Text(
-                                        text = "Speaks locally if ElevenLabs is unconfigured or offline",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = TextSecondary,
-                                        fontSize = 10.sp
-                                    )
-                                }
-                                Switch(
-                                    checked = nativeTtsFallback,
-                                    onCheckedChange = { nativeTtsFallback = it },
-                                    colors = SwitchDefaults.colors(
-                                        checkedThumbColor = AuroraPink,
-                                        checkedTrackColor = AuroraPink.copy(alpha = 0.3f),
-                                        uncheckedThumbColor = TextSecondary,
-                                        uncheckedTrackColor = DarkSurfaceBorder
-                                    )
-                                )
-                            }
+                            Text(
+                                text = "AI Voice Only: MYRAA uses Gemini Neural Voice automatically (or ElevenLabs if key provided).",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = CyanPrimary,
+                                fontSize = 11.sp
+                            )
 
                             voiceTestResult?.let { res ->
                                 Spacer(modifier = Modifier.height(6.dp))

@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
@@ -103,6 +104,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun SettingsScreen(
     onNavigateBack: () -> Unit,
+    onNavigateToMemory: () -> Unit = {},
     onNavigateToPermissions: () -> Unit,
     onNavigateToAgentFleet: () -> Unit,
     onNavigateToSecurity: () -> Unit,
@@ -205,6 +207,13 @@ fun SettingsScreen(
                         fontWeight = FontWeight.Bold,
                         color = CyanPrimary,
                         modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+                    )
+
+                    SettingsNavRow(
+                        icon = Icons.Default.Psychology,
+                        title = "Memory Core & Preferences",
+                        subtitle = "Manage custom memories (family name, habits) & view locked core bond",
+                        onClick = onNavigateToMemory
                     )
 
                     SettingsNavRow(
@@ -454,8 +463,8 @@ fun SettingsScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("settings_voice_key"),
-                        label = { Text("ElevenLabs API Key (Optional for Neural Mahi)") },
-                        placeholder = { Text("sk_... (leave blank for Native TTS)") },
+                        label = { Text("ElevenLabs API Key (Optional)") },
+                        placeholder = { Text("sk_... (leave blank for Gemini Neural AI Voice)") },
                         visualTransformation = if (showVoiceKey) VisualTransformation.None else PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                         trailingIcon = {
@@ -550,7 +559,7 @@ fun SettingsScreen(
                         } else {
                             Icon(Icons.Default.PlayArrow, contentDescription = null, tint = AuroraPink, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Test ElevenLabs Mahi Voice", color = AuroraPink, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text("Test AI Mahi Voice", color = AuroraPink, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         }
                     }
 

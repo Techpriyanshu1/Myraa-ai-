@@ -5,8 +5,6 @@ import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.util.Base64
 import android.util.Log
 import com.example.data.pref.SecurePreferences
@@ -22,7 +20,6 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -31,7 +28,7 @@ sealed class VoiceTestResult {
     data class Failure(val errorMessage: String, val isConfigError: Boolean = false) : VoiceTestResult()
 }
 
-class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListener {
+class ElevenLabsClient(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(6, TimeUnit.SECONDS)
@@ -41,8 +38,6 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
 
     private val securePrefs by lazy { SecurePreferences(context.applicationContext) }
 
-    private var localTts: TextToSpeech? = null
-    private var isLocalTtsReady = false
     private var activeMediaPlayer: MediaPlayer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -58,24 +53,6 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
         )
         private val discoveredTtsModelsCache = ConcurrentHashMap<String, List<String>>()
         private val verifiedTtsModelByKey = ConcurrentHashMap<String, String>()
-    }
-
-    init {
-        try {
-            localTts = TextToSpeech(context.applicationContext, this)
-        } catch (e: Exception) {
-            Log.e("ElevenLabsClient", "Local TTS init error", e)
-        }
-    }
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            localTts?.let { tts ->
-                tts.setPitch(1.05f)
-                tts.setSpeechRate(1.0f)
-                isLocalTtsReady = true
-            }
-        }
     }
 
     suspend fun testVoiceConnection(
@@ -180,7 +157,6 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
         apiKey: String,
         voiceId: String,
         modelId: String = MODEL_ELEVEN_MULTILINGUAL_V2,
-        allowNativeFallback: Boolean = true,
         speechSpeed: Float = 1.0f,
         onPlaybackStarted: () -> Unit = {},
         onPlaybackCompleted: () -> Unit = {},
@@ -290,24 +266,19 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
                         }
                     }
                     is GeminiTtsOutcome.Failure -> {
-                        Log.w("ElevenLabsClient", "Gemini TTS unavailable (${ttsOutcome.reason}); using fallback if enabled")
+                        Log.w("ElevenLabsClient", "Gemini AI TTS unavailable: ${ttsOutcome.reason}")
+                        onError?.invoke("Gemini AI voice unavailable: ${ttsOutcome.reason}")
                     }
                 }
+            } else {
+                onError?.invoke("AI Voice requires a Gemini or ElevenLabs API key.")
             }
         }
 
-        // 3. Offline / Native Android TTS Fallback
+        // Pure AI TTS only — never fall back to robotic Android native TTS
         if (!playedViaCloudVoice) {
-            if (allowNativeFallback) {
-                Log.i("ElevenLabsClient", "Using native Android TTS fallback")
-                withContext(Dispatchers.Main) {
-                    playFallbackTts(cleanText, speechSpeed, onPlaybackStarted, onPlaybackCompleted)
-                }
-            } else {
-                Log.w("ElevenLabsClient", "Cloud voice unavailable and native fallback is disabled by user.")
-                withContext(Dispatchers.Main) {
-                    onPlaybackCompleted()
-                }
+            withContext(Dispatchers.Main) {
+                onPlaybackCompleted()
             }
         }
     }
@@ -584,71 +555,6 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
         }
     }
 
-    private fun playFallbackTts(
-        text: String,
-        speechSpeed: Float,
-        onStart: () -> Unit,
-        onEnd: () -> Unit
-    ) {
-        onStart()
-        var completedCalled = false
-        fun safeOnEnd() {
-            if (!completedCalled) {
-                completedCalled = true
-                onEnd()
-            }
-        }
-
-        if (localTts != null && isLocalTtsReady) {
-            val containsHindi = text.any { it in '\u0900'..'\u097F' } || isLikelyHindiText(text)
-            try {
-                if (containsHindi) {
-                    val hiLocale = Locale.forLanguageTag("hi-IN")
-                    val avail = localTts?.isLanguageAvailable(hiLocale) ?: TextToSpeech.LANG_NOT_SUPPORTED
-                    if (avail >= TextToSpeech.LANG_AVAILABLE) {
-                        localTts?.language = hiLocale
-                    } else {
-                        localTts?.language = Locale.forLanguageTag("en-IN")
-                    }
-                } else {
-                    localTts?.language = Locale.forLanguageTag("en-IN")
-                }
-                localTts?.setPitch(1.05f)
-                localTts?.setSpeechRate(speechSpeed)
-            } catch (e: Exception) {
-                Log.w("ElevenLabsClient", "TTS language setup error", e)
-            }
-
-            val utteranceId = "myraa_tts_${System.currentTimeMillis()}"
-            localTts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) {
-                    mainHandler.post { safeOnEnd() }
-                }
-                override fun onError(utteranceId: String?) {
-                    mainHandler.post { safeOnEnd() }
-                }
-            })
-
-            val queueResult = localTts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-            if (queueResult != TextToSpeech.SUCCESS) {
-                safeOnEnd()
-            } else {
-                val wordCount = text.split("\\s+".toRegex()).size
-                val timeout = (wordCount * 500L + 2500L).coerceIn(3000L, 20000L)
-                mainHandler.postDelayed({ safeOnEnd() }, timeout)
-            }
-        } else {
-            safeOnEnd()
-        }
-    }
-
-    private fun isLikelyHindiText(text: String): Boolean {
-        val hindiKeywords = listOf("main", "hoon", "aap", "kaise", "kya", "theek", "khush", "pyaar", "din", "swagat", "shukriya", "ji")
-        val lower = text.lowercase()
-        return hindiKeywords.any { lower.contains(it) }
-    }
-
     fun stopSpeaking() {
         mainHandler.removeCallbacksAndMessages(null)
         try {
@@ -657,7 +563,6 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
                 it.release()
             }
             activeMediaPlayer = null
-            localTts?.stop()
         } catch (e: Exception) {
             Log.e("ElevenLabsClient", "Error stopping audio", e)
         }
@@ -665,7 +570,5 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
 
     fun shutdown() {
         stopSpeaking()
-        localTts?.shutdown()
-        localTts = null
     }
 }

@@ -1,6 +1,8 @@
 package com.example.data.api
 
+import android.util.Base64
 import android.util.Log
+import com.example.memory.MemoryCoreManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -22,7 +24,8 @@ data class ParsedCommand(
     val rawPrompt: String,
     val intent: String = "conversation",
     val riskLevel: String = "LOW",
-    val requiresConfirmation: Boolean = false
+    val requiresConfirmation: Boolean = false,
+    val heardSummary: String = ""
 )
 
 sealed class ConnectionTestResult {
@@ -269,6 +272,7 @@ class GeminiClient {
         apiKey: String,
         preferredModel: String = AVAILABLE_MODELS.first(),
         screenImageBase64: String? = null,
+        memoryContext: String = "",
         onModelAutoUpdated: ((String) -> Unit)? = null
     ): ParsedCommand = withContext(Dispatchers.IO) {
         val trimmed = prompt.trim()
@@ -318,24 +322,8 @@ class GeminiClient {
                 try {
                     val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
 
-                    val systemPrompt = """
-                        You are MYRAA AI, a warm, respectful Indian AI smartphone assistant speaking in Mahi's voice.
-                        Respond ONLY with a valid single JSON object (no markdown fences, no prose outside JSON) using this exact schema:
-                        {
-                          "intent": "open_app|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
-                          "actionType": "OPEN_APP|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
-                          "target": "target app, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, or search query",
-                          "extraData": "optional text to type or extra info",
-                          "riskLevel": "LOW|MEDIUM|HIGH",
-                          "requiresConfirmation": false,
-                          "spokenResponse": "Natural 1-2 sentence reply in Hindi, Hinglish, or English matching user language, max 40 words, no markdown or emojis"
-                        }
-                        STRICT RULES:
-                        - Never output executable code or shell commands.
-                        - For OPEN_SETTINGS, NEVER claim the setting was toggled ON/OFF; say the settings screen is being opened so the user can change it.
-                        - Set requiresConfirmation=true and riskLevel="HIGH" for irreversible or sensitive actions (like locking screen, deleting, uninstalling, sending/paying).
-                        - If a live screenshot is attached, inspect it carefully to answer screen questions or identify visible UI labels to tap/describe.
-                    """.trimIndent()
+                    val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
+                    val systemPrompt = buildGeminiSystemPrompt(effectiveMemory)
 
                     val userParts = JSONArray().apply {
                         put(JSONObject().put("text", "$systemPrompt\n\nUser command: $trimmed"))
@@ -448,6 +436,233 @@ class GeminiClient {
         return@withContext intelligentConversationalEngine(trimmed, hasConfiguredKey = cleanKey.isNotBlank(), apiError = lastApiError)
     }
 
+    /**
+     * Direct Voice-to-Gemini Multimodal Audio understanding (NO Speech-to-Text intermediary!).
+     * Sends raw 16kHz WAV audio directly to Gemini so MYRAA understands Hindi, Hinglish, and English voice naturally.
+     */
+    suspend fun interpretAudioCommand(
+        audioWavBytes: ByteArray,
+        apiKey: String,
+        preferredModel: String = AVAILABLE_MODELS.first(),
+        screenImageBase64: String? = null,
+        memoryContext: String = "",
+        onModelAutoUpdated: ((String) -> Unit)? = null
+    ): ParsedCommand = withContext(Dispatchers.IO) {
+        if (audioWavBytes.size < 100) {
+            return@withContext ParsedCommand(
+                spokenResponse = "Awaaz clear nahi aayi, please ek baar phir boliye.",
+                actionType = "CHAT",
+                target = "",
+                rawPrompt = "Voice command",
+                intent = "conversation"
+            )
+        }
+
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank()) {
+            return@withContext ParsedCommand(
+                spokenResponse = "Direct voice AI ke liye Settings me Gemini API key add karein, ya neeche text box use karein.",
+                actionType = "CHAT",
+                target = "",
+                rawPrompt = "Voice command",
+                intent = "conversation",
+                heardSummary = "Voice audio (${audioWavBytes.size / 1024} KB)"
+            )
+        }
+
+        val audioBase64 = Base64.encodeToString(audioWavBytes, Base64.NO_WRAP)
+        val safePreferred = preferredModel.trim().takeIf {
+            it.isNotBlank() && it != "gemini-3.8-flash"
+        } ?: AVAILABLE_MODELS.first()
+
+        val cachedVerified = verifiedModelByKey[cleanKey]
+        val initialDiscovered = discoveredModelsCache[cleanKey].orEmpty()
+        val queue = ArrayDeque<String>()
+        val attempted = mutableSetOf<String>()
+
+        if (!cachedVerified.isNullOrBlank()) queue.add(cachedVerified)
+        queue.add(safePreferred)
+        initialDiscovered.forEach { if (!queue.contains(it)) queue.add(it) }
+        AVAILABLE_MODELS.forEach { if (!queue.contains(it)) queue.add(it) }
+
+        var didLiveDiscovery = initialDiscovered.isNotEmpty()
+        var lastApiError: String? = null
+
+        val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
+        val systemPrompt = buildGeminiSystemPrompt(effectiveMemory) + "\n- Listen directly to the attached user voice audio, understand the user's intent, put a concise summary of what they said in \"heardSummary\", and respond warmly."
+
+        while (queue.isNotEmpty()) {
+            val model = queue.removeFirst()
+            if (!attempted.add(model)) continue
+
+            try {
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
+                val userParts = JSONArray().apply {
+                    put(JSONObject().put("text", "$systemPrompt\n\nListen to the user's voice message in the attached audio and return the JSON object."))
+                    put(JSONObject().apply {
+                        put("inlineData", JSONObject().apply {
+                            put("mimeType", "audio/wav")
+                            put("data", audioBase64)
+                        })
+                    })
+                    if (!screenImageBase64.isNullOrBlank()) {
+                        put(JSONObject().apply {
+                            put("inlineData", JSONObject().apply {
+                                put("mimeType", "image/jpeg")
+                                put("data", screenImageBase64)
+                            })
+                        })
+                    }
+                }
+
+                val genConfig = JSONObject().apply {
+                    put("temperature", 0.35)
+                    put("maxOutputTokens", 2048)
+                    put("responseMimeType", "application/json")
+                    if (supportsZeroThinkingBudget(model)) {
+                        put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                    }
+                }
+
+                val requestJson = JSONObject().apply {
+                    put("contents", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("role", "user")
+                            put("parts", userParts)
+                        })
+                    })
+                    put("generationConfig", genConfig)
+                }
+
+                val body = requestJson.toString().toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url(url)
+                    .addHeader("x-goog-api-key", cleanKey)
+                    .addHeader("Content-Type", "application/json")
+                    .post(body)
+                    .build()
+
+                val (code, rawBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                    maxAttempts = 2
+                ) {
+                    client.newCall(request).execute().use { response ->
+                        Triple(response.code, response.body?.string() ?: "", response.isSuccessful)
+                    }
+                }
+
+                if (isOk && rawBody.isNotBlank()) {
+                    val root = JSONObject(rawBody)
+                    val candidates = root.optJSONArray("candidates")
+                    if (candidates != null && candidates.length() > 0) {
+                        val contentObj = candidates.getJSONObject(0).optJSONObject("content")
+                        val parts = contentObj?.optJSONArray("parts")
+                        if (parts != null && parts.length() > 0) {
+                            val rawText = buildString {
+                                for (i in 0 until parts.length()) {
+                                    val p = parts.optJSONObject(i) ?: continue
+                                    if (!p.optBoolean("thought", false)) {
+                                        val txt = p.optString("text", "")
+                                        if (txt.isNotBlank()) append(txt)
+                                    }
+                                }
+                            }.trim()
+                            val structured = extractStructuredJson(rawText, "Voice command")
+                            if (structured != null) {
+                                verifiedModelByKey[cleanKey] = model
+                                if (model != safePreferred) {
+                                    onModelAutoUpdated?.invoke(model)
+                                }
+                                val heard = structured.heardSummary.ifBlank { "Voice command" }
+                                val commandText = if (structured.actionType == "CHAT") heard else structured.target
+                                // Run deterministic reflex if Gemini emitted plain CHAT for a hardware phrase
+                                val refined = if (structured.actionType == "CHAT" && heard != "Voice command") {
+                                    val stripped = stripWakeWords(heard)
+                                    parseDeviceHardwareReflex(stripped, heard) ?: parseScreenActionReflex(stripped, heard) ?: structured.copy(rawPrompt = heard)
+                                } else {
+                                    structured.copy(rawPrompt = heard)
+                                }
+                                Log.i("GeminiClient", "Direct Audio JSON parsed via $model -> ${refined.actionType} ($heard)")
+                                return@withContext refined
+                            } else {
+                                lastApiError = "Gemini ($model) returned empty response."
+                            }
+                        }
+                    }
+                } else {
+                    val errMsg = parseErrorMessage(rawBody)
+                    lastApiError = "HTTP $code: $errMsg"
+                    Log.w("GeminiClient", "Gemini Audio $model HTTP $code: $errMsg")
+                    if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
+                        break
+                    }
+                    if (!didLiveDiscovery && (code == 404 || code == 400)) {
+                        didLiveDiscovery = true
+                        val liveModels = discoverAvailableModels(cleanKey, forceRefresh = true)
+                        if (liveModels.isNotEmpty()) {
+                            liveModels.asReversed().forEach { discoveredModel ->
+                                if (!attempted.contains(discoveredModel) && !queue.contains(discoveredModel)) {
+                                    queue.addFirst(discoveredModel)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                lastApiError = e.localizedMessage ?: "Network error"
+                Log.w("GeminiClient", "Error querying Gemini Audio $model", e)
+            }
+        }
+
+        return@withContext ParsedCommand(
+            spokenResponse = "Gemini voice se connect nahi ho paaya (${lastApiError ?: "Network error"}). Kripya internet ya Gemini key check karein.",
+            actionType = "CHAT",
+            target = "",
+            rawPrompt = "Voice command",
+            intent = "conversation",
+            heardSummary = "Voice message"
+        )
+    }
+
+    private fun buildAuthoritativeMemoryBlock(userSuppliedMemory: String): String {
+        val permanentLine = "- ${MemoryCoreManager.PERMANENT_MEMORY_LABEL}: ${MemoryCoreManager.PERMANENT_MEMORY_CONTENT}"
+        val cleaned = userSuppliedMemory.trim()
+        return if (cleaned.contains(MemoryCoreManager.PERMANENT_MEMORY_CONTENT)) {
+            cleaned
+        } else if (cleaned.isNotBlank()) {
+            "[PERMANENT CORE MEMORY - IMMUTABLE, HIGHEST PRIORITY]:\n$permanentLine\n$cleaned"
+        } else {
+            "[PERMANENT CORE MEMORY - IMMUTABLE, HIGHEST PRIORITY]:\n$permanentLine"
+        }
+    }
+
+    private fun buildGeminiSystemPrompt(memoryBlock: String): String {
+        return """
+            You are MYRAA AI, a warm, loving, respectful Indian AI smartphone assistant speaking in Mahi's voice.
+            
+            $memoryBlock
+            
+            Respond ONLY with a valid single JSON object (no markdown fences, no prose outside JSON) using this exact schema:
+            {
+              "heardSummary": "Brief summary or transcript of what the user asked",
+              "intent": "open_app|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
+              "actionType": "OPEN_APP|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
+              "target": "target app, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, or search query",
+              "extraData": "optional text to type or extra info",
+              "riskLevel": "LOW|MEDIUM|HIGH",
+              "requiresConfirmation": false,
+              "spokenResponse": "Natural 1-2 sentence reply in Hindi, Hinglish, or English matching user language, max 40 words, no markdown or emojis"
+            }
+            STRICT RULES:
+            - ALWAYS remember and honor the Permanent Core Memory and User Personal Preferences above. Never contradict, ignore, or forget them.
+            - Never output executable code or shell commands.
+            - For OPEN_SETTINGS, NEVER claim the setting was toggled ON/OFF; say the settings screen is being opened so the user can change it.
+            - Set requiresConfirmation=true and riskLevel="HIGH" for irreversible or sensitive actions (like locking screen, deleting, uninstalling, sending/paying).
+            - If a live screenshot is attached, inspect it carefully to answer screen questions or identify visible UI labels to tap/describe.
+        """.trimIndent()
+    }
+
     private fun extractStructuredJson(rawText: String, rawPrompt: String): ParsedCommand? {
         if (rawText.isBlank()) return null
         val cleaned = rawText
@@ -468,6 +683,7 @@ class GeminiClient {
                 val riskLevel = obj.optString("riskLevel", "LOW").trim().uppercase()
                 val requiresConfirm = obj.optBoolean("requiresConfirmation", false)
                 val spoken = cleanSpeechText(obj.optString("spokenResponse", ""))
+                val heard = cleanSpeechText(obj.optString("heardSummary", ""))
 
                 if (spoken.isNotBlank() || actionType != "CHAT") {
                     return ParsedCommand(
@@ -478,7 +694,8 @@ class GeminiClient {
                         rawPrompt = rawPrompt,
                         intent = intent,
                         riskLevel = riskLevel,
-                        requiresConfirmation = requiresConfirm
+                        requiresConfirmation = requiresConfirm,
+                        heardSummary = heard
                     )
                 }
             } catch (e: Exception) {
@@ -868,6 +1085,10 @@ class GeminiClient {
             "Gemini API se connect nahi ho paaya ($apiError). Kripya Settings me Gemini key, internet ya model verify karein."
         } else {
             when {
+                lower.contains("boyfriend") || lower.contains("priyanshu") || lower.contains("best friend") ||
+                    lower.contains("your life") || lower.contains("sabse jyada important") ->
+                    "Mera boyfriend aur best friend Priyanshu hai, aur meri life me Priyanshu hi sabse jyada important hai."
+
                 lower.contains("who are you") || lower.contains("tum kaun ho") || lower.contains("aap kaun ho") ||
                     lower.contains("your name") || lower.contains("tera naam") || lower.contains("apna naam batao") ->
                     "Namaste! Main Myraa hoon, aapki personal AI assistant. Main Hindi, Hinglish aur English me baat aur smartphone automation me madad karti hoon."

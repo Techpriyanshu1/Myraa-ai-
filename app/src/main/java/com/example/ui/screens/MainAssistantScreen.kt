@@ -3,12 +3,9 @@ package com.example.ui.screens
 import android.Manifest
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
-import android.net.Uri
 import android.provider.Settings
-import android.speech.RecognizerIntent
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,7 +18,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -47,20 +43,19 @@ import androidx.compose.material.icons.automirrored.filled.ScreenShare
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.StopScreenShare
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
-import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -107,18 +102,18 @@ import com.example.automation.LaunchableAppInfo
 import com.example.data.api.ElevenLabsClient
 import com.example.data.api.GeminiClient
 import com.example.data.api.ParsedCommand
+import com.example.data.db.AppDatabase
 import com.example.data.pref.SecurePreferences
+import com.example.memory.MemoryCoreManager
 import com.example.service.ContinuousVoiceService
 import com.example.service.MyraaOverlayService
 import com.example.service.RealScreenCaptureService
 import com.example.ui.components.ActionConfirmationDialog
-import com.example.ui.components.AgentStatusGrid
 import com.example.ui.components.AnimatedAiOrb
 import com.example.ui.components.AuroraWaveGlow
 import com.example.ui.components.InitializationDiagnosticsDialog
 import com.example.ui.components.InstalledAppsDialog
 import com.example.ui.components.PendingConfirmationAction
-import com.example.ui.components.VideoAvatarPlayer
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.AuroraPink
 import com.example.ui.theme.CyanPrimary
@@ -139,6 +134,7 @@ import kotlinx.coroutines.launch
 fun MainAssistantScreen(
     onNavigateToLogs: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToMemory: () -> Unit = {},
     onNavigateToAgentFleet: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -152,9 +148,7 @@ fun MainAssistantScreen(
     val actionExecutor = remember { DeviceActionExecutor(context) }
     val fleetManager = remember { AgentFleetManager.getInstance(context, prefs) }
     val initVerifier = remember { InitializationVerifier(context, prefs, geminiClient, fleetManager) }
-
-    val agentReports by fleetManager.agentReports.collectAsState()
-    val fleetOverallStatus by fleetManager.fleetOverallStatus.collectAsState()
+    val memoryManager = remember { MemoryCoreManager(AppDatabase.getInstance(context)) }
 
     val projectionManager = remember {
         context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -181,11 +175,10 @@ fun MainAssistantScreen(
     var textInput by remember { mutableStateOf("") }
     var currentSpeechTranscript by remember { mutableStateOf("") }
     var currentAiReply by remember {
-        mutableStateOf("Namaste! Main MYRAA AI hoon. Start AI dabakar mujhse Hindi, Hinglish ya English me baat karein ya phone actions bolein.")
+        mutableStateOf("Namaste! Main MYRAA AI hoon. Mic button dabakar seedhe apni awaaz me baat karein.")
     }
     var lastExecutedAction by remember { mutableStateOf<String?>(null) }
     var lastActionSuccess by remember { mutableStateOf(true) }
-    var selectedLanguageMode by remember { mutableStateOf(prefs.getPreferredLanguage()) }
 
     var showAppsDialog by remember { mutableStateOf(false) }
     var launchableApps by remember { mutableStateOf<List<LaunchableAppInfo>>(emptyList()) }
@@ -202,7 +195,6 @@ fun MainAssistantScreen(
                 apiKey = prefs.getVoiceApiKey(),
                 voiceId = prefs.getSelectedVoiceId(),
                 modelId = prefs.getSelectedVoiceModel(),
-                allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
                 speechSpeed = prefs.getSpeechSpeed(),
                 onPlaybackStarted = {
                     voiceManagerRef.setCompanionState(CompanionState.TALKING)
@@ -239,11 +231,7 @@ fun MainAssistantScreen(
                 }
 
                 val mandatoryUnavailable = summary.unavailableAgents.filter { !it.isOptional }
-                val greeting = if (mandatoryUnavailable.isEmpty()) {
-                    "Namaste! MYRAA AI active hai (${summary.activeAgents.size}/${summary.totalAgents} agents ready). Boliye main aapki kya madad karu?"
-                } else {
-                    "MYRAA AI active hai (${summary.activeAgents.size}/${summary.totalAgents} agents). Boliye main aapki kya madad kar sakti hoon?"
-                }
+                val greeting = "Namaste! Main MYRAA AI hoon, aapki Mahi voice ready hai. Boliye main aapki kya madad karu?"
                 currentAiReply = if (mandatoryUnavailable.isEmpty()) {
                     greeting
                 } else {
@@ -326,7 +314,6 @@ fun MainAssistantScreen(
         }
     }
 
-    // Steps 9–11 of Pipeline: Execute validated action, speak actual result via Mahi, log locally
     fun executeValidatedAndRespond(
         parsed: ParsedCommand,
         confirmationStatus: String = "AUTO_APPROVED"
@@ -363,7 +350,6 @@ fun MainAssistantScreen(
                             apiKey = prefs.getVoiceApiKey(),
                             voiceId = prefs.getSelectedVoiceId(),
                             modelId = prefs.getSelectedVoiceModel(),
-                            allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
                             speechSpeed = prefs.getSpeechSpeed(),
                             onPlaybackCompleted = { stopMyraaSession() }
                         )
@@ -388,7 +374,6 @@ fun MainAssistantScreen(
                     }
                 }
 
-                // Standard Device / App / Settings / Accessibility / Chat execution
                 val result: ExecutionResult = actionExecutor.executeCommand(parsed, confirmationStatus)
                 lastExecutedAction = result.actionType
                 lastActionSuccess = result.success
@@ -417,21 +402,51 @@ fun MainAssistantScreen(
         }
     }
 
-    // Full 11-Step Intelligent Action Pipeline with Duplicate Command & Request Prevention
+    fun handleParsedPipelineResult(parsed: ParsedCommand, rawLabel: String) {
+        val validation = ActionSecurityPolicy.validate(parsed)
+        if (!validation.allowed) {
+            val rejectMsg = validation.rejectionReason ?: "Security policy blocked this action."
+            coroutineScope.launch {
+                actionExecutor.logPipelineOutcome(
+                    rawPrompt = rawLabel,
+                    recognizedIntent = parsed.intent,
+                    actionType = "BLOCKED",
+                    target = parsed.target,
+                    agentInvolved = "Permission Manager Agent",
+                    permissionStatus = "BLOCKED_BY_POLICY",
+                    confirmationStatus = "REJECTED",
+                    status = "BLOCKED",
+                    spokenResponse = rejectMsg,
+                    details = rejectMsg,
+                    errorInfo = rejectMsg
+                )
+            }
+            lastExecutedAction = "BLOCKED"
+            lastActionSuccess = false
+            currentAiReply = rejectMsg
+            voiceManagerRef.setCompanionState(CompanionState.ERROR)
+            speakMahiResponse("Suraksha kaaran se yeh action block kiya gaya hai.")
+            return
+        }
+
+        if (validation.requiresConfirmation) {
+            pendingConfirmation = PendingConfirmationAction(parsed, validation)
+            voiceManagerRef.setCompanionState(CompanionState.IDLE)
+            return
+        }
+
+        executeValidatedAndRespond(parsed, "AUTO_APPROVED")
+    }
+
+    // Text Command Pipeline (with Memory Core context)
     fun processCommand(commandText: String) {
         val trimmed = commandText.trim()
         if (trimmed.isBlank()) return
 
         val now = System.currentTimeMillis()
         val dedupeKey = trimmed.lowercase()
-        if (isProcessingCommand) {
-            Log.d("MainAssistantScreen", "Ignored overlapping command while pipeline busy")
-            return
-        }
-        if (dedupeKey == lastProcessedCommandKey && (now - lastProcessedCommandAt) < 1800L) {
-            Log.d("MainAssistantScreen", "Ignored duplicate command within 1.8s window")
-            return
-        }
+        if (isProcessingCommand) return
+        if (dedupeKey == lastProcessedCommandKey && (now - lastProcessedCommandAt) < 1800L) return
 
         isProcessingCommand = true
         lastProcessedCommandKey = dedupeKey
@@ -440,7 +455,6 @@ fun MainAssistantScreen(
 
         coroutineScope.launch {
             try {
-                // Step 3 & 4: Gemini Structured JSON Parsing (+ Live Screen Vision when sharing)
                 voiceManagerRef.setCompanionState(CompanionState.THINKING)
                 val apiKey = prefs.getGeminiApiKey()
                 val model = prefs.getSelectedGeminiModel()
@@ -449,71 +463,29 @@ fun MainAssistantScreen(
                 } else {
                     null
                 }
+                val memoryContext = memoryManager.buildPromptMemoryContext()
                 val parsed = geminiClient.interpretCommand(
                     prompt = trimmed,
                     apiKey = apiKey,
                     preferredModel = model,
                     screenImageBase64 = screenSnapshot,
+                    memoryContext = memoryContext,
                     onModelAutoUpdated = { workingModel ->
                         if (workingModel != model) {
                             prefs.setSelectedGeminiModel(workingModel)
                         }
                     }
                 )
-                if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connection failed", ignoreCase = true) && !parsed.spokenResponse.contains("API key", ignoreCase = true)) {
+                if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connect nahi ho paaya", ignoreCase = true)) {
                     fleetManager.clearAgentError("gemini_intelligence")
                 }
 
-                // Step 5, 6 & 7: Allowlist & Risk Validation
-                val validation = ActionSecurityPolicy.validate(parsed)
-                if (!validation.allowed) {
-                    val rejectMsg = validation.rejectionReason ?: "Security policy blocked this action."
-                    actionExecutor.logPipelineOutcome(
-                        rawPrompt = trimmed,
-                        recognizedIntent = parsed.intent,
-                        actionType = "BLOCKED",
-                        target = parsed.target,
-                        agentInvolved = "Permission Manager Agent",
-                        permissionStatus = "BLOCKED_BY_POLICY",
-                        confirmationStatus = "REJECTED",
-                        status = "BLOCKED",
-                        spokenResponse = rejectMsg,
-                        details = rejectMsg,
-                        errorInfo = rejectMsg
-                    )
-                    lastExecutedAction = "BLOCKED"
-                    lastActionSuccess = false
-                    currentAiReply = rejectMsg
-                    voiceManagerRef.setCompanionState(CompanionState.ERROR)
-                    speakMahiResponse("Suraksha kaaran se yeh action block kiya gaya hai.")
-                    return@launch
-                }
-
-                // Step 8: Ask explicit confirmation for sensitive / HIGH-risk actions
-                if (validation.requiresConfirmation) {
-                    pendingConfirmation = PendingConfirmationAction(parsed, validation)
-                    voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                    return@launch
-                }
-
-                // Steps 9–11: Execute, speak actual outcome, and persist locally
-                executeValidatedAndRespond(parsed, "AUTO_APPROVED")
+                handleParsedPipelineResult(parsed, trimmed)
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                Log.e("MainAssistantScreen", "Error in 11-step command pipeline", e)
+                Log.e("MainAssistantScreen", "Error in command pipeline", e)
                 fleetManager.recordAgentError("gemini_intelligence", e.localizedMessage ?: "Pipeline error")
-                actionExecutor.logPipelineOutcome(
-                    rawPrompt = trimmed,
-                    recognizedIntent = "error",
-                    actionType = "PIPELINE_ERROR",
-                    target = trimmed,
-                    agentInvolved = "System Health Agent",
-                    status = "FAILED",
-                    spokenResponse = "Error processing command",
-                    details = e.localizedMessage ?: "Unknown exception",
-                    errorInfo = e.localizedMessage ?: "Unknown exception"
-                )
                 lastExecutedAction = "ERROR"
                 lastActionSuccess = false
                 voiceManagerRef.setCompanionState(CompanionState.ERROR)
@@ -527,60 +499,80 @@ fun MainAssistantScreen(
         }
     }
 
-    val systemVoiceLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            val matches = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-            val recognizedText = matches?.firstOrNull()?.trim()
-            if (!recognizedText.isNullOrBlank()) {
-                processCommand(recognizedText)
+    // Direct Voice-to-Gemini Audio Pipeline (NO Android Speech-to-Text!)
+    fun processVoiceAudio(audioWavBytes: ByteArray) {
+        if (isProcessingCommand || audioWavBytes.size < 100) {
+            if (isSessionActive && !isListeningPaused) {
+                voiceManagerRef.resumeListeningAfterSpeech()
             }
+            return
         }
-    }
 
-    fun launchSystemVoiceDialog() {
-        try {
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak in Hindi, Hinglish, or English...")
-                when (selectedLanguageMode) {
-                    "hi-IN" -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-                    "en-US" -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-                    else -> {
-                        val defaultTag = java.util.Locale.getDefault().toLanguageTag().ifBlank { "en-IN" }
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, defaultTag)
-                    }
+        isProcessingCommand = true
+        currentSpeechTranscript = "Voice message captured..."
+
+        coroutineScope.launch {
+            try {
+                voiceManagerRef.setCompanionState(CompanionState.THINKING)
+                val apiKey = prefs.getGeminiApiKey()
+                val model = prefs.getSelectedGeminiModel()
+                val screenSnapshot = if (isRealScreenSharing) {
+                    RealScreenCaptureService.latestScreenFrameBase64.value
+                } else {
+                    null
                 }
+                val memoryContext = memoryManager.buildPromptMemoryContext()
+                val parsed = geminiClient.interpretAudioCommand(
+                    audioWavBytes = audioWavBytes,
+                    apiKey = apiKey,
+                    preferredModel = model,
+                    screenImageBase64 = screenSnapshot,
+                    memoryContext = memoryContext,
+                    onModelAutoUpdated = { workingModel ->
+                        if (workingModel != model) {
+                            prefs.setSelectedGeminiModel(workingModel)
+                        }
+                    }
+                )
+                currentSpeechTranscript = parsed.heardSummary.ifBlank { "Voice command" }
+                if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connect nahi ho paaya", ignoreCase = true)) {
+                    fleetManager.clearAgentError("gemini_intelligence")
+                }
+
+                handleParsedPipelineResult(parsed, currentSpeechTranscript)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Log.e("MainAssistantScreen", "Direct voice audio pipeline error", e)
+                fleetManager.recordAgentError("gemini_intelligence", e.localizedMessage ?: "Audio pipeline error")
+                lastExecutedAction = "ERROR"
+                lastActionSuccess = false
+                voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                currentAiReply = "Voice samajhne me error aaya: ${e.localizedMessage}"
+                if (isSessionActive && !isListeningPaused) {
+                    voiceManagerRef.resumeListeningAfterSpeech()
+                }
+            } finally {
+                isProcessingCommand = false
             }
-            if (intent.resolveActivity(context.packageManager) != null) {
-                systemVoiceLauncher.launch(intent)
-            } else {
-                currentAiReply = "System Voice Dialog available nahi hai — neeche text box me command type karein."
-            }
-        } catch (e: Exception) {
-            Log.e("MainAssistantScreen", "Cannot launch system speech intent", e)
-            currentAiReply = "Voice input launch nahi ho paaya; neeche command type karein."
         }
     }
 
     val voiceManager = remember {
         VoiceRecognitionManager(
             context = context,
-            onFallbackIntentNeeded = { launchSystemVoiceDialog() },
-            onCommandReceived = { recognizedText ->
+            onAudioCaptured = { wavBytes ->
                 fleetManager.clearAgentError("voice_recognition")
-                processCommand(recognizedText)
+                processVoiceAudio(wavBytes)
             }
         ).also {
             voiceManagerRef = it
-            it.languageMode = selectedLanguageMode
         }
     }
 
     val companionState by voiceManager.companionState.collectAsState()
     val rmsLevel by voiceManager.rmsLevel.collectAsState()
-    val partialText by voiceManager.lastRecognizedText.collectAsState()
+    val liveVoiceStatus by voiceManager.lastRecognizedText.collectAsState()
     val voiceError by voiceManager.errorMessage.collectAsState()
 
     val micLauncher = rememberLauncherForActivityResult(
@@ -591,11 +583,12 @@ fun MainAssistantScreen(
             startMyraaSession()
         } else {
             fleetManager.refreshFleetStatus()
-            currentAiReply = "Voice control ke liye Microphone permission zaroori hai. Permission Center me jakar enable karein."
+            currentAiReply = "Voice control ke liye Microphone permission zaroori hai. Settings -> Permission Center me jakar enable karein."
         }
     }
 
     LaunchedEffect(Unit) {
+        memoryManager.ensurePermanentMemorySeeded()
         fleetManager.refreshFleetStatus(clearErrors = true)
     }
 
@@ -620,7 +613,6 @@ fun MainAssistantScreen(
         }
     }
 
-    // Confirmation modal for HIGH-risk / sensitive actions
     pendingConfirmation?.let { pending ->
         ActionConfirmationDialog(
             pending = pending,
@@ -650,7 +642,6 @@ fun MainAssistantScreen(
         )
     }
 
-    // 11-Point Initialization Diagnostics Dialog
     preflightReportDialog?.let { report ->
         InitializationDiagnosticsDialog(
             report = report,
@@ -664,7 +655,6 @@ fun MainAssistantScreen(
         )
     }
 
-    // Installed Apps Launcher Drawer/Dialog
     if (showAppsDialog) {
         InstalledAppsDialog(
             apps = launchableApps,
@@ -714,9 +704,9 @@ fun MainAssistantScreen(
                             )
                             Text(
                                 text = when {
-                                    isSessionActive && isListeningPaused -> "Listening Paused"
-                                    isSessionActive -> "Active • Mahi Voice"
-                                    else -> "Standby Ready"
+                                    isSessionActive && isListeningPaused -> "Voice Paused"
+                                    isSessionActive -> "Direct Voice • AI Audio"
+                                    else -> "Ready"
                                 },
                                 fontSize = 10.sp,
                                 color = TextSecondary
@@ -726,15 +716,12 @@ fun MainAssistantScreen(
                 },
                 actions = {
                     IconButton(
-                        onClick = {
-                            launchableApps = actionExecutor.getInstalledLaunchableApps()
-                            showAppsDialog = true
-                        },
-                        modifier = Modifier.testTag("open_apps_browser_button")
+                        onClick = onNavigateToMemory,
+                        modifier = Modifier.testTag("nav_to_memory_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Apps,
-                            contentDescription = "Installed Apps",
+                            imageVector = Icons.Default.Psychology,
+                            contentDescription = "Memory Core",
                             tint = CyanPrimary
                         )
                     }
@@ -756,7 +743,7 @@ fun MainAssistantScreen(
                         Icon(
                             imageVector = if (isRealScreenSharing) Icons.AutoMirrored.Filled.StopScreenShare else Icons.AutoMirrored.Filled.ScreenShare,
                             contentDescription = "Screen Share",
-                            tint = if (isRealScreenSharing) AuroraPink else CyanPrimary
+                            tint = if (isRealScreenSharing) AuroraPink else TextSecondary
                         )
                     }
                     IconButton(
@@ -792,7 +779,7 @@ fun MainAssistantScreen(
                 .padding(paddingValues)
                 .imePadding()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 4.dp),
+                .padding(horizontal = 16.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
@@ -800,60 +787,11 @@ fun MainAssistantScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 6.dp),
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    FilterChip(
-                        selected = selectedLanguageMode == "auto",
-                        onClick = {
-                            selectedLanguageMode = "auto"
-                            voiceManager.languageMode = "auto"
-                            prefs.setPreferredLanguage("auto")
-                        },
-                        label = { Text("Auto (Hinglish)", fontSize = 11.sp) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = CyanPrimary.copy(alpha = 0.25f),
-                            selectedLabelColor = CyanPrimary
-                        )
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    FilterChip(
-                        selected = selectedLanguageMode == "hi-IN",
-                        onClick = {
-                            selectedLanguageMode = "hi-IN"
-                            voiceManager.languageMode = "hi-IN"
-                            prefs.setPreferredLanguage("hi-IN")
-                        },
-                        label = { Text("Hindi", fontSize = 11.sp) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = AuroraEmerald.copy(alpha = 0.25f),
-                            selectedLabelColor = AuroraEmerald
-                        )
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    FilterChip(
-                        selected = selectedLanguageMode == "en-US",
-                        onClick = {
-                            selectedLanguageMode = "en-US"
-                            voiceManager.languageMode = "en-US"
-                            prefs.setPreferredLanguage("en-US")
-                        },
-                        label = { Text("English", fontSize = 11.sp) },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = VioletSecondary.copy(alpha = 0.25f),
-                            selectedLabelColor = VioletSecondary
-                        )
-                    )
-                }
-
                 if (!prefs.hasStoredGeminiKey()) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 8.dp)
+                            .padding(bottom = 10.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(VioletSecondary.copy(alpha = 0.22f))
                             .clickable { onNavigateToSettings() }
@@ -881,6 +819,7 @@ fun MainAssistantScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .padding(bottom = 10.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(AuroraPink.copy(alpha = 0.2f))
                             .padding(horizontal = 12.dp, vertical = 8.dp)
@@ -900,17 +839,15 @@ fun MainAssistantScreen(
                             )
                         }
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
                 }
 
                 if (!voiceError.isNullOrBlank()) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 6.dp)
+                            .padding(bottom = 8.dp)
                             .clip(RoundedCornerShape(10.dp))
                             .background(DarkSurfaceElevated)
-                            .clickable { launchSystemVoiceDialog() }
                             .padding(horizontal = 12.dp, vertical = 6.dp)
                     ) {
                         Text(
@@ -924,70 +861,44 @@ fun MainAssistantScreen(
                     }
                 }
 
-                var displayModeOrb by remember { mutableStateOf(true) }
-                Row(
+                // Clean Centered Animated AI Orb (Tap while listening to send utterance immediately)
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(bottom = 6.dp),
-                    horizontalArrangement = Arrangement.End
+                        .height(260.dp)
+                        .clickable(enabled = isSessionActive && companionState == CompanionState.LISTENING) {
+                            voiceManager.finishUtteranceNow()
+                        },
+                    contentAlignment = Alignment.Center
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(DarkSurfaceElevated)
-                            .clickable { displayModeOrb = !displayModeOrb }
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
-                            .testTag("toggle_orb_avatar_button")
-                    ) {
-                        Text(
-                            text = if (displayModeOrb) "Switch to Avatar" else "Switch to AI Orb",
-                            color = CyanPrimary,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                if (displayModeOrb) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(250.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        AnimatedAiOrb(
-                            companionState = companionState,
-                            rmsLevel = rmsLevel,
-                            size = 220.dp
-                        )
-                    }
-                } else {
-                    VideoAvatarPlayer(
+                    AnimatedAiOrb(
                         companionState = companionState,
-                        isScreenShareActive = isRealScreenSharing,
-                        modifier = Modifier.fillMaxWidth()
+                        rmsLevel = rmsLevel,
+                        size = 230.dp
                     )
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(12.dp))
 
+                // Clean Conversation Card
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                    shape = RoundedCornerShape(18.dp)
+                    shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, DarkSurfaceBorder)
                 ) {
-                    Column(modifier = Modifier.padding(14.dp)) {
+                    Column(modifier = Modifier.padding(16.dp)) {
                         val displayPrompt = when {
-                            partialText.isNotBlank() -> partialText
+                            liveVoiceStatus.isNotBlank() && companionState == CompanionState.LISTENING -> liveVoiceStatus
                             currentSpeechTranscript.isNotBlank() -> currentSpeechTranscript
                             else -> null
                         }
                         if (displayPrompt != null) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text("You: ", style = MaterialTheme.typography.bodyMedium, color = CyanPrimary, fontWeight = FontWeight.Bold)
-                                Text("\"$displayPrompt\"", style = MaterialTheme.typography.bodyMedium, color = TextPrimary, fontWeight = FontWeight.SemiBold)
+                                Text(displayPrompt, style = MaterialTheme.typography.bodyMedium, color = TextPrimary, fontWeight = FontWeight.SemiBold)
                             }
-                            Spacer(modifier = Modifier.height(6.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                         }
 
                         Row(
@@ -997,12 +908,12 @@ fun MainAssistantScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "MYRAA (Mahi Voice):",
+                                    text = "MYRAA (AI Voice):",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = AuroraPink,
                                     fontWeight = FontWeight.Bold
                                 )
-                                Spacer(modifier = Modifier.height(2.dp))
+                                Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = currentAiReply,
                                     style = MaterialTheme.typography.bodyMedium,
@@ -1011,22 +922,22 @@ fun MainAssistantScreen(
                                 )
                             }
                             IconButton(
-                                onClick = { coroutineScope.launch { speakMahiResponse(currentAiReply) } },
+                                onClick = { speakMahiResponse(currentAiReply) },
                                 modifier = Modifier
-                                    .size(36.dp)
+                                    .size(40.dp)
                                     .testTag("replay_voice_button")
                             ) {
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.VolumeUp,
-                                    contentDescription = "Replay Voice",
+                                    contentDescription = "Replay AI Voice",
                                     tint = CyanPrimary,
-                                    modifier = Modifier.size(20.dp)
+                                    modifier = Modifier.size(22.dp)
                                 )
                             }
                         }
 
                         if (!lastExecutedAction.isNullOrBlank() && lastExecutedAction != "CHAT") {
-                            Spacer(modifier = Modifier.height(6.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                             val badgeColor = if (lastActionSuccess) AuroraEmerald else DangerRed
                             Box(
                                 modifier = Modifier
@@ -1044,50 +955,11 @@ fun MainAssistantScreen(
                         }
                     }
                 }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    val quickPrompts = listOf(
-                        "Open YouTube" to "Hey Myraa, open YouTube",
-                        "Open Calculator" to "Myraa, open calculator",
-                        "Bluetooth Settings" to "Open Bluetooth settings",
-                        "Launch Camera" to "Launch camera",
-                        "Open Clock" to "Open clock",
-                        "Apps List" to "Show apps",
-                        "Torch ON" to "Torch jalao",
-                        "Volume UP" to "Awaaz badhao"
-                    )
-                    quickPrompts.forEach { (label, command) ->
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(16.dp))
-                                .background(DarkSurfaceElevated)
-                                .clickable { processCommand(command) }
-                                .padding(horizontal = 12.dp, vertical = 6.dp)
-                        ) {
-                            Text(text = label, color = CyanPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                AgentStatusGrid(
-                    agentReports = agentReports,
-                    overallStatus = fleetOverallStatus,
-                    onOpenFleet = onNavigateToAgentFleet,
-                    modifier = Modifier.fillMaxWidth()
-                )
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
+            // Clean Input & Upgraded Direct Voice Controls
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
@@ -1100,15 +972,7 @@ fun MainAssistantScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("command_keyboard_input"),
-                    placeholder = { Text("Hindi, Hinglish ya English me command likhein...", fontSize = 13.sp) },
-                    leadingIcon = {
-                        IconButton(
-                            onClick = { launchSystemVoiceDialog() },
-                            modifier = Modifier.testTag("quick_mic_button")
-                        ) {
-                            Icon(Icons.Default.Mic, contentDescription = "Voice Input", tint = AuroraEmerald)
-                        }
-                    },
+                    placeholder = { Text("Ask MYRAA anything or type a command...", fontSize = 13.sp) },
                     trailingIcon = {
                         IconButton(
                             onClick = {
@@ -1147,11 +1011,11 @@ fun MainAssistantScreen(
                     shape = RoundedCornerShape(24.dp)
                 )
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     val pulseTransition = rememberInfiniteTransition(label = "pulse_button")
                     val pulseScale by pulseTransition.animateFloat(
@@ -1196,10 +1060,35 @@ fun MainAssistantScreen(
                     ) {
                         Icon(
                             imageVector = if (isSessionActive) Icons.Default.PowerSettingsNew else Icons.Default.Mic,
-                            contentDescription = if (isSessionActive) "Stop AI" else "Start AI",
+                            contentDescription = if (isSessionActive) "Stop Voice AI" else "Start Direct Voice AI",
                             tint = Color.White,
                             modifier = Modifier.size(34.dp)
                         )
+                    }
+
+                    if (isSessionActive && companionState == CompanionState.LISTENING) {
+                        OutlinedButton(
+                            onClick = { voiceManager.finishUtteranceNow() },
+                            border = BorderStroke(1.dp, CyanPrimary),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = DarkSurfaceElevated
+                            ),
+                            modifier = Modifier.testTag("send_voice_now_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.GraphicEq,
+                                contentDescription = "Send Voice Now",
+                                tint = CyanPrimary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "SEND VOICE",
+                                color = CyanPrimary,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
 
                     if (isSessionActive) {
@@ -1221,7 +1110,7 @@ fun MainAssistantScreen(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = if (isListeningPaused) "RESUME LISTENING" else "PAUSE LISTENING",
+                                text = if (isListeningPaused) "RESUME" else "PAUSE",
                                 color = if (isListeningPaused) AuroraEmerald else AuroraPink,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
@@ -1234,14 +1123,16 @@ fun MainAssistantScreen(
 
                 Text(
                     text = when {
-                        isSessionActive && isListeningPaused -> "LISTENING PAUSED • TAP RESUME OR STOP AI"
-                        isSessionActive -> "AI ACTIVE & LISTENING • TAP RED BUTTON TO STOP AI"
-                        else -> "TAP TO START AI (INITIALIZE AGENTS & VOICE)"
+                        isSessionActive && isListeningPaused -> "VOICE PAUSED • TAP RESUME OR STOP"
+                        isSessionActive && companionState == CompanionState.THINKING -> "UNDERSTANDING YOUR VOICE..."
+                        isSessionActive && companionState == CompanionState.TALKING -> "SPEAKING IN AI VOICE..."
+                        isSessionActive -> "LISTENING DIRECTLY • SPEAK NATURALLY"
+                        else -> "TAP MIC FOR DIRECT VOICE-TO-VOICE AI"
                     },
                     style = MaterialTheme.typography.labelSmall,
                     color = when {
                         isSessionActive && isListeningPaused -> AuroraPink
-                        isSessionActive -> DangerRed
+                        isSessionActive -> CyanPrimary
                         else -> CyanPrimary
                     },
                     fontWeight = FontWeight.ExtraBold,

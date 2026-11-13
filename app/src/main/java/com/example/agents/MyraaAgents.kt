@@ -5,10 +5,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
 import android.provider.Settings
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import com.example.data.db.AppDatabase
 import com.example.data.pref.SecurePreferences
 import com.example.permissions.PermissionManager
@@ -214,34 +214,33 @@ class GeminiIntelligenceAgent(
     override fun onActiveDetail(): String = "Active with ${prefs.getSelectedGeminiModel()} (JSON Pipeline)"
 }
 
-// 2. Voice Recognition Agent
+// 2. Direct Audio Voice Agent (No Speech-to-Text)
 class VoiceRecognitionAgent(
     private val context: Context
 ) : BaseMyraaAgent(
     agentId = "voice_recognition",
-    name = "Voice Recognition Agent",
-    role = "Hindi, Hinglish & English Speech-to-Text",
+    name = "Direct Voice Capture Agent",
+    role = "Direct 16kHz Audio Capture for Multimodal Gemini AI",
     isOptional = false,
     dependencies = listOf("permission_manager")
 ) {
-    private fun hasDialogRecognizer(): Boolean {
-        return try {
-            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).resolveActivity(context.packageManager) != null
-        } catch (_: Exception) {
-            false
-        }
-    }
-
     override fun validateConfiguration(): AgentValidationResult {
-        val liveReady = SpeechRecognizer.isRecognitionAvailable(context)
-        val dialogReady = hasDialogRecognizer()
-        return if (liveReady || dialogReady) {
+        val minBuf = try {
+            AudioRecord.getMinBufferSize(
+                16000,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+        } catch (_: Exception) {
+            -1
+        }
+        return if (minBuf > 0) {
             AgentValidationResult(true)
         } else {
             AgentValidationResult(
                 isValid = false,
                 statusOnFailure = AgentStatus.DISABLED,
-                reason = "Speech recognition service unavailable on ROM; text command input remains active."
+                reason = "Direct audio capture buffer unavailable on this hardware."
             )
         }
     }
@@ -259,35 +258,23 @@ class VoiceRecognitionAgent(
         }
     }
 
-    override fun onReadyDetail(): String {
-        return if (SpeechRecognizer.isRecognitionAvailable(context)) {
-            "Microphone & SpeechRecognizer ready"
-        } else {
-            "Mic dialog voice input ready (Tap Mic icon)"
-        }
-    }
+    override fun onReadyDetail(): String = "Direct AudioRecord microphone stream ready"
 
-    override fun onActiveDetail(): String {
-        return if (SpeechRecognizer.isRecognitionAvailable(context)) {
-            "Listening continuously for Hindi/Hinglish/English"
-        } else {
-            "Active via System Voice Dialog & Text Commands"
-        }
-    }
+    override fun onActiveDetail(): String = "Listening directly & streaming voice audio to MYRAA AI"
 }
 
-// 3. Mahi Voice Output Agent
+// 3. Mahi AI Voice Output Agent (Pure AI TTS Only)
 class MahiVoiceOutputAgent(
     private val prefs: SecurePreferences
 ) : BaseMyraaAgent(
     agentId = "mahi_voice_output",
     name = "Mahi Voice Output Agent",
-    role = "ElevenLabs Mahi Neural TTS & Native Speech",
+    role = "Pure AI Neural TTS (Gemini Neural Voice / ElevenLabs)",
     isOptional = false
 ) {
     override fun validateConfiguration(): AgentValidationResult {
         val hasElevenKey = prefs.getVoiceApiKey().isNotBlank()
-        val hasFallback = prefs.isNativeTtsFallbackEnabled()
+        val hasGeminiKey = prefs.getGeminiApiKey().isNotBlank()
         val voiceId = prefs.getSelectedVoiceId()
         return when {
             voiceId.isBlank() -> AgentValidationResult(
@@ -295,10 +282,10 @@ class MahiVoiceOutputAgent(
                 statusOnFailure = AgentStatus.NOT_CONFIGURED,
                 reason = "Mahi Voice ID is empty in Voice Settings."
             )
-            !hasElevenKey && !hasFallback -> AgentValidationResult(
+            !hasElevenKey && !hasGeminiKey -> AgentValidationResult(
                 isValid = false,
                 statusOnFailure = AgentStatus.NOT_CONFIGURED,
-                reason = "ElevenLabs API key missing and native TTS fallback is disabled."
+                reason = "AI TTS requires a Gemini or ElevenLabs API key."
             )
             else -> AgentValidationResult(true)
         }
@@ -307,18 +294,24 @@ class MahiVoiceOutputAgent(
     override fun validatePermissions(): AgentValidationResult = AgentValidationResult(true)
 
     override fun onReadyDetail(): String {
-        return if (prefs.getVoiceApiKey().isNotBlank()) {
-            "Mahi Voice ID (${prefs.getSelectedVoiceId().take(8)}…) configured"
-        } else {
-            "Mahi Native TTS Fallback Ready (Configure ElevenLabs key for neural voice)"
+        return when {
+            prefs.getVoiceApiKey().isNotBlank() ->
+                "ElevenLabs Mahi Voice (${prefs.getSelectedVoiceId().take(8)}…) ready"
+            prefs.getGeminiApiKey().isNotBlank() ->
+                "Gemini Neural Voice (Mahi • Aoede) ready"
+            else ->
+                "AI Voice waiting for Gemini or ElevenLabs API key"
         }
     }
 
     override fun onActiveDetail(): String {
-        return if (prefs.getVoiceApiKey().isNotBlank()) {
-            "Speaking via ElevenLabs Mahi (${prefs.getSelectedVoiceModel()})"
-        } else {
-            "Speaking via Android Native TTS fallback"
+        return when {
+            prefs.getVoiceApiKey().isNotBlank() ->
+                "Speaking via ElevenLabs Mahi AI TTS (${prefs.getSelectedVoiceModel()})"
+            prefs.getGeminiApiKey().isNotBlank() ->
+                "Speaking via Gemini Neural AI TTS (Mahi)"
+            else ->
+                "AI Voice unconfigured"
         }
     }
 }

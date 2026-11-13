@@ -280,10 +280,10 @@ class MyraaCoreVerificationTest {
     fun `VoiceRecognitionManager handles permission revocation and cleans up cleanly`() {
         val voiceManager = com.example.voice.VoiceRecognitionManager(
             context = context,
-            onCommandReceived = {}
+            onAudioCaptured = {}
         )
         voiceManager.startContinuousListening()
-        voiceManager.onError(android.speech.SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS)
+        voiceManager.handlePermissionRevoked()
 
         assertFalse(voiceManager.isSessionActive)
         assertEquals(com.example.voice.CompanionState.ERROR, voiceManager.companionState.value)
@@ -366,7 +366,7 @@ class MyraaCoreVerificationTest {
     fun `VoiceRecognitionManager prepareSessionForGreeting enters TALKING without mic contention`() {
         val voiceManager = com.example.voice.VoiceRecognitionManager(
             context = context,
-            onCommandReceived = {}
+            onAudioCaptured = {}
         )
         voiceManager.prepareSessionForGreeting()
         assertTrue(voiceManager.isSessionActive)
@@ -384,5 +384,43 @@ class MyraaCoreVerificationTest {
 
         prefs.setOfflineModeAccepted(true)
         assertTrue(prefs.isOfflineModeAccepted())
+    }
+
+    @Test
+    fun `MemoryCoreManager permanently protects Priyanshu memory while allowing user preferences CRUD`() = runTest {
+        val memoryManager = com.example.memory.MemoryCoreManager(db)
+        memoryManager.ensurePermanentMemorySeeded()
+
+        val initial = memoryManager.getAllMemories()
+        assertEquals(1, initial.size)
+        val permanent = initial.first()
+        assertTrue(permanent.isPermanent)
+        assertEquals(com.example.memory.MemoryCoreManager.PERMANENT_MEMORY_CONTENT, permanent.content)
+
+        // Add custom user preference (e.g. family name)
+        val customId = memoryManager.addUserMemory(
+            category = "Family",
+            label = "Family Name",
+            content = "My family name is Verma"
+        )
+        assertEquals(2, memoryManager.getAllMemories().size)
+
+        // Attempt to delete permanent memory by ID and via clearAllUserMemories() — both MUST NOT remove it
+        val deletedPermanent = memoryManager.deleteUserMemory(permanent.id)
+        assertFalse(deletedPermanent)
+        memoryManager.clearAllUserMemories()
+
+        val afterClear = memoryManager.getAllMemories()
+        assertEquals(1, afterClear.size)
+        assertTrue(afterClear.first().isPermanent)
+        assertEquals(com.example.memory.MemoryCoreManager.PERMANENT_MEMORY_CONTENT, afterClear.first().content)
+
+        // Re-add user memory and delete only the user memory cleanly
+        val customId2 = memoryManager.addUserMemory("Family", "Family Name", "Sharma")
+        assertTrue(memoryManager.deleteUserMemory(customId2))
+        assertFalse(memoryManager.getAllMemories().any { it.id == customId })
+
+        val promptContext = memoryManager.buildPromptMemoryContext()
+        assertTrue(promptContext.contains(com.example.memory.MemoryCoreManager.PERMANENT_MEMORY_CONTENT))
     }
 }

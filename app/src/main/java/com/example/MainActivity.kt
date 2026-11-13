@@ -19,6 +19,7 @@ import com.example.ui.screens.AboutScreen
 import com.example.ui.screens.AgentFleetScreen
 import com.example.ui.screens.AuditLogScreen
 import com.example.ui.screens.MainAssistantScreen
+import com.example.ui.screens.MemoryCoreScreen
 import com.example.ui.screens.PermissionCenterScreen
 import com.example.ui.screens.SecurityPrivacyScreen
 import com.example.ui.screens.SettingsScreen
@@ -33,6 +34,7 @@ enum class AppScreen {
     WELCOME,
     SETUP,
     MAIN,
+    MEMORY_CORE,
     AUDIT_LOGS,
     SETTINGS,
     PERMISSION_CENTER,
@@ -57,6 +59,7 @@ class MainActivity : ComponentActivity() {
                 ) {
                     var currentScreen by remember { mutableStateOf(AppScreen.SPLASH) }
                     var agentFleetReturnScreen by remember { mutableStateOf(AppScreen.SETTINGS) }
+                    var memoryReturnScreen by remember { mutableStateOf(AppScreen.MAIN) }
 
                     Crossfade(targetState = currentScreen, label = "screen_crossfade") { screen ->
                         when (screen) {
@@ -91,10 +94,20 @@ class MainActivity : ComponentActivity() {
                                 MainAssistantScreen(
                                     onNavigateToLogs = { currentScreen = AppScreen.AUDIT_LOGS },
                                     onNavigateToSettings = { currentScreen = AppScreen.SETTINGS },
+                                    onNavigateToMemory = {
+                                        memoryReturnScreen = AppScreen.MAIN
+                                        currentScreen = AppScreen.MEMORY_CORE
+                                    },
                                     onNavigateToAgentFleet = {
                                         agentFleetReturnScreen = AppScreen.MAIN
                                         currentScreen = AppScreen.AGENT_FLEET
                                     }
+                                )
+                            }
+                            AppScreen.MEMORY_CORE -> {
+                                BackHandler { currentScreen = memoryReturnScreen }
+                                MemoryCoreScreen(
+                                    onNavigateBack = { currentScreen = memoryReturnScreen }
                                 )
                             }
                             AppScreen.AUDIT_LOGS -> {
@@ -107,6 +120,10 @@ class MainActivity : ComponentActivity() {
                                 BackHandler { currentScreen = AppScreen.MAIN }
                                 SettingsScreen(
                                     onNavigateBack = { currentScreen = AppScreen.MAIN },
+                                    onNavigateToMemory = {
+                                        memoryReturnScreen = AppScreen.SETTINGS
+                                        currentScreen = AppScreen.MEMORY_CORE
+                                    },
                                     onNavigateToPermissions = { currentScreen = AppScreen.PERMISSION_CENTER },
                                     onNavigateToAgentFleet = {
                                         agentFleetReturnScreen = AppScreen.SETTINGS

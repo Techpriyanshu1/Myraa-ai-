@@ -1,18 +1,26 @@
 package com.example.voice
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.util.Locale
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import kotlin.math.sqrt
 
 enum class CompanionState {
     IDLE,
@@ -22,19 +30,28 @@ enum class CompanionState {
     ERROR
 }
 
+/**
+ * Direct Audio Voice Capture Manager (NO Android SpeechRecognizer / Speech-to-Text).
+ * Captures 16kHz 16-bit mono PCM directly from the microphone with Voice Activity Detection (VAD),
+ * wraps detected speech into a clean WAV payload, and sends raw audio straight to Gemini Multimodal AI.
+ */
 class VoiceRecognitionManager(
     private val context: Context,
-    private val onFallbackIntentNeeded: (() -> Unit)? = null,
-    private val onCommandReceived: (String) -> Unit
-) : RecognitionListener {
-
-    private var speechRecognizer: SpeechRecognizer? = null
+    private val onAudioCaptured: (ByteArray) -> Unit
+) {
     var isSessionActive = false
         private set
     var isPaused = false
         private set
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var captureJob: Job? = null
+
+    @Volatile
+    private var activeAudioRecord: AudioRecord? = null
+
+    @Volatile
+    private var forceFinishUtterance = false
 
     private val _companionState = MutableStateFlow(CompanionState.IDLE)
     val companionState: StateFlow<CompanionState> = _companionState.asStateFlow()
@@ -48,38 +65,48 @@ class VoiceRecognitionManager(
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
-    // Supported language mode: "auto" (Hindi + English), "hi-IN" (Hindi), "en-US" (English)
-    var languageMode: String = "auto"
-    private var forceDeviceDefaultLocale = false
-    private var consecutiveErrorCount = 0
+    companion object {
+        private const val SAMPLE_RATE_HZ = 16000
+        private const val CHANNELS = 1
+        private const val BITS_PER_SAMPLE = 16
+        private const val CHUNK_SHORTS = 1600 // 100ms per chunk at 16kHz
+        private const val PRE_ROLL_CHUNKS = 7 // ~700ms pre-roll before speech trigger
+        private const val SPEECH_RMS_THRESHOLD = 0.025
+        private const val SILENCE_END_MS = 1350L
+        private const val MIN_SPEECH_MS = 350L
+        private const val MAX_UTTERANCE_MS = 14000L
+        private const val IDLE_WINDOW_MS = 20000L
+        private const val MIN_FORCED_BYTES = 6400 // ~200ms
+    }
 
     fun prepareSessionForGreeting() {
         isSessionActive = true
         isPaused = false
-        consecutiveErrorCount = 0
+        forceFinishUtterance = false
         _errorMessage.value = null
+        _lastRecognizedText.value = ""
         _companionState.value = CompanionState.TALKING
     }
 
     fun startContinuousListening() {
+        if (!hasMicPermission()) {
+            handlePermissionRevoked()
+            return
+        }
         isSessionActive = true
         isPaused = false
-        consecutiveErrorCount = 0
+        forceFinishUtterance = false
         _errorMessage.value = null
-        restartListeningInternal()
+        launchCaptureLoop()
     }
 
     fun pauseListening() {
         isPaused = true
-        mainHandler.removeCallbacksAndMessages(null)
-        try {
-            speechRecognizer?.stopListening()
-            speechRecognizer?.cancel()
-        } catch (e: Exception) {
-            Log.e("VoiceRecognition", "Error pausing recognizer", e)
-        }
+        forceFinishUtterance = false
+        stopCaptureLoop()
         _companionState.value = CompanionState.IDLE
         _rmsLevel.value = 0f
+        _lastRecognizedText.value = ""
     }
 
     fun resumeListening() {
@@ -87,27 +114,24 @@ class VoiceRecognitionManager(
             startContinuousListening()
             return
         }
+        if (!hasMicPermission()) {
+            handlePermissionRevoked()
+            return
+        }
         isPaused = false
-        consecutiveErrorCount = 0
+        forceFinishUtterance = false
         _errorMessage.value = null
-        restartListeningInternal()
+        launchCaptureLoop()
     }
 
     fun stopContinuousListening() {
         isSessionActive = false
         isPaused = false
-        consecutiveErrorCount = 0
-        mainHandler.removeCallbacksAndMessages(null)
-        try {
-            speechRecognizer?.stopListening()
-            speechRecognizer?.cancel()
-            speechRecognizer?.destroy()
-        } catch (e: Exception) {
-            Log.e("VoiceRecognition", "Error stopping recognizer", e)
-        }
-        speechRecognizer = null
+        forceFinishUtterance = false
+        stopCaptureLoop()
         _companionState.value = CompanionState.IDLE
         _rmsLevel.value = 0f
+        _lastRecognizedText.value = ""
     }
 
     fun setCompanionState(state: CompanionState) {
@@ -117,213 +141,279 @@ class VoiceRecognitionManager(
         }
     }
 
-    // Called as soon as Myraa completes speaking to immediately resume listening for next command!
     fun resumeListeningAfterSpeech() {
         if (!isSessionActive || isPaused) {
             _companionState.value = CompanionState.IDLE
             return
         }
-        mainHandler.postDelayed({
-            if (isSessionActive && !isPaused) {
-                _companionState.value = CompanionState.LISTENING
-                restartListeningInternal()
-            }
-        }, 250)
+        if (!hasMicPermission()) {
+            handlePermissionRevoked()
+            return
+        }
+        _companionState.value = CompanionState.LISTENING
+        launchCaptureLoop()
     }
 
-    fun restartListeningInternal() {
+    fun finishUtteranceNow() {
+        if (isSessionActive && !isPaused && _companionState.value == CompanionState.LISTENING) {
+            forceFinishUtterance = true
+        }
+    }
+
+    fun handlePermissionRevoked() {
+        isSessionActive = false
+        isPaused = false
+        forceFinishUtterance = false
+        stopCaptureLoop()
+        _rmsLevel.value = 0f
+        _lastRecognizedText.value = ""
+        _errorMessage.value = "Microphone permission is required for direct voice listening."
+        _companionState.value = CompanionState.ERROR
+    }
+
+    private fun hasMicPermission(): Boolean {
+        return try {
+            context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun launchCaptureLoop() {
+        stopCaptureLoop()
         if (!isSessionActive || isPaused) return
 
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            Log.w("VoiceRecognition", "Continuous SpeechRecognizer unavailable on device, offering dialog fallback")
-            _errorMessage.value = "Live background recognizer unavailable — tap Mic icon to speak."
-            _companionState.value = CompanionState.IDLE
-            onFallbackIntentNeeded?.invoke()
+        captureJob = managerScope.launch {
+            recordSingleUtteranceOrContinue()
+        }
+    }
+
+    private fun stopCaptureLoop() {
+        captureJob?.cancel()
+        captureJob = null
+        releaseAudioRecordSafely(activeAudioRecord)
+        activeAudioRecord = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun recordSingleUtteranceOrContinue() {
+        if (!isSessionActive || isPaused || !hasMicPermission()) {
+            if (!hasMicPermission() && isSessionActive) handlePermissionRevoked()
             return
         }
 
-        mainHandler.removeCallbacksAndMessages(null)
-        mainHandler.post {
-            try {
-                try {
-                    speechRecognizer?.cancel()
-                } catch (_: Exception) {}
-
-                if (speechRecognizer == null) {
-                    speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-                        setRecognitionListener(this@VoiceRecognitionManager)
-                    }
-                }
-
-                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-
-                    if (!forceDeviceDefaultLocale) {
-                        when (languageMode) {
-                            "hi-IN" -> {
-                                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-                                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
-                            }
-                            "en-US" -> {
-                                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-                                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US")
-                            }
-                            else -> {
-                                val localeTag = Locale.getDefault().toLanguageTag().ifBlank { "en-IN" }
-                                putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
-                                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
-                            }
-                        }
-                    }
-
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
-                }
-
-                speechRecognizer?.startListening(intent)
-                _companionState.value = CompanionState.LISTENING
-            } catch (e: Exception) {
-                Log.e("VoiceRecognition", "Failed to start speech listener", e)
-                _errorMessage.value = "Speech listener error: ${e.message}"
-
-                try {
-                    speechRecognizer?.destroy()
-                } catch (_: Exception) {}
-                speechRecognizer = null
-
-                consecutiveErrorCount++
-                if (consecutiveErrorCount < 3) {
-                    mainHandler.postDelayed({
-                        if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
-                            restartListeningInternal()
-                        }
-                    }, 800)
-                } else {
-                    _companionState.value = CompanionState.IDLE
-                    _errorMessage.value = "Tap the green Mic button to speak."
-                }
-            }
+        val minBuf = try {
+            AudioRecord.getMinBufferSize(
+                SAMPLE_RATE_HZ,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+        } catch (_: Exception) {
+            -1
         }
-    }
-
-    override fun onReadyForSpeech(params: Bundle?) {
-        consecutiveErrorCount = 0
-        _errorMessage.value = null
-        if (isSessionActive && _companionState.value != CompanionState.TALKING) {
-            _companionState.value = CompanionState.LISTENING
-        }
-    }
-
-    override fun onBeginningOfSpeech() {
-        consecutiveErrorCount = 0
-        if (isSessionActive && _companionState.value != CompanionState.TALKING) {
-            _companionState.value = CompanionState.LISTENING
-        }
-    }
-
-    override fun onRmsChanged(rmsdB: Float) {
-        val normalized = (rmsdB + 2f) / 12f
-        _rmsLevel.value = normalized.coerceIn(0f, 1f)
-    }
-
-    override fun onBufferReceived(buffer: ByteArray?) {}
-
-    override fun onEndOfSpeech() {
-        if (isSessionActive && _companionState.value != CompanionState.TALKING) {
-            _companionState.value = CompanionState.THINKING
-        }
-    }
-
-    override fun onError(error: Int) {
-        Log.d("VoiceRecognition", "onError code: $error")
-        if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-            isSessionActive = false
-            isPaused = false
-            mainHandler.removeCallbacksAndMessages(null)
-            try {
-                speechRecognizer?.cancel()
-                speechRecognizer?.destroy()
-            } catch (_: Exception) {}
-            speechRecognizer = null
-            _rmsLevel.value = 0f
-            _errorMessage.value = "Microphone permission is required for voice recognition."
+        if (minBuf <= 0) {
+            _errorMessage.value = "Microphone hardware buffer unavailable on this device."
             _companionState.value = CompanionState.ERROR
             return
         }
 
-        // Language pack error (12 = ERROR_LANGUAGE_NOT_SUPPORTED, 13 = ERROR_LANGUAGE_UNAVAILABLE) -> fall back to device locale
-        if (error == 12 || error == 13) {
-            forceDeviceDefaultLocale = true
-        }
-
-        // Normal silence / no match timeouts — do not count against service health
-        if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-            if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
-                mainHandler.removeCallbacksAndMessages(null)
-                mainHandler.postDelayed({
-                    if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
-                        restartListeningInternal()
-                    }
-                }, 400L)
-            }
-            return
-        }
-
-        // Service/client/audio/network error: recreate recognizer cleanly
-        consecutiveErrorCount++
+        val bufferBytes = maxOf(minBuf, CHUNK_SHORTS * 2 * 2)
+        var recorder: AudioRecord? = null
         try {
-            speechRecognizer?.cancel()
-            speechRecognizer?.destroy()
-        } catch (_: Exception) {}
-        speechRecognizer = null
-
-        if (consecutiveErrorCount >= 3) {
-            _rmsLevel.value = 0f
-            _companionState.value = CompanionState.IDLE
-            _errorMessage.value = "Voice recognizer paused (code $error). Tap green Mic icon to speak."
-            return
-        }
-
-        if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
-            val retryDelayMs = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_AUDIO) 900L else 550L
-            mainHandler.removeCallbacksAndMessages(null)
-            mainHandler.postDelayed({
-                if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
-                    restartListeningInternal()
-                }
-            }, retryDelayMs)
-        }
-    }
-
-    override fun onResults(results: Bundle?) {
-        consecutiveErrorCount = 0
-        _errorMessage.value = null
-        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-        val text = matches?.firstOrNull()?.trim() ?: ""
-        if (text.isNotBlank()) {
-            _lastRecognizedText.value = text
-            _companionState.value = CompanionState.THINKING
-            onCommandReceived(text)
-        } else {
-            if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
-                restartListeningInternal()
+            recorder = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                SAMPLE_RATE_HZ,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufferBytes
+            )
+            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                releaseAudioRecordSafely(recorder)
+                recorder = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    SAMPLE_RATE_HZ,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferBytes
+                )
             }
+            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+                releaseAudioRecordSafely(recorder)
+                _errorMessage.value = "Unable to initialize direct microphone stream."
+                _companionState.value = CompanionState.ERROR
+                return
+            }
+
+            activeAudioRecord = recorder
+            recorder.startRecording()
+            _companionState.value = CompanionState.LISTENING
+            _errorMessage.value = null
+            _lastRecognizedText.value = "Listening directly (speak naturally)..."
+
+            val shortBuf = ShortArray(CHUNK_SHORTS)
+            val preRoll = ArrayDeque<ByteArray>()
+            val speechStream = ByteArrayOutputStream()
+
+            val windowStartedAt = System.currentTimeMillis()
+            var speechStartedAt = 0L
+            var lastVoiceActivityAt = 0L
+            var hasSpeechStarted = false
+            var capturedWav: ByteArray? = null
+
+            while (managerScope.isActive && isSessionActive && !isPaused) {
+                val readCount = recorder.read(shortBuf, 0, shortBuf.size)
+                if (readCount <= 0) continue
+
+                val chunkBytes = shortsToLittleEndianBytes(shortBuf, readCount)
+                val rms = calculateNormalizedRms(shortBuf, readCount)
+                _rmsLevel.value = (rms * 7.5).toFloat().coerceIn(0f, 1f)
+
+                val now = System.currentTimeMillis()
+
+                if (!hasSpeechStarted) {
+                    if (preRoll.size >= PRE_ROLL_CHUNKS) preRoll.removeFirst()
+                    preRoll.addLast(chunkBytes)
+
+                    if (rms >= SPEECH_RMS_THRESHOLD) {
+                        hasSpeechStarted = true
+                        speechStartedAt = now
+                        lastVoiceActivityAt = now
+                        _lastRecognizedText.value = "Hearing your voice..."
+                        while (preRoll.isNotEmpty()) {
+                            speechStream.write(preRoll.removeFirst())
+                        }
+                    } else if (forceFinishUtterance && speechStream.size() >= MIN_FORCED_BYTES) {
+                        capturedWav = wrapPcm16AsWav(speechStream.toByteArray())
+                        break
+                    } else if (forceFinishUtterance) {
+                        preRoll.forEach { speechStream.write(it) }
+                        if (speechStream.size() >= MIN_FORCED_BYTES) {
+                            capturedWav = wrapPcm16AsWav(speechStream.toByteArray())
+                        }
+                        forceFinishUtterance = false
+                        break
+                    } else if (now - windowStartedAt >= IDLE_WINDOW_MS) {
+                        // Silence timeout: restart clean listening window silently
+                        break
+                    }
+                } else {
+                    speechStream.write(chunkBytes)
+                    if (rms >= SPEECH_RMS_THRESHOLD * 0.85) {
+                        lastVoiceActivityAt = now
+                    }
+
+                    val speechElapsed = now - speechStartedAt
+                    val silenceElapsed = now - lastVoiceActivityAt
+                    val shouldFinish = (silenceElapsed >= SILENCE_END_MS && speechElapsed >= MIN_SPEECH_MS) ||
+                        speechElapsed >= MAX_UTTERANCE_MS ||
+                        (forceFinishUtterance && speechStream.size() >= MIN_FORCED_BYTES)
+
+                    if (shouldFinish) {
+                        capturedWav = wrapPcm16AsWav(speechStream.toByteArray())
+                        break
+                    }
+                }
+            }
+
+            forceFinishUtterance = false
+            releaseAudioRecordSafely(recorder)
+            if (activeAudioRecord == recorder) activeAudioRecord = null
+
+            val wavReady = capturedWav
+            if (wavReady != null && isSessionActive && !isPaused) {
+                _rmsLevel.value = 0f
+                _companionState.value = CompanionState.THINKING
+                _lastRecognizedText.value = "Sending voice directly to MYRAA..."
+                withContext(Dispatchers.Main) {
+                    onAudioCaptured(wavReady)
+                }
+            } else if (isSessionActive && !isPaused && _companionState.value == CompanionState.LISTENING) {
+                // Silent window expired without speech — seamlessly start next listening window
+                _rmsLevel.value = 0f
+                launchCaptureLoop()
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            releaseAudioRecordSafely(recorder)
+            throw ce
+        } catch (e: Exception) {
+            Log.e("VoiceRecognition", "Direct AudioRecord error", e)
+            releaseAudioRecordSafely(recorder)
+            if (activeAudioRecord == recorder) activeAudioRecord = null
+            _rmsLevel.value = 0f
+            _errorMessage.value = "Direct voice capture error: ${e.localizedMessage ?: "Mic unavailable"}"
+            _companionState.value = CompanionState.ERROR
         }
     }
 
-    override fun onPartialResults(partialResults: Bundle?) {
-        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-        val text = matches?.firstOrNull()?.trim() ?: ""
-        if (text.isNotBlank()) {
-            _lastRecognizedText.value = text
-        }
+    private fun releaseAudioRecordSafely(recorder: AudioRecord?) {
+        if (recorder == null) return
+        try {
+            if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                recorder.stop()
+            }
+        } catch (_: Exception) {}
+        try {
+            recorder.release()
+        } catch (_: Exception) {}
     }
 
-    override fun onEvent(eventType: Int, params: Bundle?) {}
+    private fun calculateNormalizedRms(samples: ShortArray, count: Int): Double {
+        if (count <= 0) return 0.0
+        var sum = 0.0
+        for (i in 0 until count) {
+            val s = samples[i].toDouble()
+            sum += s * s
+        }
+        return sqrt(sum / count) / 32768.0
+    }
+
+    private fun shortsToLittleEndianBytes(samples: ShortArray, count: Int): ByteArray {
+        val bytes = ByteArray(count * 2)
+        for (i in 0 until count) {
+            val v = samples[i].toInt()
+            bytes[i * 2] = (v and 0xFF).toByte()
+            bytes[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        return bytes
+    }
+
+    private fun wrapPcm16AsWav(pcmData: ByteArray): ByteArray {
+        val byteRate = SAMPLE_RATE_HZ * CHANNELS * BITS_PER_SAMPLE / 8
+        val blockAlign = CHANNELS * BITS_PER_SAMPLE / 8
+        val dataSize = pcmData.size
+        val chunkSize = 36 + dataSize
+
+        val out = ByteArrayOutputStream(44 + dataSize)
+        fun writeIntLE(v: Int) {
+            out.write(v and 0xFF)
+            out.write((v shr 8) and 0xFF)
+            out.write((v shr 16) and 0xFF)
+            out.write((v shr 24) and 0xFF)
+        }
+        fun writeShortLE(v: Int) {
+            out.write(v and 0xFF)
+            out.write((v shr 8) and 0xFF)
+        }
+
+        out.write("RIFF".toByteArray(Charsets.US_ASCII))
+        writeIntLE(chunkSize)
+        out.write("WAVE".toByteArray(Charsets.US_ASCII))
+        out.write("fmt ".toByteArray(Charsets.US_ASCII))
+        writeIntLE(16)
+        writeShortLE(1)
+        writeShortLE(CHANNELS)
+        writeIntLE(SAMPLE_RATE_HZ)
+        writeIntLE(byteRate)
+        writeShortLE(blockAlign)
+        writeShortLE(BITS_PER_SAMPLE)
+        out.write("data".toByteArray(Charsets.US_ASCII))
+        writeIntLE(dataSize)
+        out.write(pcmData)
+        return out.toByteArray()
+    }
 
     fun destroy() {
         stopContinuousListening()
+        managerScope.cancel()
     }
 }
