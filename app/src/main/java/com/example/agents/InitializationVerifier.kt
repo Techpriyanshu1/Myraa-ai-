@@ -1,9 +1,11 @@
 package com.example.agents
 
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.Settings
+import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import com.example.data.api.ConnectionTestResult
 import com.example.data.api.GeminiClient
@@ -91,12 +93,15 @@ class InitializationVerifier(
                 ConnectionTestResult.Failure("Gemini connection failed: ${e.localizedMessage ?: "Network error"}")
             }
             checks += when (conn) {
-                is ConnectionTestResult.Success -> PreflightCheckItem(
-                    id = "gemini_connectivity",
-                    title = "2. Gemini Connectivity",
-                    severity = PreflightSeverity.OK,
-                    message = "Gemini connected (${conn.modelUsed})."
-                )
+                is ConnectionTestResult.Success -> {
+                    fleetManager.clearAgentError("gemini_intelligence")
+                    PreflightCheckItem(
+                        id = "gemini_connectivity",
+                        title = "2. Gemini Connectivity",
+                        severity = PreflightSeverity.OK,
+                        message = "Gemini connected (${conn.modelUsed})."
+                    )
+                }
                 is ConnectionTestResult.Failure -> {
                     fleetManager.recordAgentError("gemini_intelligence", conn.errorMessage)
                     PreflightCheckItem(
@@ -168,6 +173,11 @@ class InitializationVerifier(
 
         // 7. Foreground-service eligibility & speech recognition availability
         val speechAvail = SpeechRecognizer.isRecognitionAvailable(context)
+        val dialogAvail = try {
+            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).resolveActivity(context.packageManager) != null
+        } catch (_: Exception) {
+            false
+        }
         val fgEligible = hasMic && (Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
             context.checkSelfPermission(android.Manifest.permission.FOREGROUND_SERVICE) == PackageManager.PERMISSION_GRANTED)
         checks += PreflightCheckItem(
@@ -175,12 +185,13 @@ class InitializationVerifier(
             title = "7. Foreground-Service Eligibility",
             severity = when {
                 !fgEligible -> PreflightSeverity.BLOCKING_ERROR
-                !speechAvail -> PreflightSeverity.WARNING
+                !speechAvail && !dialogAvail -> PreflightSeverity.WARNING
                 else -> PreflightSeverity.OK
             },
             message = when {
                 !fgEligible -> "Unable to start listening: foreground microphone permission not eligible."
-                !speechAvail -> "Unable to start continuous recognizer; system voice dialog fallback available."
+                !speechAvail && !dialogAvail -> "System speech service unavailable; text command mode active."
+                !speechAvail -> "Voice dialog fallback & foreground mic ready."
                 else -> "Microphone foreground service eligible and ready."
             }
         )

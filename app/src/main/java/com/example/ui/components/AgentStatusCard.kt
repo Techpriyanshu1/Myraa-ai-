@@ -123,14 +123,20 @@ fun AgentStatusGrid(
 
 @Composable
 private fun LiveAgentBadge(report: AgentHealthReport, modifier: Modifier = Modifier) {
-    val statusColor = when (report.status) {
-        AgentStatus.ACTIVE -> AuroraEmerald
-        AgentStatus.READY -> CyanPrimary
-        AgentStatus.INITIALIZING -> CyanPrimary
-        AgentStatus.PERMISSION_REQUIRED, AgentStatus.ERROR -> DangerRed
-        AgentStatus.NOT_CONFIGURED -> AuroraPink
-        AgentStatus.DISABLED -> TextSecondary
+    val isOptionalStandby = report.isOptional &&
+        (report.status == AgentStatus.DISABLED || report.status == AgentStatus.PERMISSION_REQUIRED)
+
+    val statusColor = when {
+        isOptionalStandby -> TextSecondary
+        report.status == AgentStatus.ACTIVE -> AuroraEmerald
+        report.status == AgentStatus.READY -> CyanPrimary
+        report.status == AgentStatus.INITIALIZING -> CyanPrimary
+        report.status == AgentStatus.PERMISSION_REQUIRED || report.status == AgentStatus.ERROR -> DangerRed
+        report.status == AgentStatus.NOT_CONFIGURED -> AuroraPink
+        else -> TextSecondary
     }
+
+    val statusLabel = if (isOptionalStandby) "STANDBY" else report.status.name
 
     val icon: ImageVector = when (report.agentId) {
         "gemini_intelligence" -> Icons.Default.Psychology
@@ -176,7 +182,7 @@ private fun LiveAgentBadge(report: AgentHealthReport, modifier: Modifier = Modif
                 maxLines = 1
             )
             Text(
-                text = report.status.name,
+                text = statusLabel,
                 style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                 color = statusColor,
                 fontWeight = FontWeight.Bold,

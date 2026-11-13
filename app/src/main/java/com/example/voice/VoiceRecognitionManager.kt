@@ -50,10 +50,21 @@ class VoiceRecognitionManager(
 
     // Supported language mode: "auto" (Hindi + English), "hi-IN" (Hindi), "en-US" (English)
     var languageMode: String = "auto"
+    private var forceDeviceDefaultLocale = false
+    private var consecutiveErrorCount = 0
+
+    fun prepareSessionForGreeting() {
+        isSessionActive = true
+        isPaused = false
+        consecutiveErrorCount = 0
+        _errorMessage.value = null
+        _companionState.value = CompanionState.TALKING
+    }
 
     fun startContinuousListening() {
         isSessionActive = true
         isPaused = false
+        consecutiveErrorCount = 0
         _errorMessage.value = null
         restartListeningInternal()
     }
@@ -77,6 +88,7 @@ class VoiceRecognitionManager(
             return
         }
         isPaused = false
+        consecutiveErrorCount = 0
         _errorMessage.value = null
         restartListeningInternal()
     }
@@ -84,6 +96,7 @@ class VoiceRecognitionManager(
     fun stopContinuousListening() {
         isSessionActive = false
         isPaused = false
+        consecutiveErrorCount = 0
         mainHandler.removeCallbacksAndMessages(null)
         try {
             speechRecognizer?.stopListening()
@@ -115,15 +128,16 @@ class VoiceRecognitionManager(
                 _companionState.value = CompanionState.LISTENING
                 restartListeningInternal()
             }
-        }, 150)
+        }, 250)
     }
 
     fun restartListeningInternal() {
         if (!isSessionActive || isPaused) return
 
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            Log.w("VoiceRecognition", "Speech recognition service not available on device, triggering fallback")
-            _errorMessage.value = "Speech service missing - opening voice dialog"
+            Log.w("VoiceRecognition", "Continuous SpeechRecognizer unavailable on device, offering dialog fallback")
+            _errorMessage.value = "Live background recognizer unavailable — tap Mic icon to speak."
+            _companionState.value = CompanionState.IDLE
             onFallbackIntentNeeded?.invoke()
             return
         }
@@ -131,10 +145,9 @@ class VoiceRecognitionManager(
         mainHandler.removeCallbacksAndMessages(null)
         mainHandler.post {
             try {
-                // Cancel pending recognition session to avoid ERROR_RECOGNIZER_BUSY (code 8)
                 try {
                     speechRecognizer?.cancel()
-                } catch (ignored: Exception) {}
+                } catch (_: Exception) {}
 
                 if (speechRecognizer == null) {
                     speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
@@ -147,20 +160,21 @@ class VoiceRecognitionManager(
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
 
-                    when (languageMode) {
-                        "hi-IN" -> {
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
-                        }
-                        "en-US" -> {
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US")
-                        }
-                        else -> {
-                            // Default Auto: Multilingual Hindi + English (Hinglish)
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
-                            putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("hi-IN", "en-IN", "en-US"))
+                    if (!forceDeviceDefaultLocale) {
+                        when (languageMode) {
+                            "hi-IN" -> {
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
+                            }
+                            "en-US" -> {
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US")
+                            }
+                            else -> {
+                                val localeTag = Locale.getDefault().toLanguageTag().ifBlank { "en-IN" }
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
+                                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "hi-IN")
+                            }
                         }
                     }
 
@@ -176,26 +190,34 @@ class VoiceRecognitionManager(
 
                 try {
                     speechRecognizer?.destroy()
-                } catch (ignored: Exception) {}
+                } catch (_: Exception) {}
                 speechRecognizer = null
 
-                // If continuous mode is on, attempt retry or trigger system prompt
-                mainHandler.postDelayed({
-                    if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
-                        restartListeningInternal()
-                    }
-                }, 700)
+                consecutiveErrorCount++
+                if (consecutiveErrorCount < 3) {
+                    mainHandler.postDelayed({
+                        if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
+                            restartListeningInternal()
+                        }
+                    }, 800)
+                } else {
+                    _companionState.value = CompanionState.IDLE
+                    _errorMessage.value = "Tap the green Mic button to speak."
+                }
             }
         }
     }
 
     override fun onReadyForSpeech(params: Bundle?) {
+        consecutiveErrorCount = 0
+        _errorMessage.value = null
         if (isSessionActive && _companionState.value != CompanionState.TALKING) {
             _companionState.value = CompanionState.LISTENING
         }
     }
 
     override fun onBeginningOfSpeech() {
+        consecutiveErrorCount = 0
         if (isSessionActive && _companionState.value != CompanionState.TALKING) {
             _companionState.value = CompanionState.LISTENING
         }
@@ -223,7 +245,7 @@ class VoiceRecognitionManager(
             try {
                 speechRecognizer?.cancel()
                 speechRecognizer?.destroy()
-            } catch (ignored: Exception) {}
+            } catch (_: Exception) {}
             speechRecognizer = null
             _rmsLevel.value = 0f
             _errorMessage.value = "Microphone permission is required for voice recognition."
@@ -231,20 +253,41 @@ class VoiceRecognitionManager(
             return
         }
 
-        // If recognizer is busy or client failed, recreate it
-        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
-            error == SpeechRecognizer.ERROR_CLIENT ||
-            error == SpeechRecognizer.ERROR_AUDIO) {
-            try {
-                speechRecognizer?.cancel()
-                speechRecognizer?.destroy()
-            } catch (ignored: Exception) {}
-            speechRecognizer = null
+        // Language pack error (12 = ERROR_LANGUAGE_NOT_SUPPORTED, 13 = ERROR_LANGUAGE_UNAVAILABLE) -> fall back to device locale
+        if (error == 12 || error == 13) {
+            forceDeviceDefaultLocale = true
         }
 
-        // On no-match or timeout, seamlessly continue listening without stacking retries
-        if (isSessionActive && !isPaused) {
-            val retryDelayMs = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_AUDIO) 850L else 400L
+        // Normal silence / no match timeouts — do not count against service health
+        if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+            if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
+                mainHandler.removeCallbacksAndMessages(null)
+                mainHandler.postDelayed({
+                    if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
+                        restartListeningInternal()
+                    }
+                }, 400L)
+            }
+            return
+        }
+
+        // Service/client/audio/network error: recreate recognizer cleanly
+        consecutiveErrorCount++
+        try {
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
+
+        if (consecutiveErrorCount >= 3) {
+            _rmsLevel.value = 0f
+            _companionState.value = CompanionState.IDLE
+            _errorMessage.value = "Voice recognizer paused (code $error). Tap green Mic icon to speak."
+            return
+        }
+
+        if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
+            val retryDelayMs = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_AUDIO) 900L else 550L
             mainHandler.removeCallbacksAndMessages(null)
             mainHandler.postDelayed({
                 if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
@@ -255,6 +298,8 @@ class VoiceRecognitionManager(
     }
 
     override fun onResults(results: Bundle?) {
+        consecutiveErrorCount = 0
+        _errorMessage.value = null
         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
         val text = matches?.firstOrNull()?.trim() ?: ""
         if (text.isNotBlank()) {

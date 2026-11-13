@@ -48,6 +48,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.StopScreenShare
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.Pause
@@ -93,6 +94,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.agents.AgentFleetManager
 import com.example.agents.InitializationPreflightReport
 import com.example.agents.InitializationVerifier
@@ -139,6 +143,7 @@ fun MainAssistantScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val prefs = remember { SecurePreferences(context) }
@@ -227,7 +232,7 @@ fun MainAssistantScreen(
         coroutineScope.launch {
             try {
                 val summary = fleetManager.initializeAndStartEligibleAgents()
-                voiceManagerRef.startContinuousListening()
+                voiceManagerRef.prepareSessionForGreeting()
                 ContinuousVoiceService.start(context)
                 if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(context)) {
                     MyraaOverlayService.start(context)
@@ -445,6 +450,9 @@ fun MainAssistantScreen(
                     null
                 }
                 val parsed = geminiClient.interpretCommand(trimmed, apiKey, model, screenSnapshot)
+                if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connection failed", ignoreCase = true) && !parsed.spokenResponse.contains("API key", ignoreCase = true)) {
+                    fleetManager.clearAgentError("gemini_intelligence")
+                }
 
                 // Step 5, 6 & 7: Allowlist & Risk Validation
                 val validation = ActionSecurityPolicy.validate(parsed)
@@ -530,14 +538,19 @@ fun MainAssistantScreen(
                     "hi-IN" -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
                     "en-US" -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
                     else -> {
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-                        putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("hi-IN", "en-IN", "en-US"))
+                        val defaultTag = java.util.Locale.getDefault().toLanguageTag().ifBlank { "en-IN" }
+                        putExtra(RecognizerIntent.EXTRA_LANGUAGE, defaultTag)
                     }
                 }
             }
-            systemVoiceLauncher.launch(intent)
+            if (intent.resolveActivity(context.packageManager) != null) {
+                systemVoiceLauncher.launch(intent)
+            } else {
+                currentAiReply = "System Voice Dialog available nahi hai — neeche text box me command type karein."
+            }
         } catch (e: Exception) {
             Log.e("MainAssistantScreen", "Cannot launch system speech intent", e)
+            currentAiReply = "Voice input launch nahi ho paaya; neeche command type karein."
         }
     }
 
@@ -545,7 +558,10 @@ fun MainAssistantScreen(
         VoiceRecognitionManager(
             context = context,
             onFallbackIntentNeeded = { launchSystemVoiceDialog() },
-            onCommandReceived = { recognizedText -> processCommand(recognizedText) }
+            onCommandReceived = { recognizedText ->
+                fleetManager.clearAgentError("voice_recognition")
+                processCommand(recognizedText)
+            }
         ).also {
             voiceManagerRef = it
             it.languageMode = selectedLanguageMode
@@ -555,16 +571,22 @@ fun MainAssistantScreen(
     val companionState by voiceManager.companionState.collectAsState()
     val rmsLevel by voiceManager.rmsLevel.collectAsState()
     val partialText by voiceManager.lastRecognizedText.collectAsState()
+    val voiceError by voiceManager.errorMessage.collectAsState()
 
     val micLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
+            fleetManager.clearAgentError("voice_recognition")
             startMyraaSession()
         } else {
             fleetManager.refreshFleetStatus()
             currentAiReply = "Voice control ke liye Microphone permission zaroori hai. Permission Center me jakar enable karein."
         }
+    }
+
+    LaunchedEffect(Unit) {
+        fleetManager.refreshFleetStatus(clearErrors = true)
     }
 
     LaunchedEffect(screenShareError) {
@@ -573,8 +595,15 @@ fun MainAssistantScreen(
         }
     }
 
-    DisposableEffect(Unit) {
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                fleetManager.refreshFleetStatus(clearErrors = true)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             voiceManager.destroy()
             elevenLabsClient.shutdown()
             ContinuousVoiceService.stop(context)
@@ -810,6 +839,34 @@ fun MainAssistantScreen(
                     )
                 }
 
+                if (!prefs.hasStoredGeminiKey()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(VioletSecondary.copy(alpha = 0.22f))
+                            .clickable { onNavigateToSettings() }
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                            .testTag("missing_gemini_key_banner")
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.Key, contentDescription = null, tint = CyanPrimary, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Gemini API Key missing • Tap here to configure",
+                                color = TextPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+
                 if (isRealScreenSharing) {
                     Box(
                         modifier = Modifier
@@ -834,6 +891,27 @@ fun MainAssistantScreen(
                         }
                     }
                     Spacer(modifier = Modifier.height(8.dp))
+                }
+
+                if (!voiceError.isNullOrBlank()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 6.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(DarkSurfaceElevated)
+                            .clickable { launchSystemVoiceDialog() }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = voiceError ?: "",
+                            color = AuroraPink,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 }
 
                 var displayModeOrb by remember { mutableStateOf(true) }

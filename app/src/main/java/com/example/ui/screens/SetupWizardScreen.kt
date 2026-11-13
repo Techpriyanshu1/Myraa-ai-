@@ -1,24 +1,28 @@
 package com.example.ui.screens
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -28,14 +32,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RecordVoiceOver
-import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -60,8 +66,9 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -72,21 +79,29 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.agents.AgentFleetManager
 import com.example.data.api.ConnectionTestResult
 import com.example.data.api.ElevenLabsClient
 import com.example.data.api.GeminiClient
 import com.example.data.api.VoiceTestResult
 import com.example.data.pref.SecurePreferences
 import com.example.service.MyraaAccessibilityService
-import com.example.shizuku.ShizukuBridge
+import com.example.ui.components.AnimatedAiOrb
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.AuroraPink
 import com.example.ui.theme.CardGlowBorder
@@ -99,6 +114,7 @@ import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VioletSecondary
+import com.example.voice.CompanionState
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -108,10 +124,15 @@ fun SetupWizardScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val clipboardManager = LocalClipboardManager.current
+    val focusManager = LocalFocusManager.current
     val coroutineScope = rememberCoroutineScope()
+
     val prefs = remember { SecurePreferences(context) }
     val geminiClient = remember { GeminiClient() }
     val elevenLabsClient = remember { ElevenLabsClient(context) }
+    val fleetManager = remember { AgentFleetManager.getInstance(context, prefs) }
 
     // State: Gemini
     var geminiKey by remember { mutableStateOf(prefs.getGeminiApiKey()) }
@@ -121,11 +142,12 @@ fun SetupWizardScreen(
     var isTestingGemini by remember { mutableStateOf(false) }
     var geminiTestResult by remember { mutableStateOf<ConnectionTestResult?>(null) }
 
-    // State: ElevenLabs & Mahi Voice
+    // State: Optional Voice & Permissions Section
+    var showAdvancedOptions by remember { mutableStateOf(false) }
     var voiceKey by remember { mutableStateOf(prefs.getVoiceApiKey()) }
     var showVoiceKey by remember { mutableStateOf(false) }
     var mahiVoiceId by remember { mutableStateOf(prefs.getSelectedVoiceId()) }
-    var voiceModel by remember { mutableStateOf(prefs.getSelectedVoiceModel()) }
+    val voiceModel by remember { mutableStateOf(prefs.getSelectedVoiceModel()) }
     var isTestingVoice by remember { mutableStateOf(false) }
     var voiceTestResult by remember { mutableStateOf<VoiceTestResult?>(null) }
     var nativeTtsFallback by remember { mutableStateOf(prefs.isNativeTtsFallbackEnabled()) }
@@ -134,14 +156,12 @@ fun SetupWizardScreen(
     var isMicPermissionGranted by remember {
         mutableStateOf(
             context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                    android.content.pm.PackageManager.PERMISSION_GRANTED
+                PackageManager.PERMISSION_GRANTED
         )
     }
-
     var isOverlayPermissionGranted by remember {
         mutableStateOf(Settings.canDrawOverlays(context))
     }
-
     var isAccessibilityGranted by remember {
         mutableStateOf(MyraaAccessibilityService.isRunning())
     }
@@ -152,16 +172,38 @@ fun SetupWizardScreen(
         isMicPermissionGranted = granted
     }
 
-    // Refresh permission statuses on resume & clean up TTS/player on exit
-    LaunchedEffect(Unit) {
-        isAccessibilityGranted = MyraaAccessibilityService.isRunning()
-        isOverlayPermissionGranted = Settings.canDrawOverlays(context)
-    }
-
-    androidx.compose.runtime.DisposableEffect(Unit) {
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isMicPermissionGranted =
+                    context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                        PackageManager.PERMISSION_GRANTED
+                isAccessibilityGranted = MyraaAccessibilityService.isRunning()
+                isOverlayPermissionGranted = Settings.canDrawOverlays(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             elevenLabsClient.shutdown()
         }
+    }
+
+    fun persistSettingsAndProceed(effectiveModel: String, isOfflineOnly: Boolean) {
+        if (!isOfflineOnly) {
+            prefs.setGeminiApiKey(geminiKey.trim())
+            prefs.setSelectedGeminiModel(effectiveModel)
+            prefs.setOfflineModeAccepted(false)
+        } else {
+            prefs.setOfflineModeAccepted(true)
+        }
+        prefs.setVoiceApiKey(voiceKey.trim())
+        prefs.setSelectedVoiceId(mahiVoiceId)
+        prefs.setSelectedVoiceModel(voiceModel)
+        prefs.setNativeTtsFallbackEnabled(nativeTtsFallback)
+        prefs.setSetupCompleted(true)
+        fleetManager.refreshFleetStatus(clearErrors = true)
+        onSetupCompleted()
     }
 
     Scaffold(
@@ -172,13 +214,20 @@ fun SetupWizardScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
+                .imePadding()
+                .navigationBarsPadding()
                 .verticalScroll(rememberScrollState())
-                .padding(20.dp),
+                .padding(horizontal = 20.dp, vertical = 14.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // Compact Glowing Hero Header
+            AnimatedAiOrb(
+                companionState = if (isTestingGemini) CompanionState.THINKING else CompanionState.IDLE,
+                size = 94.dp
+            )
+
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Header with glowing badge
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(30.dp))
@@ -192,41 +241,42 @@ fun SetupWizardScreen(
                         Brush.horizontalGradient(listOf(CyanPrimary, VioletSecondary)),
                         RoundedCornerShape(30.dp)
                     )
-                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                    .padding(horizontal = 14.dp, vertical = 5.dp)
             ) {
                 Text(
-                    text = "MYRAA AI INITIALIZATION",
+                    text = "MYRAA AI • QUICK START",
                     color = CyanPrimary,
-                    style = MaterialTheme.typography.labelMedium,
+                    style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
                     letterSpacing = 1.2.sp
                 )
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
             Text(
-                text = "Welcome to Myraa AI",
+                text = "Activate MYRAA AI",
                 style = MaterialTheme.typography.headlineMedium,
                 color = TextPrimary,
-                fontWeight = FontWeight.ExtraBold
+                fontWeight = FontWeight.ExtraBold,
+                textAlign = TextAlign.Center
             )
 
             Text(
-                text = "Your private voice-controlled assistant with Mahi's warm Indian voice. Configure your credentials securely.",
-                style = MaterialTheme.typography.bodyMedium,
+                text = "Paste your Gemini API key below to unlock Hindi, Hinglish & English voice intelligence.",
+                style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,
-                modifier = Modifier.padding(top = 6.dp, bottom = 20.dp),
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
+                textAlign = TextAlign.Center
             )
 
-            // Step 1: Gemini API Key Card
+            // Primary Card: Direct Gemini API Key Setup & Verification
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .border(1.dp, CardGlowBorder, RoundedCornerShape(16.dp)),
+                    .border(1.dp, CardGlowBorder, RoundedCornerShape(18.dp)),
                 colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                shape = RoundedCornerShape(16.dp)
+                shape = RoundedCornerShape(18.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
@@ -237,7 +287,7 @@ fun SetupWizardScreen(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(
                                 modifier = Modifier
-                                    .size(36.dp)
+                                    .size(34.dp)
                                     .clip(CircleShape)
                                     .background(VioletSecondary.copy(alpha = 0.2f)),
                                 contentAlignment = Alignment.Center
@@ -246,77 +296,87 @@ fun SetupWizardScreen(
                                     imageVector = Icons.Default.Key,
                                     contentDescription = null,
                                     tint = VioletSecondary,
-                                    modifier = Modifier.size(20.dp)
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
-                            Spacer(modifier = Modifier.width(12.dp))
+                            Spacer(modifier = Modifier.width(10.dp))
                             Column {
                                 Text(
-                                    text = "1. Gemini Intelligence",
+                                    text = "Gemini API Key",
                                     style = MaterialTheme.typography.titleMedium,
                                     color = TextPrimary,
                                     fontWeight = FontWeight.Bold
                                 )
                                 Text(
-                                    text = "Encrypted in Android Keystore",
-                                    style = MaterialTheme.typography.bodySmall,
+                                    text = "Stored locally via Android Keystore",
+                                    style = MaterialTheme.typography.labelSmall,
                                     color = AuroraEmerald,
                                     fontSize = 11.sp
                                 )
                             }
                         }
 
-                        // Test Gemini Connection Button
-                        OutlinedButton(
+                        TextButton(
                             onClick = {
-                                if (!isTestingGemini) {
-                                    isTestingGemini = true
-                                    geminiTestResult = null
-                                    coroutineScope.launch {
-                                        geminiTestResult = geminiClient.testConnection(
-                                            apiKey = geminiKey,
-                                            selectedModel = selectedGeminiModel
-                                        )
-                                        isTestingGemini = false
-                                    }
-                                }
+                                try {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse("https://aistudio.google.com/apikey"))
+                                    )
+                                } catch (_: Exception) {}
                             },
-                            modifier = Modifier.testTag("test_gemini_connection_button"),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = CyanPrimary),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, CyanPrimary),
-                            shape = RoundedCornerShape(20.dp)
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
                         ) {
-                            if (isTestingGemini) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(14.dp),
-                                    strokeWidth = 2.dp,
-                                    color = CyanPrimary
-                                )
-                            } else {
-                                Text("Test Connection", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            }
+                            Text("Get Key", color = CyanPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                                contentDescription = "Get Gemini API Key",
+                                tint = CyanPrimary,
+                                modifier = Modifier.size(13.dp)
+                            )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
 
                     OutlinedTextField(
                         value = geminiKey,
-                        onValueChange = { geminiKey = it },
+                        onValueChange = {
+                            geminiKey = it
+                            geminiTestResult = null
+                        },
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("gemini_key_input"),
-                        label = { Text("Gemini API Key (Google AI Studio)") },
+                        label = { Text("Paste Gemini API Key") },
                         placeholder = { Text("AIzaSy...") },
                         visualTransformation = if (showGeminiKey) VisualTransformation.None else PasswordVisualTransformation(),
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                         trailingIcon = {
-                            IconButton(onClick = { showGeminiKey = !showGeminiKey }) {
-                                Icon(
-                                    imageVector = if (showGeminiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = "Toggle Visibility",
-                                    tint = TextSecondary
-                                )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = {
+                                        val pasted = clipboardManager.getText()?.text?.trim().orEmpty()
+                                        if (pasted.isNotBlank()) {
+                                            geminiKey = pasted
+                                            geminiTestResult = null
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("paste_gemini_key_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ContentPaste,
+                                        contentDescription = "Paste API Key",
+                                        tint = CyanPrimary
+                                    )
+                                }
+                                IconButton(onClick = { showGeminiKey = !showGeminiKey }) {
+                                    Icon(
+                                        imageVector = if (showGeminiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = "Toggle Visibility",
+                                        tint = TextSecondary
+                                    )
+                                }
                             }
                         },
                         colors = OutlinedTextFieldDefaults.colors(
@@ -343,7 +403,7 @@ fun SetupWizardScreen(
                             value = selectedGeminiModel,
                             onValueChange = {},
                             readOnly = true,
-                            label = { Text("Gemini Model Version") },
+                            label = { Text("Gemini Model") },
                             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = isModelDropdownExpanded) },
                             modifier = Modifier
                                 .menuAnchor(MenuAnchorType.PrimaryNotEditable)
@@ -360,36 +420,66 @@ fun SetupWizardScreen(
                         )
                         ExposedDropdownMenu(
                             expanded = isModelDropdownExpanded,
-                            onDismissRequest = { isModelDropdownExpanded = false }
+                            onDismissRequest = { isModelDropdownExpanded = false },
+                            modifier = Modifier.background(DarkSurfaceElevated)
                         ) {
                             GeminiClient.AVAILABLE_MODELS.forEach { model ->
                                 DropdownMenuItem(
-                                    text = { Text(model) },
+                                    text = { Text(model, color = TextPrimary) },
                                     onClick = {
                                         selectedGeminiModel = model
                                         isModelDropdownExpanded = false
+                                        geminiTestResult = null
                                     }
                                 )
                             }
                         }
                     }
 
-                    // Test Result Feedback Banner
+                    // Verification Result Feedback Banner
                     geminiTestResult?.let { res ->
                         Spacer(modifier = Modifier.height(10.dp))
-                        when (res) {
-                            is ConnectionTestResult.Success -> {
+                        val isSuccess = res is ConnectionTestResult.Success
+                        val statusColor = if (isSuccess) AuroraEmerald else DangerRed
+                        val msg = when (res) {
+                            is ConnectionTestResult.Success -> res.message
+                            is ConnectionTestResult.Failure -> res.errorMessage
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(statusColor.copy(alpha = 0.14f))
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = msg,
+                                color = statusColor,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+
+                        if (res is ConnectionTestResult.Failure &&
+                            res.errorMessage.contains("Network", ignoreCase = true) &&
+                            geminiKey.trim().isNotBlank()
+                        ) {
+                            TextButton(
+                                onClick = { persistSettingsAndProceed(selectedGeminiModel, isOfflineOnly = false) },
+                                modifier = Modifier.align(Alignment.End)
+                            ) {
                                 Text(
-                                    text = "✓ ${res.message}",
-                                    color = AuroraEmerald,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                            is ConnectionTestResult.Failure -> {
-                                Text(
-                                    text = "✕ ${res.errorMessage}",
-                                    color = DangerRed,
+                                    text = "Save Key & Continue Offline →",
+                                    color = CyanPrimary,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Bold
                                 )
@@ -401,307 +491,377 @@ fun SetupWizardScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Step 2: Voice API & Mahi Voice Preset Card
+            // Microphone Quick Grant Strip (one-tap before starting)
+            if (!isMicPermissionGranted) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(DarkSurface)
+                        .border(1.dp, CyanPrimary.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
+                        .clickable { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                        Icon(
+                            imageVector = Icons.Default.Mic,
+                            contentDescription = null,
+                            tint = CyanPrimary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Microphone Access Required for Voice",
+                                color = TextPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Tap Allow so MYRAA can hear you",
+                                color = TextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(CyanPrimary)
+                            .padding(horizontal = 12.dp, vertical = 5.dp)
+                    ) {
+                        Text("Allow", color = Color(0xFF04141E), fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+                Spacer(modifier = Modifier.height(14.dp))
+            }
+
+            // Primary Verify & Activate CTA
+            Button(
+                onClick = {
+                    if (isTestingGemini) return@Button
+                    focusManager.clearFocus()
+                    val cleanKey = geminiKey.trim()
+                    if (cleanKey.isBlank()) {
+                        geminiTestResult = ConnectionTestResult.Failure(
+                            "Please enter your Gemini API key above, or tap Skip below for offline device controls."
+                        )
+                        return@Button
+                    }
+                    isTestingGemini = true
+                    geminiTestResult = null
+                    coroutineScope.launch {
+                        val result = geminiClient.testConnection(cleanKey, selectedGeminiModel)
+                        isTestingGemini = false
+                        geminiTestResult = result
+                        if (result is ConnectionTestResult.Success) {
+                            selectedGeminiModel = result.modelUsed
+                            persistSettingsAndProceed(result.modelUsed, isOfflineOnly = false)
+                        }
+                    }
+                },
+                enabled = !isTestingGemini,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp)
+                    .testTag("activate_agents_button"),
+                colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                if (isTestingGemini) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = Color(0xFF04141E)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "VERIFYING GEMINI KEY...",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = Color(0xFF04141E),
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                } else {
+                    Text(
+                        text = "VERIFY API KEY & START MYRAA",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color(0xFF04141E),
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            TextButton(
+                onClick = {
+                    persistSettingsAndProceed(selectedGeminiModel, isOfflineOnly = true)
+                },
+                modifier = Modifier.testTag("skip_offline_setup_button")
+            ) {
+                Text(
+                    text = "Continue without Gemini Key (Local Device Controls Only)",
+                    color = TextSecondary,
+                    fontSize = 12.sp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Collapsible Optional Voice (ElevenLabs Mahi) & System Permissions Card
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .border(1.dp, CardGlowBorder, RoundedCornerShape(16.dp)),
+                    .border(1.dp, DarkSurfaceBorder, RoundedCornerShape(16.dp)),
                 colors = CardDefaults.cardColors(containerColor = DarkSurface),
                 shape = RoundedCornerShape(16.dp)
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+                Column(modifier = Modifier.padding(14.dp)) {
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(CircleShape)
-                                    .background(AuroraPink.copy(alpha = 0.2f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.RecordVoiceOver,
-                                    contentDescription = null,
-                                    tint = AuroraPink,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Column {
-                                Text(
-                                    text = "2. ElevenLabs Voice (Mahi)",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = TextPrimary,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "Default Indian Conversational Voice",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = AuroraPink,
-                                    fontSize = 11.sp
-                                )
-                            }
-                        }
-
-                        // Test Voice Button
-                        OutlinedButton(
-                            onClick = {
-                                if (!isTestingVoice) {
-                                    isTestingVoice = true
-                                    voiceTestResult = null
-                                    coroutineScope.launch {
-                                        voiceTestResult = elevenLabsClient.testVoiceConnection(
-                                            apiKey = voiceKey,
-                                            voiceId = mahiVoiceId,
-                                            modelId = voiceModel
-                                        )
-                                        isTestingVoice = false
-                                    }
-                                }
-                            },
-                            modifier = Modifier.testTag("test_voice_button"),
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AuroraPink),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, AuroraPink),
-                            shape = RoundedCornerShape(20.dp)
-                        ) {
-                            if (isTestingVoice) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(14.dp),
-                                    strokeWidth = 2.dp,
-                                    color = AuroraPink
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.PlayArrow,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Test Mahi", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    OutlinedTextField(
-                        value = voiceKey,
-                        onValueChange = { voiceKey = it },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .testTag("voice_key_input"),
-                        label = { Text("ElevenLabs API Key") },
-                        placeholder = { Text("Enter your ElevenLabs API Key") },
-                        visualTransformation = if (showVoiceKey) VisualTransformation.None else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        trailingIcon = {
-                            IconButton(onClick = { showVoiceKey = !showVoiceKey }) {
-                                Icon(
-                                    imageVector = if (showVoiceKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = "Toggle Visibility",
-                                    tint = TextSecondary
-                                )
-                            }
-                        },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = AuroraPink,
-                            unfocusedBorderColor = DarkSurfaceBorder,
-                            focusedTextColor = TextPrimary,
-                            unfocusedTextColor = TextPrimary,
-                            focusedContainerColor = DarkSurfaceElevated,
-                            unfocusedContainerColor = DarkSurfaceElevated
-                        ),
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp)
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    // Mahi Voice ID Configuration Field
-                    OutlinedTextField(
-                        value = mahiVoiceId,
-                        onValueChange = { mahiVoiceId = it },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("mahi_voice_id_input"),
-                        label = { Text("Configured Mahi Voice ID") },
-                        placeholder = { Text("e.g. 21m00Tcm4TlvDq8ikWAM") },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = AuroraPink,
-                            unfocusedBorderColor = DarkSurfaceBorder,
-                            focusedTextColor = TextPrimary,
-                            unfocusedTextColor = TextPrimary,
-                            focusedContainerColor = DarkSurfaceElevated,
-                            unfocusedContainerColor = DarkSurfaceElevated
-                        ),
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp)
-                    )
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    // Optional Native TTS Fallback Toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
+                            .clickable { showAdvancedOptions = !showAdvancedOptions },
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Native Android TTS Fallback",
-                                style = MaterialTheme.typography.bodySmall,
+                                text = "Mahi Voice & Device Permissions (Optional)",
+                                style = MaterialTheme.typography.titleSmall,
                                 color = TextPrimary,
-                                fontWeight = FontWeight.SemiBold
+                                fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Use local TTS only if ElevenLabs is unconfigured or offline",
+                                text = "Android Mahi TTS is active by default • Tap to add ElevenLabs or Accessibility",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary,
-                                fontSize = 10.sp
+                                fontSize = 11.sp
                             )
                         }
-                        Switch(
-                            checked = nativeTtsFallback,
-                            onCheckedChange = { nativeTtsFallback = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = AuroraPink,
-                                checkedTrackColor = AuroraPink.copy(alpha = 0.3f),
-                                uncheckedThumbColor = TextSecondary,
-                                uncheckedTrackColor = DarkSurfaceBorder
-                            )
+                        Icon(
+                            imageVector = if (showAdvancedOptions) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = "Toggle Optional Settings",
+                            tint = CyanPrimary
                         )
                     }
 
-                    // Voice Test Result Feedback
-                    voiceTestResult?.let { res ->
-                        Spacer(modifier = Modifier.height(10.dp))
-                        when (res) {
-                            is VoiceTestResult.Success -> {
-                                Text(
-                                    text = "✓ ${res.message}",
-                                    color = AuroraEmerald,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
+                    AnimatedVisibility(visible = showAdvancedOptions) {
+                        Column(modifier = Modifier.padding(top = 14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.RecordVoiceOver,
+                                        contentDescription = null,
+                                        tint = AuroraPink,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "ElevenLabs Voice (Mahi)",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = TextPrimary,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        if (!isTestingVoice) {
+                                            isTestingVoice = true
+                                            voiceTestResult = null
+                                            coroutineScope.launch {
+                                                voiceTestResult = elevenLabsClient.testVoiceConnection(
+                                                    apiKey = voiceKey,
+                                                    voiceId = mahiVoiceId,
+                                                    modelId = voiceModel
+                                                )
+                                                isTestingVoice = false
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("test_voice_button"),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AuroraPink),
+                                    border = BorderStroke(1.dp, AuroraPink),
+                                    shape = RoundedCornerShape(20.dp),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                                ) {
+                                    if (isTestingVoice) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(14.dp),
+                                            strokeWidth = 2.dp,
+                                            color = AuroraPink
+                                        )
+                                    } else {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Test Mahi", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            OutlinedTextField(
+                                value = voiceKey,
+                                onValueChange = { voiceKey = it },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("voice_key_input"),
+                                label = { Text("ElevenLabs API Key (Optional)") },
+                                placeholder = { Text("sk_... (blank = Native TTS)") },
+                                visualTransformation = if (showVoiceKey) VisualTransformation.None else PasswordVisualTransformation(),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                                trailingIcon = {
+                                    IconButton(onClick = { showVoiceKey = !showVoiceKey }) {
+                                        Icon(
+                                            imageVector = if (showVoiceKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                            contentDescription = "Toggle Visibility",
+                                            tint = TextSecondary
+                                        )
+                                    }
+                                },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = AuroraPink,
+                                    unfocusedBorderColor = DarkSurfaceBorder,
+                                    focusedTextColor = TextPrimary,
+                                    unfocusedTextColor = TextPrimary,
+                                    focusedContainerColor = DarkSurfaceElevated,
+                                    unfocusedContainerColor = DarkSurfaceElevated
+                                ),
+                                singleLine = true,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            OutlinedTextField(
+                                value = mahiVoiceId,
+                                onValueChange = { mahiVoiceId = it },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("mahi_voice_id_input"),
+                                label = { Text("Configured Mahi Voice ID") },
+                                placeholder = { Text("e.g. 21m00Tcm4TlvDq8ikWAM") },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = AuroraPink,
+                                    unfocusedBorderColor = DarkSurfaceBorder,
+                                    focusedTextColor = TextPrimary,
+                                    unfocusedTextColor = TextPrimary,
+                                    focusedContainerColor = DarkSurfaceElevated,
+                                    unfocusedContainerColor = DarkSurfaceElevated
+                                ),
+                                singleLine = true,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Native Android TTS Fallback",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextPrimary,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(
+                                        text = "Speaks locally if ElevenLabs is unconfigured or offline",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextSecondary,
+                                        fontSize = 10.sp
+                                    )
+                                }
+                                Switch(
+                                    checked = nativeTtsFallback,
+                                    onCheckedChange = { nativeTtsFallback = it },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = AuroraPink,
+                                        checkedTrackColor = AuroraPink.copy(alpha = 0.3f),
+                                        uncheckedThumbColor = TextSecondary,
+                                        uncheckedTrackColor = DarkSurfaceBorder
+                                    )
                                 )
                             }
-                            is VoiceTestResult.Failure -> {
-                                Text(
-                                    text = "✕ ${res.errorMessage}",
-                                    color = DangerRed,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
+
+                            voiceTestResult?.let { res ->
+                                Spacer(modifier = Modifier.height(6.dp))
+                                when (res) {
+                                    is VoiceTestResult.Success -> Text(
+                                        text = "✓ ${res.message}",
+                                        color = AuroraEmerald,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    is VoiceTestResult.Failure -> Text(
+                                        text = "✕ ${res.errorMessage}",
+                                        color = DangerRed,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            Text(
+                                text = "Device Automation Permissions",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = TextPrimary,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(bottom = 8.dp)
+                            )
+
+                            PermissionItemRow(
+                                title = "Microphone Permission",
+                                desc = "Hands-free speech recognition",
+                                icon = Icons.Default.Mic,
+                                isGranted = isMicPermissionGranted,
+                                actionLabel = if (isMicPermissionGranted) "Active" else "Allow",
+                                onClick = { micLauncher.launch(Manifest.permission.RECORD_AUDIO) }
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            PermissionItemRow(
+                                title = "Accessibility Service",
+                                desc = "Tap buttons, scroll, home & back",
+                                icon = Icons.Default.TouchApp,
+                                isGranted = isAccessibilityGranted,
+                                actionLabel = if (isAccessibilityGranted) "Active" else "Enable",
+                                onClick = {
+                                    context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                                }
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            PermissionItemRow(
+                                title = "Draw Over Other Apps",
+                                desc = "Floating Aurora light overlay",
+                                icon = Icons.Default.Layers,
+                                isGranted = isOverlayPermissionGranted,
+                                actionLabel = if (isOverlayPermissionGranted) "Active" else "Enable",
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                            Uri.parse("package:${context.packageName}")
+                                        )
+                                    )
+                                }
+                            )
                         }
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // Step 3: Permissions Card (Accessibility + Draw Over Other Apps + Mic)
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, CardGlowBorder, RoundedCornerShape(16.dp)),
-                colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "3. Required Device Permissions",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = TextPrimary,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Enables full device control and floating aurora overlay",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary,
-                        modifier = Modifier.padding(bottom = 12.dp)
-                    )
-
-                    // Accessibility Permission Row
-                    PermissionItemRow(
-                        title = "Accessibility Service",
-                        desc = "Navigate apps, scroll, tap buttons, home & back",
-                        icon = Icons.Default.TouchApp,
-                        isGranted = isAccessibilityGranted,
-                        actionLabel = if (isAccessibilityGranted) "Active" else "Enable",
-                        onClick = {
-                            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                            context.startActivity(intent)
-                        }
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // Draw Over Other Apps Permission Row
-                    PermissionItemRow(
-                        title = "Draw Over Other Apps",
-                        desc = "Floating Aurora light when app is minimized",
-                        icon = Icons.Default.Layers,
-                        isGranted = isOverlayPermissionGranted,
-                        actionLabel = if (isOverlayPermissionGranted) "Active" else "Enable",
-                        onClick = {
-                            val intent = Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:${context.packageName}")
-                            )
-                            context.startActivity(intent)
-                        }
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // Microphone Permission Row
-                    PermissionItemRow(
-                        title = "Microphone Permission",
-                        desc = "Continuous voice listening and speech input",
-                        icon = Icons.Default.Mic,
-                        isGranted = isMicPermissionGranted,
-                        actionLabel = if (isMicPermissionGranted) "Active" else "Allow",
-                        onClick = {
-                            micLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                        }
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // Complete Setup & Save Button
-            Button(
-                onClick = {
-                    prefs.setGeminiApiKey(geminiKey)
-                    prefs.setSelectedGeminiModel(selectedGeminiModel)
-                    prefs.setVoiceApiKey(voiceKey)
-                    prefs.setSelectedVoiceId(mahiVoiceId)
-                    prefs.setSelectedVoiceModel(voiceModel)
-                    prefs.setNativeTtsFallbackEnabled(nativeTtsFallback)
-                    prefs.setSetupCompleted(true)
-                    onSetupCompleted()
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp)
-                    .testTag("activate_agents_button"),
-                colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Text(
-                    text = "SAVE CREDENTIALS & START MYRAA",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = Color(0xFF04141E),
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }
@@ -710,7 +870,7 @@ fun SetupWizardScreen(
 private fun PermissionItemRow(
     title: String,
     desc: String,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    icon: ImageVector,
     isGranted: Boolean,
     actionLabel: String,
     onClick: () -> Unit
@@ -725,7 +885,7 @@ private fun PermissionItemRow(
                 if (isGranted) AuroraEmerald.copy(alpha = 0.4f) else DarkSurfaceBorder,
                 RoundedCornerShape(12.dp)
             )
-            .padding(12.dp),
+            .padding(10.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -737,19 +897,19 @@ private fun PermissionItemRow(
                 imageVector = icon,
                 contentDescription = null,
                 tint = if (isGranted) AuroraEmerald else CyanPrimary,
-                modifier = Modifier.size(22.dp)
+                modifier = Modifier.size(20.dp)
             )
             Spacer(modifier = Modifier.width(10.dp))
             Column {
                 Text(
                     text = title,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = MaterialTheme.typography.bodySmall,
                     color = TextPrimary,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
                     text = desc,
-                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                     color = TextSecondary
                 )
             }
@@ -769,13 +929,13 @@ private fun PermissionItemRow(
                         imageVector = Icons.Default.CheckCircle,
                         contentDescription = null,
                         tint = AuroraEmerald,
-                        modifier = Modifier.size(14.dp)
+                        modifier = Modifier.size(13.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = "ACTIVE",
                         color = AuroraEmerald,
-                        fontSize = 11.sp,
+                        fontSize = 10.sp,
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -785,11 +945,11 @@ private fun PermissionItemRow(
                 onClick = onClick,
                 colors = ButtonDefaults.buttonColors(containerColor = VioletSecondary),
                 shape = RoundedCornerShape(20.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 4.dp)
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
             ) {
                 Text(
                     text = actionLabel,
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     color = Color.White,
                     fontWeight = FontWeight.Bold
                 )

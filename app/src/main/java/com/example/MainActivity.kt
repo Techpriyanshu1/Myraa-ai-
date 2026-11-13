@@ -63,10 +63,12 @@ class MainActivity : ComponentActivity() {
                             AppScreen.SPLASH -> {
                                 SplashScreen(
                                     onSplashFinished = {
-                                        currentScreen = if (prefs.isSetupCompleted()) {
+                                        val isConfigured = prefs.isSetupCompleted() &&
+                                            (prefs.hasStoredGeminiKey() || prefs.isOfflineModeAccepted())
+                                        currentScreen = if (isConfigured) {
                                             AppScreen.MAIN
                                         } else {
-                                            AppScreen.WELCOME
+                                            AppScreen.SETUP
                                         }
                                     }
                                 )

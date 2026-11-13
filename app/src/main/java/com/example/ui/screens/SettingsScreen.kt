@@ -79,6 +79,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.agents.AgentFleetManager
 import com.example.data.api.ConnectionTestResult
 import com.example.data.api.ElevenLabsClient
 import com.example.data.api.GeminiClient
@@ -114,6 +115,7 @@ fun SettingsScreen(
     val prefs = remember { SecurePreferences(context) }
     val geminiClient = remember { GeminiClient() }
     val elevenLabsClient = remember { ElevenLabsClient(context) }
+    val fleetManager = remember { AgentFleetManager.getInstance(context, prefs) }
 
     var geminiKey by remember { mutableStateOf(prefs.getGeminiApiKey()) }
     var showGeminiKey by remember { mutableStateOf(false) }
@@ -354,7 +356,15 @@ fun SettingsScreen(
                             prefs.setGeminiApiKey(cleanKey)
                             prefs.setSelectedGeminiModel(selectedGeminiModel)
                             coroutineScope.launch {
-                                geminiTestResult = geminiClient.testConnection(cleanKey, selectedGeminiModel)
+                                val res = geminiClient.testConnection(cleanKey, selectedGeminiModel)
+                                geminiTestResult = res
+                                if (res is ConnectionTestResult.Success) {
+                                    selectedGeminiModel = res.modelUsed
+                                    prefs.setSelectedGeminiModel(res.modelUsed)
+                                    prefs.setOfflineModeAccepted(false)
+                                    fleetManager.clearAgentError("gemini_intelligence")
+                                    fleetManager.refreshFleetStatus(clearErrors = true)
+                                }
                                 isTestingGemini = false
                             }
                         },
@@ -517,7 +527,12 @@ fun SettingsScreen(
                             prefs.setVoiceApiKey(cleanVoiceKey)
                             prefs.setSelectedVoiceId(selectedVoiceId)
                             coroutineScope.launch {
-                                voiceTestResult = elevenLabsClient.testVoiceConnection(cleanVoiceKey, selectedVoiceId)
+                                val res = elevenLabsClient.testVoiceConnection(cleanVoiceKey, selectedVoiceId)
+                                voiceTestResult = res
+                                if (res is VoiceTestResult.Success) {
+                                    fleetManager.clearAgentError("mahi_voice_output")
+                                    fleetManager.refreshFleetStatus()
+                                }
                                 isTestingVoice = false
                             }
                         },
@@ -651,12 +666,17 @@ fun SettingsScreen(
             // Save Settings Button
             Button(
                 onClick = {
-                    prefs.setGeminiApiKey(geminiKey.trim())
+                    val cleanGemini = geminiKey.trim()
+                    prefs.setGeminiApiKey(cleanGemini)
                     prefs.setSelectedGeminiModel(selectedGeminiModel)
+                    if (cleanGemini.isNotBlank()) {
+                        prefs.setOfflineModeAccepted(false)
+                    }
                     prefs.setVoiceApiKey(voiceKey.trim())
                     prefs.setSelectedVoiceId(selectedVoiceId)
                     prefs.setOverlayEnabled(isOverlayEnabled)
                     prefs.setContinuousListeningEnabled(isContinuousListening)
+                    fleetManager.refreshFleetStatus(clearErrors = true)
                     savedMessage = "Preferences saved securely in Keystore!"
                 },
                 modifier = Modifier

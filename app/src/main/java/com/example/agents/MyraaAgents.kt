@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.provider.Settings
+import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import com.example.data.db.AppDatabase
 import com.example.data.pref.SecurePreferences
@@ -119,27 +120,44 @@ abstract class BaseMyraaAgent(
 
     override fun clearError() {
         lastErrorReason = null
+        val configOk = validateConfiguration()
+        val permOk = validatePermissions()
+        when {
+            !configOk.isValid -> {
+                _statusFlow.value = configOk.statusOnFailure
+                lastDetailMessage = configOk.reason
+            }
+            !permOk.isValid -> {
+                _statusFlow.value = permOk.statusOnFailure
+                lastDetailMessage = permOk.reason
+            }
+            _statusFlow.value == AgentStatus.ERROR || _statusFlow.value == AgentStatus.NOT_CONFIGURED || _statusFlow.value == AgentStatus.PERMISSION_REQUIRED -> {
+                _statusFlow.value = AgentStatus.READY
+                lastDetailMessage = onReadyDetail()
+            }
+        }
     }
 
     override fun checkHealth(): AgentHealthReport {
-        // Re-evaluate live permissions/config if currently idle/ready/disabled/permission_required
+        // Re-evaluate live permissions/config cleanly; recover when config/permission state is satisfied
         val current = _statusFlow.value
-        if (current != AgentStatus.INITIALIZING && current != AgentStatus.ERROR) {
-            val configOk = validateConfiguration()
-            val permOk = validatePermissions()
-            when {
-                !configOk.isValid -> {
-                    _statusFlow.value = configOk.statusOnFailure
-                    lastDetailMessage = configOk.reason
-                }
-                !permOk.isValid -> {
-                    _statusFlow.value = permOk.statusOnFailure
-                    lastDetailMessage = permOk.reason
-                }
-                current != AgentStatus.ACTIVE -> {
-                    _statusFlow.value = AgentStatus.READY
-                    lastDetailMessage = onReadyDetail()
-                }
+        val configOk = validateConfiguration()
+        val permOk = validatePermissions()
+        when {
+            !configOk.isValid -> {
+                _statusFlow.value = configOk.statusOnFailure
+                lastDetailMessage = configOk.reason
+            }
+            !permOk.isValid -> {
+                _statusFlow.value = permOk.statusOnFailure
+                lastDetailMessage = permOk.reason
+            }
+            current == AgentStatus.ERROR -> {
+                // Keep explicit runtime error visible until clearError() or successful re-init
+            }
+            current != AgentStatus.ACTIVE -> {
+                _statusFlow.value = AgentStatus.READY
+                lastDetailMessage = onReadyDetail()
             }
         }
 
@@ -206,14 +224,24 @@ class VoiceRecognitionAgent(
     isOptional = false,
     dependencies = listOf("permission_manager")
 ) {
+    private fun hasDialogRecognizer(): Boolean {
+        return try {
+            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).resolveActivity(context.packageManager) != null
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     override fun validateConfiguration(): AgentValidationResult {
-        return if (SpeechRecognizer.isRecognitionAvailable(context)) {
+        val liveReady = SpeechRecognizer.isRecognitionAvailable(context)
+        val dialogReady = hasDialogRecognizer()
+        return if (liveReady || dialogReady) {
             AgentValidationResult(true)
         } else {
             AgentValidationResult(
                 isValid = false,
                 statusOnFailure = AgentStatus.DISABLED,
-                reason = "On-device SpeechRecognizer unavailable; system dialog fallback only."
+                reason = "Speech recognition service unavailable on ROM; text command input remains active."
             )
         }
     }
@@ -231,8 +259,21 @@ class VoiceRecognitionAgent(
         }
     }
 
-    override fun onReadyDetail(): String = "Microphone & SpeechRecognizer ready"
-    override fun onActiveDetail(): String = "Listening continuously for Hindi/Hinglish/English"
+    override fun onReadyDetail(): String {
+        return if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            "Microphone & SpeechRecognizer ready"
+        } else {
+            "Mic dialog voice input ready (Tap Mic icon)"
+        }
+    }
+
+    override fun onActiveDetail(): String {
+        return if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            "Listening continuously for Hindi/Hinglish/English"
+        } else {
+            "Active via System Voice Dialog & Text Commands"
+        }
+    }
 }
 
 // 3. Mahi Voice Output Agent

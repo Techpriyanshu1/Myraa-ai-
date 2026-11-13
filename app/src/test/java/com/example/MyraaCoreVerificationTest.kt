@@ -316,4 +316,58 @@ class MyraaCoreVerificationTest {
         assertEquals("OPEN_SETTINGS", wifiDirect.actionType)
         assertEquals("wifi", wifiDirect.target)
     }
+
+    @Test
+    fun `Gemini agent recovers cleanly from ERROR to READY after key is saved`() = runTest {
+        val fleet = AgentFleetManager(context, prefs)
+        assertEquals(AgentStatus.NOT_CONFIGURED, fleet.getAgentReport("gemini_intelligence")?.status)
+
+        prefs.setGeminiApiKey("AIzaSyTemporaryBadKey1111")
+        fleet.refreshFleetStatus()
+        assertEquals(AgentStatus.READY, fleet.getAgentReport("gemini_intelligence")?.status)
+
+        fleet.recordAgentError("gemini_intelligence", "Temporary network failure")
+        assertEquals(AgentStatus.ERROR, fleet.getAgentReport("gemini_intelligence")?.status)
+
+        prefs.setGeminiApiKey("AIzaSyDummyRecoveredKey12345")
+        fleet.refreshFleetStatus(clearErrors = true)
+
+        assertEquals(AgentStatus.READY, fleet.getAgentReport("gemini_intelligence")?.status)
+    }
+
+    @Test
+    fun `KeystoreSecurityVault encrypts with explicit prefix and round-trips Gemini key`() {
+        val vault = com.example.security.KeystoreSecurityVault(context)
+        val cipher = vault.encrypt("AIzaSyRoundTripSecret9876")
+        assertTrue(cipher.startsWith("v2ks:") || cipher.startsWith("v2fb:"))
+        assertEquals("AIzaSyRoundTripSecret9876", vault.decrypt(cipher))
+
+        prefs.setGeminiApiKey("AIzaSyPrefSavedKey4321")
+        assertTrue(prefs.hasStoredGeminiKey())
+        assertEquals("AIzaSyPrefSavedKey4321", prefs.getGeminiApiKey())
+    }
+
+    @Test
+    fun `VoiceRecognitionManager prepareSessionForGreeting enters TALKING without mic contention`() {
+        val voiceManager = com.example.voice.VoiceRecognitionManager(
+            context = context,
+            onCommandReceived = {}
+        )
+        voiceManager.prepareSessionForGreeting()
+        assertTrue(voiceManager.isSessionActive)
+        assertFalse(voiceManager.isPaused)
+        assertEquals(com.example.voice.CompanionState.TALKING, voiceManager.companionState.value)
+        assertEquals(null, voiceManager.errorMessage.value)
+        voiceManager.destroy()
+    }
+
+    @Test
+    fun `first-screen onboarding gate distinguishes incomplete key from explicit offline mode`() {
+        prefs.setSetupCompleted(true)
+        assertFalse(prefs.hasStoredGeminiKey())
+        assertFalse(prefs.isOfflineModeAccepted())
+
+        prefs.setOfflineModeAccepted(true)
+        assertTrue(prefs.isOfflineModeAccepted())
+    }
 }

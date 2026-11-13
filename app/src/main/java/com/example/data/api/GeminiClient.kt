@@ -48,75 +48,90 @@ class GeminiClient {
         )
     }
 
+    private fun supportsZeroThinkingBudget(model: String): Boolean {
+        return model == "gemini-2.5-flash" || model == "gemini-2.5-flash-lite"
+    }
+
     suspend fun testConnection(apiKey: String, selectedModel: String): ConnectionTestResult = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank()) {
             return@withContext ConnectionTestResult.Failure("API key is empty. Please enter your Gemini API key.")
         }
 
-        val targetModel = if (selectedModel.isNotBlank() && selectedModel !in listOf("gemini-3.8-flash", "gemini-3.5-flash")) {
-            selectedModel.trim()
-        } else {
-            "gemini-2.5-flash"
-        }
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$targetModel:generateContent"
+        val safePreferred = selectedModel.trim().takeIf {
+            it.isNotBlank() && it !in listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-pro-latest")
+        } ?: "gemini-2.5-flash"
+        val candidateModels = (listOf(safePreferred) + AVAILABLE_MODELS).distinct()
 
-        try {
-            val testPayload = JSONObject().apply {
-                put("contents", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("role", "user")
-                        put("parts", JSONArray().apply {
-                            put(JSONObject().put("text", "Reply with only OK."))
+        var lastFailure = ConnectionTestResult.Failure("Gemini connection failed.")
+
+        for (targetModel in candidateModels) {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$targetModel:generateContent"
+            try {
+                val testPayload = JSONObject().apply {
+                    put("contents", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("role", "user")
+                            put("parts", JSONArray().apply {
+                                put(JSONObject().put("text", "Reply with only OK."))
+                            })
                         })
                     })
-                })
-                put("generationConfig", JSONObject().apply {
-                    put("maxOutputTokens", 32)
-                    if (targetModel.contains("2.5") || targetModel.contains("latest")) {
-                        put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                    put("generationConfig", JSONObject().apply {
+                        put("maxOutputTokens", 32)
+                        if (supportsZeroThinkingBudget(targetModel)) {
+                            put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                        }
+                    })
+                }
+
+                val body = testPayload.toString().toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url(url)
+                    .addHeader("x-goog-api-key", cleanKey)
+                    .addHeader("Content-Type", "application/json")
+                    .post(body)
+                    .build()
+
+                val (code, errBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                    maxAttempts = 2
+                ) {
+                    client.newCall(request).execute().use { response ->
+                        val responseBodyStr = response.body?.string() ?: ""
+                        Triple(response.code, responseBodyStr, response.isSuccessful)
                     }
-                })
-            }
-
-            val body = testPayload.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder()
-                .url(url)
-                .addHeader("x-goog-api-key", cleanKey)
-                .addHeader("Content-Type", "application/json")
-                .post(body)
-                .build()
-
-            val (code, errBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
-                maxAttempts = 2
-            ) {
-                client.newCall(request).execute().use { response ->
-                    val responseBodyStr = response.body?.string() ?: ""
-                    Triple(response.code, responseBodyStr, response.isSuccessful)
                 }
-            }
 
-            if (isOk) {
-                return@withContext ConnectionTestResult.Success(
-                    message = "Connection successful with $targetModel!",
-                    modelUsed = targetModel
-                )
-            } else {
+                if (isOk) {
+                    return@withContext ConnectionTestResult.Success(
+                        message = "Connection successful with $targetModel!",
+                        modelUsed = targetModel
+                    )
+                }
+
+                val parsedErr = parseErrorMessage(errBody)
                 val humanMsg = when (code) {
-                    400 -> "API key or request is invalid: ${parseErrorMessage(errBody)}"
-                    403 -> "API key lacks permissions or quota exceeded: ${parseErrorMessage(errBody)}"
-                    404 -> "Model $targetModel is not available: ${parseErrorMessage(errBody)}"
-                    429 -> "Rate limit exceeded. Please wait a moment."
-                    else -> "Connection failed (HTTP $code): ${parseErrorMessage(errBody)}"
+                    400 -> "API key or request invalid: $parsedErr"
+                    401, 403 -> "Invalid Gemini API key or access denied: $parsedErr"
+                    404 -> "Model $targetModel unavailable: $parsedErr"
+                    429 -> "Rate limit / quota reached ($targetModel): $parsedErr"
+                    else -> "Connection failed (HTTP $code): $parsedErr"
                 }
-                return@withContext ConnectionTestResult.Failure(humanMsg, code)
+                lastFailure = ConnectionTestResult.Failure(humanMsg, code)
+
+                // Invalid API key won't pass on other models — fail fast with clear error
+                if (code == 401 || code == 403 || (code == 400 && parsedErr.contains("API key", ignoreCase = true))) {
+                    return@withContext lastFailure
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Log.e("GeminiClient", "Test connection exception for $targetModel", e)
+                return@withContext ConnectionTestResult.Failure("Network error: ${e.localizedMessage ?: "Check internet connection"}")
             }
-        } catch (ce: kotlinx.coroutines.CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            Log.e("GeminiClient", "Test connection exception", e)
-            return@withContext ConnectionTestResult.Failure("Gemini connection failed: ${e.localizedMessage ?: "Network error"}")
         }
+
+        return@withContext lastFailure
     }
 
     suspend fun interpretCommand(
@@ -193,7 +208,7 @@ class GeminiClient {
                         put("temperature", 0.35)
                         put("maxOutputTokens", 650)
                         put("responseMimeType", "application/json")
-                        if (model.contains("2.5") || model.contains("latest")) {
+                        if (supportsZeroThinkingBudget(model)) {
                             put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                         }
                     }
@@ -253,7 +268,7 @@ class GeminiClient {
                         val errMsg = parseErrorMessage(rawBody)
                         lastApiError = "HTTP $code: $errMsg"
                         Log.w("GeminiClient", "Gemini $model HTTP $code: $errMsg")
-                        if (code == 400 || code == 401 || code == 403) {
+                        if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
                             // Invalid key/permission won't succeed on fallback models
                             break
                         }

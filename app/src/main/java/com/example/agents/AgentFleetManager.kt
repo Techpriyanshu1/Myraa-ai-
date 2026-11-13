@@ -69,9 +69,18 @@ class AgentFleetManager(
     /**
      * Evaluates current configuration & permissions of all 11 agents without force-activating them.
      */
-    fun refreshFleetStatus() {
+    fun refreshFleetStatus(clearErrors: Boolean = false) {
+        if (clearErrors) {
+            agents.forEach { it.clearError() }
+        }
         val reports = agents.map { it.checkHealth() }
         publishReports(reports)
+    }
+
+    fun clearAgentError(agentId: String) {
+        val agent = agents.firstOrNull { it.agentId == agentId } ?: return
+        agent.clearError()
+        publishReports(agents.map { it.checkHealth() })
     }
 
     /**

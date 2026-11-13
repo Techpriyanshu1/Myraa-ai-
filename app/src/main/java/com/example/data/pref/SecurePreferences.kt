@@ -181,8 +181,16 @@ class SecurePreferences(private val context: Context) {
         prefs.edit().putBoolean("privacy_log_command_text", enabled).apply()
     }
 
+    fun isOfflineModeAccepted(): Boolean {
+        return prefs.getBoolean("offline_mode_accepted", false)
+    }
+
+    fun setOfflineModeAccepted(accepted: Boolean) {
+        prefs.edit().putBoolean("offline_mode_accepted", accepted).apply()
+    }
+
     fun hasStoredGeminiKey(): Boolean {
-        return prefs.getString("gemini_api_key_vault", "")?.isNotBlank() == true || getGeminiApiKey().isNotBlank()
+        return getGeminiApiKey().isNotBlank()
     }
 
     fun hasStoredVoiceKey(): Boolean {
