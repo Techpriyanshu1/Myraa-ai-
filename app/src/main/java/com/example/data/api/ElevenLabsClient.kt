@@ -7,18 +7,23 @@ import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.util.Base64
 import android.util.Log
+import com.example.data.pref.SecurePreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 sealed class VoiceTestResult {
@@ -30,8 +35,11 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(18, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
         .build()
+
+    private val securePrefs by lazy { SecurePreferences(context.applicationContext) }
 
     private var localTts: TextToSpeech? = null
     private var isLocalTtsReady = false
@@ -42,6 +50,14 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
         const val DEFAULT_MAHI_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
         const val MODEL_ELEVEN_MULTILINGUAL_V2 = "eleven_multilingual_v2"
         const val MODEL_ELEVEN_FLASH_V2_5 = "eleven_flash_v2_5"
+
+        private const val GEMINI_VOICE_MAHI = "Aoede"
+        private val DEFAULT_GEMINI_TTS_MODELS = listOf(
+            "gemini-2.5-flash-preview-tts",
+            "gemini-2.5-pro-preview-tts"
+        )
+        private val discoveredTtsModelsCache = ConcurrentHashMap<String, List<String>>()
+        private val verifiedTtsModelByKey = ConcurrentHashMap<String, String>()
     }
 
     init {
@@ -70,11 +86,40 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
         val cleanKey = apiKey.trim()
         val cleanVoiceId = voiceId.trim()
 
-        if (cleanKey.isBlank()) {
-            return@withContext VoiceTestResult.Failure("Voice API key is missing. Please enter your ElevenLabs API key.", true)
-        }
         if (cleanVoiceId.isBlank()) {
             return@withContext VoiceTestResult.Failure("Voice ID is empty. Please enter or confirm the Mahi Voice ID.", true)
+        }
+
+        // If no ElevenLabs key is provided, automatically test Gemini Neural Voice using stored Gemini key
+        if (cleanKey.isBlank()) {
+            val geminiKey = try {
+                securePrefs.getGeminiApiKey().trim()
+            } catch (_: Exception) {
+                ""
+            }
+            if (geminiKey.isBlank()) {
+                return@withContext VoiceTestResult.Failure("Voice API key is missing. Please enter your ElevenLabs API key.", true)
+            }
+            val geminiRes = synthesizeWithGeminiTts(
+                text = "Namaste! Main Myraa hoon, aapki Mahi voice Gemini ke saath taiyyar hai.",
+                geminiApiKey = geminiKey
+            )
+            return@withContext when (geminiRes) {
+                is GeminiTtsOutcome.Success -> {
+                    val cacheFile = File(context.cacheDir, "test_gemini_voice_${System.currentTimeMillis()}.${geminiRes.fileExtension}")
+                    cacheFile.writeBytes(geminiRes.audioBytes)
+                    withContext(Dispatchers.Main) {
+                        playAudioFile(cacheFile, {}, {})
+                    }
+                    VoiceTestResult.Success(
+                        message = "Gemini Neural Voice (Mahi • ${geminiRes.modelUsed}) verified without ElevenLabs!",
+                        audioBytes = geminiRes.audioBytes.size
+                    )
+                }
+                is GeminiTtsOutcome.Failure -> {
+                    VoiceTestResult.Failure(geminiRes.reason, isConfigError = false)
+                }
+            }
         }
 
         try {
@@ -147,10 +192,11 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
             return@withContext
         }
 
-        var playedViaElevenLabs = false
+        var playedViaCloudVoice = false
         val cleanKey = apiKey.trim()
         val targetVoiceId = if (voiceId.isNotBlank()) voiceId.trim() else DEFAULT_MAHI_VOICE_ID
 
+        // 1. ElevenLabs Neural Voice (when ElevenLabs subscription key is configured)
         if (cleanKey.isNotBlank()) {
             try {
                 val url = "https://api.elevenlabs.io/v1/text-to-speech/$targetVoiceId"
@@ -200,8 +246,8 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
                     withContext(Dispatchers.Main) {
                         playAudioFile(cacheFile, onPlaybackStarted, onPlaybackCompleted)
                     }
-                    playedViaElevenLabs = true
-                    Log.i("ElevenLabsClient", "Mahi voice synthesized successfully: ${audioBytes.size} bytes")
+                    playedViaCloudVoice = true
+                    Log.i("ElevenLabsClient", "Mahi voice synthesized via ElevenLabs: ${audioBytes.size} bytes")
                 }
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
@@ -211,19 +257,276 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
             }
         }
 
-        if (!playedViaElevenLabs) {
+        // 2. Gemini Neural Voice (uses stored Gemini API key — no ElevenLabs or OpenAI key required!)
+        if (!playedViaCloudVoice) {
+            val geminiKey = try {
+                securePrefs.getGeminiApiKey().trim()
+            } catch (_: Exception) {
+                ""
+            }
+            if (geminiKey.isNotBlank()) {
+                when (val ttsOutcome = synthesizeWithGeminiTts(cleanText, geminiKey)) {
+                    is GeminiTtsOutcome.Success -> {
+                        try {
+                            val cacheFile = File(
+                                context.cacheDir,
+                                "myraa_gemini_speech_${System.currentTimeMillis()}.${ttsOutcome.fileExtension}"
+                            )
+                            FileOutputStream(cacheFile).use { output ->
+                                output.write(ttsOutcome.audioBytes)
+                            }
+                            withContext(Dispatchers.Main) {
+                                playAudioFile(cacheFile, onPlaybackStarted, onPlaybackCompleted)
+                            }
+                            playedViaCloudVoice = true
+                            Log.i(
+                                "ElevenLabsClient",
+                                "Mahi voice synthesized via Gemini (${ttsOutcome.modelUsed}): ${ttsOutcome.audioBytes.size} bytes"
+                            )
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
+                            throw ce
+                        } catch (e: Exception) {
+                            Log.w("ElevenLabsClient", "Failed to write/play Gemini TTS file", e)
+                        }
+                    }
+                    is GeminiTtsOutcome.Failure -> {
+                        Log.w("ElevenLabsClient", "Gemini TTS unavailable (${ttsOutcome.reason}); using fallback if enabled")
+                    }
+                }
+            }
+        }
+
+        // 3. Offline / Native Android TTS Fallback
+        if (!playedViaCloudVoice) {
             if (allowNativeFallback) {
                 Log.i("ElevenLabsClient", "Using native Android TTS fallback")
                 withContext(Dispatchers.Main) {
                     playFallbackTts(cleanText, speechSpeed, onPlaybackStarted, onPlaybackCompleted)
                 }
             } else {
-                Log.w("ElevenLabsClient", "ElevenLabs failed and native fallback is disabled by user.")
+                Log.w("ElevenLabsClient", "Cloud voice unavailable and native fallback is disabled by user.")
                 withContext(Dispatchers.Main) {
                     onPlaybackCompleted()
                 }
             }
         }
+    }
+
+    private sealed class GeminiTtsOutcome {
+        data class Success(
+            val audioBytes: ByteArray,
+            val fileExtension: String,
+            val modelUsed: String
+        ) : GeminiTtsOutcome()
+        data class Failure(val reason: String) : GeminiTtsOutcome()
+    }
+
+    private suspend fun synthesizeWithGeminiTts(
+        text: String,
+        geminiApiKey: String
+    ): GeminiTtsOutcome = withContext(Dispatchers.IO) {
+        val cleanKey = geminiApiKey.trim()
+        if (cleanKey.isBlank()) {
+            return@withContext GeminiTtsOutcome.Failure("Gemini API key is missing.")
+        }
+
+        val queue = ArrayDeque<String>()
+        val attempted = mutableSetOf<String>()
+        verifiedTtsModelByKey[cleanKey]?.let { queue.add(it) }
+        discoveredTtsModelsCache[cleanKey]?.forEach { if (!queue.contains(it)) queue.add(it) }
+        DEFAULT_GEMINI_TTS_MODELS.forEach { if (!queue.contains(it)) queue.add(it) }
+
+        var didDiscovery = !discoveredTtsModelsCache[cleanKey].isNullOrEmpty()
+        var lastError = "Gemini TTS synthesis failed."
+
+        while (queue.isNotEmpty()) {
+            val model = queue.removeFirst()
+            if (!attempted.add(model)) continue
+
+            try {
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
+                val payload = JSONObject().apply {
+                    put("contents", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("role", "user")
+                            put("parts", JSONArray().apply {
+                                put(JSONObject().put("text", text))
+                            })
+                        })
+                    })
+                    put("generationConfig", JSONObject().apply {
+                        put("responseModalities", JSONArray().put("AUDIO"))
+                        put("speechConfig", JSONObject().apply {
+                            put("voiceConfig", JSONObject().apply {
+                                put("prebuiltVoiceConfig", JSONObject().apply {
+                                    put("voiceName", GEMINI_VOICE_MAHI)
+                                })
+                            })
+                        })
+                    })
+                }
+
+                val body = payload.toString().toRequestBody("application/json".toMediaType())
+                val request = Request.Builder()
+                    .url(url)
+                    .addHeader("x-goog-api-key", cleanKey)
+                    .addHeader("Content-Type", "application/json")
+                    .post(body)
+                    .build()
+
+                val (code, respBody) = com.example.core.NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
+                    client.newCall(request).execute().use { resp ->
+                        Pair(resp.code, resp.body?.string() ?: "")
+                    }
+                }
+
+                if (code in 200..299 && respBody.isNotBlank()) {
+                    val extracted = extractAudioFromGeminiResponse(respBody)
+                    if (extracted != null) {
+                        verifiedTtsModelByKey[cleanKey] = model
+                        return@withContext GeminiTtsOutcome.Success(
+                            audioBytes = extracted.first,
+                            fileExtension = extracted.second,
+                            modelUsed = model
+                        )
+                    } else {
+                        lastError = "Gemini TTS ($model) returned no audio bytes."
+                    }
+                } else {
+                    lastError = "HTTP $code"
+                    if (code == 401 || code == 403) {
+                        return@withContext GeminiTtsOutcome.Failure("Gemini API key unauthorized ($code).")
+                    }
+                    if (!didDiscovery && (code == 404 || code == 400)) {
+                        didDiscovery = true
+                        val liveTts = discoverGeminiTtsModels(cleanKey)
+                        liveTts.asReversed().forEach { m ->
+                            if (!attempted.contains(m) && !queue.contains(m)) {
+                                queue.addFirst(m)
+                            }
+                        }
+                    }
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                lastError = e.localizedMessage ?: "Network error"
+                Log.w("ElevenLabsClient", "Gemini TTS error with $model", e)
+            }
+        }
+
+        GeminiTtsOutcome.Failure(lastError)
+    }
+
+    private fun discoverGeminiTtsModels(geminiApiKey: String): List<String> {
+        return try {
+            val request = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models?pageSize=100")
+                .addHeader("x-goog-api-key", geminiApiKey)
+                .get()
+                .build()
+            client.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return emptyList()
+                val raw = resp.body?.string() ?: return emptyList()
+                val modelsArr = JSONObject(raw).optJSONArray("models") ?: return emptyList()
+                val ttsModels = mutableListOf<String>()
+                for (i in 0 until modelsArr.length()) {
+                    val obj = modelsArr.optJSONObject(i) ?: continue
+                    val shortName = obj.optString("name", "").trim().removePrefix("models/")
+                    if (!shortName.startsWith("gemini-", ignoreCase = true)) continue
+                    if (!shortName.contains("tts", ignoreCase = true)) continue
+                    val methods = obj.optJSONArray("supportedGenerationMethods")
+                    var supportsGenerate = false
+                    if (methods != null) {
+                        for (m in 0 until methods.length()) {
+                            if (methods.optString(m) == "generateContent") {
+                                supportsGenerate = true
+                                break
+                            }
+                        }
+                    }
+                    if (supportsGenerate) ttsModels += shortName
+                }
+                val sorted = ttsModels.distinct().sortedBy { if (it.contains("flash", ignoreCase = true)) 0 else 1 }
+                if (sorted.isNotEmpty()) {
+                    discoveredTtsModelsCache[geminiApiKey] = sorted
+                }
+                sorted
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun extractAudioFromGeminiResponse(rawJson: String): Pair<ByteArray, String>? {
+        return try {
+            val root = JSONObject(rawJson)
+            val candidates = root.optJSONArray("candidates") ?: return null
+            if (candidates.length() == 0) return null
+            val parts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts") ?: return null
+            for (i in 0 until parts.length()) {
+                val inlineData = parts.optJSONObject(i)?.optJSONObject("inlineData") ?: continue
+                val b64 = inlineData.optString("data", "")
+                if (b64.isBlank()) continue
+                val mimeType = inlineData.optString("mimeType", "audio/L16;codec=pcm;rate=24000")
+                val rawBytes = Base64.decode(b64, Base64.DEFAULT)
+                if (rawBytes.size < 64) continue
+
+                val isRiffWav = rawBytes.size >= 4 &&
+                    rawBytes[0] == 'R'.code.toByte() &&
+                    rawBytes[1] == 'I'.code.toByte() &&
+                    rawBytes[2] == 'F'.code.toByte() &&
+                    rawBytes[3] == 'F'.code.toByte()
+                if (isRiffWav) {
+                    return Pair(rawBytes, "wav")
+                }
+                if (mimeType.contains("mpeg", ignoreCase = true) || mimeType.contains("mp3", ignoreCase = true)) {
+                    return Pair(rawBytes, "mp3")
+                }
+                val sampleRate = Regex("rate=(\\d+)").find(mimeType)?.groupValues?.get(1)?.toIntOrNull() ?: 24000
+                return Pair(wrapPcm16AsWav(rawBytes, sampleRate, channels = 1), "wav")
+            }
+            null
+        } catch (e: Exception) {
+            Log.w("ElevenLabsClient", "Failed to parse Gemini TTS audio response", e)
+            null
+        }
+    }
+
+    private fun wrapPcm16AsWav(pcmData: ByteArray, sampleRate: Int, channels: Int): ByteArray {
+        val bitsPerSample = 16
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        val blockAlign = channels * bitsPerSample / 8
+        val dataSize = pcmData.size
+        val chunkSize = 36 + dataSize
+
+        val out = ByteArrayOutputStream(44 + dataSize)
+        fun writeIntLE(v: Int) {
+            out.write(v and 0xFF)
+            out.write((v shr 8) and 0xFF)
+            out.write((v shr 16) and 0xFF)
+            out.write((v shr 24) and 0xFF)
+        }
+        fun writeShortLE(v: Int) {
+            out.write(v and 0xFF)
+            out.write((v shr 8) and 0xFF)
+        }
+
+        out.write("RIFF".toByteArray(Charsets.US_ASCII))
+        writeIntLE(chunkSize)
+        out.write("WAVE".toByteArray(Charsets.US_ASCII))
+        out.write("fmt ".toByteArray(Charsets.US_ASCII))
+        writeIntLE(16) // PCM subchunk1 size
+        writeShortLE(1) // PCM audio format
+        writeShortLE(channels)
+        writeIntLE(sampleRate)
+        writeIntLE(byteRate)
+        writeShortLE(blockAlign)
+        writeShortLE(bitsPerSample)
+        out.write("data".toByteArray(Charsets.US_ASCII))
+        writeIntLE(dataSize)
+        out.write(pcmData)
+        return out.toByteArray()
     }
 
     private fun playAudioFile(file: File, onStart: () -> Unit, onEnd: () -> Unit) {
