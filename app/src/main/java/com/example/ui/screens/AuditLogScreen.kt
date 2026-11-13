@@ -1,7 +1,10 @@
 package com.example.ui.screens
 
+import android.content.Intent
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,14 +19,19 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -36,6 +44,9 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -55,13 +66,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.db.AppDatabase
 import com.example.data.db.AutomationLogEntity
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.AuroraPink
-import com.example.ui.theme.CardGlowBorder
 import com.example.ui.theme.CyanPrimary
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.DarkBackground
@@ -72,9 +83,26 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VioletSecondary
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+
+private enum class StatusFilter(val label: String) {
+    ALL("All Activities"),
+    SUCCESS("Successful"),
+    FAILED("Failed"),
+    CANCELLED("Cancelled")
+}
+
+private enum class DateFilter(val label: String) {
+    ALL("All Dates"),
+    TODAY("Today"),
+    LAST_7_DAYS("Last 7 Days"),
+    OLDER("Older")
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -87,21 +115,107 @@ fun AuditLogScreen(
     val db = remember { AppDatabase.getInstance(context) }
     val logs by db.automationLogDao().getAllLogs().collectAsState(initial = emptyList())
 
-    var selectedFilter by remember { mutableStateOf("ALL") }
+    var searchQuery by remember { mutableStateOf("") }
+    var selectedStatus by remember { mutableStateOf(StatusFilter.ALL) }
+    var selectedDate by remember { mutableStateOf(DateFilter.ALL) }
+    var selectedDetailLog by remember { mutableStateOf<AutomationLogEntity?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
 
-    val filterOptions = listOf("ALL", "OPEN_APP", "FLASHLIGHT", "VOLUME", "ACCESSIBILITY", "SETTINGS", "CHAT")
+    val startOfTodayMs = remember {
+        Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+    }
+    val sevenDaysAgoMs = remember(startOfTodayMs) { startOfTodayMs - 6L * 24L * 60L * 60L * 1000L }
 
-    val filteredLogs = remember(logs, selectedFilter) {
-        if (selectedFilter == "ALL") logs
-        else logs.filter { it.actionType.equals(selectedFilter, ignoreCase = true) }
+    val filteredLogs = remember(logs, searchQuery, selectedStatus, selectedDate) {
+        logs.filter { log ->
+            val matchesStatus = when (selectedStatus) {
+                StatusFilter.ALL -> true
+                StatusFilter.SUCCESS -> log.status == "SUCCESS"
+                StatusFilter.FAILED -> log.status == "FAILED"
+                StatusFilter.CANCELLED -> log.status == "CANCELLED" || log.status == "BLOCKED"
+            }
+
+            val matchesDate = when (selectedDate) {
+                DateFilter.ALL -> true
+                DateFilter.TODAY -> log.timestamp >= startOfTodayMs
+                DateFilter.LAST_7_DAYS -> log.timestamp >= sevenDaysAgoMs
+                DateFilter.OLDER -> log.timestamp < sevenDaysAgoMs
+            }
+
+            val q = searchQuery.trim()
+            val matchesSearch = q.isBlank() ||
+                log.voicePrompt.contains(q, ignoreCase = true) ||
+                log.recognizedIntent.contains(q, ignoreCase = true) ||
+                log.actionType.contains(q, ignoreCase = true) ||
+                log.target.contains(q, ignoreCase = true) ||
+                log.agentInvolved.contains(q, ignoreCase = true) ||
+                log.errorInfo.contains(q, ignoreCase = true)
+
+            matchesStatus && matchesDate && matchesSearch
+        }
+    }
+
+    fun exportLocalHistory() {
+        coroutineScope.launch {
+            val exportList = filteredLogs.ifEmpty { logs }
+            val jsonArray = JSONArray()
+            val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+            exportList.forEach { entry ->
+                jsonArray.put(JSONObject().apply {
+                    put("id", entry.id)
+                    put("dateTime", dateFmt.format(Date(entry.timestamp)))
+                    put("commandText", entry.voicePrompt)
+                    put("recognizedIntent", entry.recognizedIntent)
+                    put("requestedOperation", entry.actionType)
+                    put("target", entry.target)
+                    put("agentInvolved", entry.agentInvolved)
+                    put("permissionStatus", entry.permissionStatus)
+                    put("confirmationStatus", entry.confirmationStatus)
+                    put("status", entry.status)
+                    put("executionResult", entry.executionDetails)
+                    put("errorInfo", entry.errorInfo)
+                    put("executionDurationMs", entry.executionDurationMs)
+                })
+            }
+            val payload = JSONObject().apply {
+                put("app", "MYRAA AI")
+                put("exportedAt", dateFmt.format(Date()))
+                put("totalEntries", exportList.size)
+                put("entries", jsonArray)
+            }.toString(2)
+
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, "MYRAA AI Local Activity History")
+                putExtra(Intent.EXTRA_TEXT, payload)
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "Export MYRAA Activity History"))
+        }
+    }
+
+    selectedDetailLog?.let { detail ->
+        ActivityEntryDetailDialog(
+            log = detail,
+            onDelete = {
+                coroutineScope.launch {
+                    db.automationLogDao().deleteLogById(detail.id)
+                    selectedDetailLog = null
+                }
+            },
+            onDismiss = { selectedDetailLog = null }
+        )
     }
 
     if (showClearConfirm) {
         AlertDialog(
             onDismissRequest = { showClearConfirm = false },
-            title = { Text("Clear Audit Logs?") },
-            text = { Text("This will permanently delete all stored local voice interactions and device automation audit traces.") },
+            title = { Text("Clear Activity History?") },
+            text = { Text("This permanently deletes all local Room DB activity records on this device.") },
             confirmButton = {
                 Button(
                     onClick = {
@@ -110,7 +224,8 @@ fun AuditLogScreen(
                             showClearConfirm = false
                         }
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed)
+                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                    modifier = Modifier.testTag("confirm_clear_logs_button")
                 ) {
                     Text("Clear All")
                 }
@@ -136,15 +251,22 @@ fun AuditLogScreen(
                             imageVector = Icons.Default.Security,
                             contentDescription = null,
                             tint = CyanPrimary,
-                            modifier = Modifier.size(22.dp)
+                            modifier = Modifier.size(20.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Transparency Audit Logs",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = TextPrimary
-                        )
+                        Column {
+                            Text(
+                                text = "Local Activity History",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "${filteredLogs.size} of ${logs.size} local records",
+                                fontSize = 11.sp,
+                                color = TextSecondary
+                            )
+                        }
                     }
                 },
                 navigationIcon = {
@@ -162,12 +284,22 @@ fun AuditLogScreen(
                 actions = {
                     if (logs.isNotEmpty()) {
                         IconButton(
+                            onClick = { exportLocalHistory() },
+                            modifier = Modifier.testTag("export_logs_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Download,
+                                contentDescription = "Export History",
+                                tint = CyanPrimary
+                            )
+                        }
+                        IconButton(
                             onClick = { showClearConfirm = true },
                             modifier = Modifier.testTag("clear_logs_button")
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Delete,
-                                contentDescription = "Clear Logs",
+                                contentDescription = "Clear History",
                                 tint = DangerRed
                             )
                         }
@@ -184,29 +316,69 @@ fun AuditLogScreen(
                 .padding(paddingValues)
                 .padding(horizontal = 16.dp)
         ) {
-            // Filter chips
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Search command, intent, agent, or error...", fontSize = 13.sp) },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = CyanPrimary) },
+                singleLine = true,
+                shape = RoundedCornerShape(14.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = CyanPrimary,
+                    unfocusedBorderColor = DarkSurfaceBorder,
+                    focusedTextColor = TextPrimary,
+                    unfocusedTextColor = TextPrimary,
+                    focusedContainerColor = DarkSurfaceElevated,
+                    unfocusedContainerColor = DarkSurfaceElevated
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp)
+                    .testTag("search_logs_input")
+            )
+
+            // Status filter chips
             LazyRow(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 8.dp),
+                    .padding(top = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(filterOptions) { filter ->
+                items(StatusFilter.entries) { filter ->
                     FilterChip(
-                        selected = selectedFilter == filter,
-                        onClick = { selectedFilter = filter },
-                        label = { Text(filter, fontSize = 12.sp) },
+                        selected = selectedStatus == filter,
+                        onClick = { selectedStatus = filter },
+                        label = { Text(filter.label, fontSize = 11.sp) },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = CyanPrimary.copy(alpha = 0.2f),
                             selectedLabelColor = CyanPrimary,
                             containerColor = DarkSurfaceElevated,
                             labelColor = TextSecondary
                         ),
-                        border = FilterChipDefaults.filterChipBorder(
-                            enabled = true,
-                            selected = selectedFilter == filter,
-                            borderColor = if (selectedFilter == filter) CyanPrimary else DarkSurfaceBorder
-                        )
+                        modifier = Modifier.testTag("status_filter_${filter.name}")
+                    )
+                }
+            }
+
+            // Date filter chips
+            LazyRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(DateFilter.entries) { filter ->
+                    FilterChip(
+                        selected = selectedDate == filter,
+                        onClick = { selectedDate = filter },
+                        label = { Text(filter.label, fontSize = 11.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = VioletSecondary.copy(alpha = 0.25f),
+                            selectedLabelColor = VioletSecondary,
+                            containerColor = DarkSurfaceElevated,
+                            labelColor = TextSecondary
+                        ),
+                        modifier = Modifier.testTag("date_filter_${filter.name}")
                     )
                 }
             }
@@ -215,7 +387,7 @@ fun AuditLogScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(bottom = 60.dp),
+                        .padding(bottom = 48.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -227,16 +399,16 @@ fun AuditLogScreen(
                         )
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = "No audit logs recorded yet",
+                            text = if (logs.isEmpty()) "No local activity logs yet" else "No entries match your filters",
                             style = MaterialTheme.typography.titleMedium,
                             color = TextSecondary
                         )
                         Text(
-                            text = "Commands executed by Myraa will appear here with full transparency.",
+                            text = "All activity logs stay strictly on your device in local Room storage.",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary.copy(alpha = 0.7f),
-                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                            modifier = Modifier.padding(horizontal = 32.dp, vertical = 6.dp)
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp)
                         )
                     }
                 }
@@ -246,7 +418,15 @@ fun AuditLogScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(filteredLogs, key = { it.id }) { log ->
-                        AuditLogItemCard(log = log)
+                        AuditLogItemCard(
+                            log = log,
+                            onClickDetails = { selectedDetailLog = log },
+                            onDeleteEntry = {
+                                coroutineScope.launch {
+                                    db.automationLogDao().deleteLogById(log.id)
+                                }
+                            }
+                        )
                     }
                     item {
                         Spacer(modifier = Modifier.height(20.dp))
@@ -258,28 +438,35 @@ fun AuditLogScreen(
 }
 
 @Composable
-private fun AuditLogItemCard(log: AutomationLogEntity) {
+private fun AuditLogItemCard(
+    log: AutomationLogEntity,
+    onClickDetails: () -> Unit,
+    onDeleteEntry: () -> Unit
+) {
     val dateFormat = remember { SimpleDateFormat("hh:mm:ss a • MMM dd", Locale.getDefault()) }
     val formattedTime = remember(log.timestamp) { dateFormat.format(Date(log.timestamp)) }
 
-    val actionColor = when (log.actionType) {
-        "OPEN_APP" -> CyanPrimary
-        "FLASHLIGHT" -> AuroraPink
-        "VOLUME" -> VioletSecondary
-        "ACCESSIBILITY" -> AuroraEmerald
-        "SETTINGS" -> Color(0xFFFFB300)
-        else -> TextSecondary
+    val statusColor = when (log.status) {
+        "SUCCESS" -> AuroraEmerald
+        "CANCELLED", "BLOCKED" -> AuroraPink
+        else -> DangerRed
+    }
+    val statusIcon = when (log.status) {
+        "SUCCESS" -> Icons.Default.CheckCircle
+        "CANCELLED", "BLOCKED" -> Icons.Default.Cancel
+        else -> Icons.Default.Error
     }
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, DarkSurfaceBorder, RoundedCornerShape(14.dp)),
+            .border(1.dp, DarkSurfaceBorder, RoundedCornerShape(14.dp))
+            .clickable { onClickDetails() }
+            .testTag("log_card_${log.id}"),
         colors = CardDefaults.cardColors(containerColor = DarkSurface),
         shape = RoundedCornerShape(14.dp)
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
-            // Header Row: Action badge, timestamp, status icon
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -289,51 +476,54 @@ private fun AuditLogItemCard(log: AutomationLogEntity) {
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
-                            .background(actionColor.copy(alpha = 0.2f))
+                            .background(CyanPrimary.copy(alpha = 0.18f))
                             .padding(horizontal = 8.dp, vertical = 3.dp)
                     ) {
                         Text(
                             text = log.actionType,
-                            color = actionColor,
-                            fontSize = 11.sp,
+                            color = CyanPrimary,
+                            fontSize = 10.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = formattedTime,
-                        fontSize = 11.sp,
-                        color = TextSecondary
-                    )
+                    Text(text = formattedTime, fontSize = 11.sp, color = TextSecondary)
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        imageVector = if (log.status == "SUCCESS") Icons.Default.CheckCircle else Icons.Default.Error,
+                        imageVector = statusIcon,
                         contentDescription = log.status,
-                        tint = if (log.status == "SUCCESS") AuroraEmerald else DangerRed,
-                        modifier = Modifier.size(16.dp)
+                        tint = statusColor,
+                        modifier = Modifier.size(15.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = log.status,
-                        fontSize = 11.sp,
-                        color = if (log.status == "SUCCESS") AuroraEmerald else DangerRed,
+                        fontSize = 10.sp,
+                        color = statusColor,
                         fontWeight = FontWeight.Bold
                     )
+                    IconButton(
+                        onClick = onDeleteEntry,
+                        modifier = Modifier
+                            .size(28.dp)
+                            .testTag("delete_log_${log.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteOutline,
+                            contentDescription = "Delete Entry",
+                            tint = TextSecondary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
-            // User Prompt
             Row(verticalAlignment = Alignment.Top) {
-                Icon(
-                    imageVector = Icons.Default.Mic,
-                    contentDescription = null,
-                    tint = CyanPrimary,
-                    modifier = Modifier.size(16.dp)
-                )
+                Icon(Icons.Default.Mic, contentDescription = null, tint = CyanPrimary, modifier = Modifier.size(15.dp))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = "\"${log.voicePrompt}\"",
@@ -343,33 +533,98 @@ private fun AuditLogItemCard(log: AutomationLogEntity) {
                 )
             }
 
-            // Myraa Spoken Output
-            if (log.aiResponse.isNotBlank()) {
-                Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = "Agent: ${log.agentInvolved} • Intent: ${log.recognizedIntent} • ${log.executionDurationMs}ms",
+                fontSize = 11.sp,
+                color = TextSecondary
+            )
+
+            if (log.errorInfo.isNotBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Myraa: ${log.aiResponse}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = VioletSecondary
+                    text = "Error: ${log.errorInfo}",
+                    fontSize = 11.sp,
+                    color = DangerRed
                 )
             }
+        }
+    }
+}
 
-            // Technical execution details
-            if (log.executionDetails.isNotBlank()) {
-                Spacer(modifier = Modifier.height(6.dp))
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(DarkSurfaceElevated)
-                        .padding(horizontal = 8.dp, vertical = 6.dp)
-                ) {
-                    Text(
-                        text = "Trace: ${log.executionDetails}",
-                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                        color = TextSecondary
-                    )
+@Composable
+private fun ActivityEntryDetailDialog(
+    log: AutomationLogEntity,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd hh:mm:ss a", Locale.getDefault()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = DarkSurface,
+        titleContentColor = TextPrimary,
+        textContentColor = TextSecondary,
+        title = {
+            Text(
+                text = "Activity Entry Details",
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                DetailRow("Date & Time", dateFormat.format(Date(log.timestamp)))
+                DetailRow("User Command", log.voicePrompt)
+                DetailRow("Recognized Intent", log.recognizedIntent)
+                DetailRow("Requested Operation", "${log.actionType} (${log.target})")
+                DetailRow("Agent Involved", log.agentInvolved)
+                DetailRow("Permission Status", log.permissionStatus)
+                DetailRow("Confirmation Status", log.confirmationStatus)
+                DetailRow("Execution Status", log.status)
+                DetailRow("Execution Result", log.executionDetails)
+                if (log.errorInfo.isNotBlank()) {
+                    DetailRow("Error Info", log.errorInfo)
+                }
+                DetailRow("Duration", "${log.executionDurationMs} ms")
+                if (log.aiResponse.isNotBlank()) {
+                    DetailRow("Mahi Response", log.aiResponse)
                 }
             }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary)
+            ) {
+                Text("Close", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            OutlinedButton(
+                onClick = onDelete,
+                border = BorderStroke(1.dp, DangerRed.copy(alpha = 0.6f))
+            ) {
+                Text("Delete Entry", color = DangerRed)
+            }
         }
+    )
+}
+
+@Composable
+private fun DetailRow(label: String, value: String) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(DarkSurfaceElevated)
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        Text(text = label, color = CyanPrimary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        Text(text = value.ifBlank { "—" }, color = TextPrimary, fontSize = 12.sp)
     }
 }

@@ -153,4 +153,40 @@ class SecurePreferences(private val context: Context) {
         setSelectedApps(updated)
         return updated
     }
+
+    // --- PRIVACY & CREDENTIAL MANAGEMENT ---
+    fun isCommandTextLoggingEnabled(): Boolean {
+        return prefs.getBoolean("privacy_log_command_text", true)
+    }
+
+    fun setCommandTextLoggingEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("privacy_log_command_text", enabled).apply()
+    }
+
+    fun hasStoredGeminiKey(): Boolean {
+        return prefs.getString("gemini_api_key_vault", "")?.isNotBlank() == true || getGeminiApiKey().isNotBlank()
+    }
+
+    fun hasStoredVoiceKey(): Boolean {
+        return prefs.getString("voice_api_key_vault", "")?.isNotBlank() == true
+    }
+
+    fun deleteGeminiCredentials() {
+        prefs.edit().remove("gemini_api_key_vault").apply()
+    }
+
+    fun deleteVoiceCredentials() {
+        prefs.edit()
+            .remove("voice_api_key_vault")
+            .putString("selected_voice_id", VOICE_MAHI)
+            .apply()
+    }
+
+    fun deleteAllCredentials() {
+        prefs.edit()
+            .remove("gemini_api_key_vault")
+            .remove("voice_api_key_vault")
+            .putString("selected_voice_id", VOICE_MAHI)
+            .apply()
+    }
 }

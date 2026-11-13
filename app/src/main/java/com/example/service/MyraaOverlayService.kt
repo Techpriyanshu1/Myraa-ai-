@@ -44,6 +44,7 @@ class MyraaOverlayService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == ACTION_STOP_OVERLAY) {
+            isRunning = false
             stopSelf()
             return START_NOT_STICKY
         }
@@ -51,6 +52,7 @@ class MyraaOverlayService : Service() {
         val prefs = SecurePreferences(this)
         if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(this)) {
             showFloatingAurora()
+            isRunning = true
         }
 
         return START_STICKY
@@ -196,6 +198,7 @@ class MyraaOverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isRunning = false
         removeFloatingAurora()
     }
 
@@ -203,6 +206,10 @@ class MyraaOverlayService : Service() {
         const val CHANNEL_ID = "myraa_ai_active_channel"
         const val NOTIFICATION_ID = 1001
         const val ACTION_STOP_OVERLAY = "com.example.service.ACTION_STOP_OVERLAY"
+
+        @Volatile
+        var isRunning: Boolean = false
+            private set
 
         fun start(context: Context) {
             val intent = Intent(context, MyraaOverlayService::class.java)
@@ -214,6 +221,7 @@ class MyraaOverlayService : Service() {
         }
 
         fun stop(context: Context) {
+            isRunning = false
             val intent = Intent(context, MyraaOverlayService::class.java).apply {
                 action = ACTION_STOP_OVERLAY
             }

@@ -314,3 +314,93 @@ fun InstalledAppsDialog(
         }
     }
 }
+
+@Composable
+fun InitializationDiagnosticsDialog(
+    report: com.example.agents.InitializationPreflightReport,
+    onContinueAnyway: (() -> Unit)?,
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.8f),
+            shape = RoundedCornerShape(22.dp),
+            color = DarkBackground,
+            border = BorderStroke(1.dp, DarkSurfaceBorder)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "MYRAA Initialization Checks (11)",
+                        color = TextPrimary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 16.sp
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "Close", tint = TextSecondary)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(report.checks, key = { it.id }) { check ->
+                        val color = when (check.severity) {
+                            com.example.agents.PreflightSeverity.OK -> AuroraEmerald
+                            com.example.agents.PreflightSeverity.WARNING -> AuroraPink
+                            com.example.agents.PreflightSeverity.BLOCKING_ERROR -> DangerRed
+                        }
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = DarkSurface),
+                            border = BorderStroke(1.dp, color.copy(alpha = 0.4f))
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(text = check.title, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(text = check.message, color = color, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        border = BorderStroke(1.dp, DarkSurfaceBorder),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Close", color = TextPrimary)
+                    }
+                    if (report.canStartVoiceSession && onContinueAnyway != null) {
+                        Button(
+                            onClick = onContinueAnyway,
+                            colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Start AI", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

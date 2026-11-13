@@ -9,9 +9,15 @@ data class AutomationLogEntity(
     val id: Long = 0,
     val timestamp: Long = System.currentTimeMillis(),
     val voicePrompt: String,
-    val actionType: String, // e.g. "OPEN_APP", "DEVICE_CONTROL", "ACCESSIBILITY_GESTURE", "SYSTEM_QUERY", "CONVERSATION"
-    val target: String,      // e.g. "YouTube", "Flashlight ON", "Scroll Down", "Volume 80%"
-    val status: String,      // "SUCCESS", "FAILED", "RUNNING", "CANCELLED"
-    val aiResponse: String,  // Text spoken by Myraa
-    val executionDetails: String // Specific technical trace for transparency
+    val recognizedIntent: String = "unknown",
+    val actionType: String,
+    val target: String,
+    val agentInvolved: String = "System Health Agent",
+    val permissionStatus: String = "GRANTED",
+    val confirmationStatus: String = "AUTO_APPROVED",
+    val status: String, // "SUCCESS", "FAILED", "CANCELLED", "BLOCKED"
+    val aiResponse: String,
+    val executionDetails: String,
+    val errorInfo: String = "",
+    val executionDurationMs: Long = 0L
 )

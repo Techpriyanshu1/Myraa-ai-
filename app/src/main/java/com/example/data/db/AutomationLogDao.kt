@@ -14,6 +14,12 @@ interface AutomationLogDao {
     @Query("SELECT * FROM automation_logs ORDER BY timestamp DESC")
     fun getAllLogs(): Flow<List<AutomationLogEntity>>
 
+    @Query("SELECT * FROM automation_logs ORDER BY timestamp DESC")
+    suspend fun getAllLogsOnce(): List<AutomationLogEntity>
+
+    @Query("SELECT COUNT(*) FROM automation_logs")
+    fun getLogCount(): Flow<Int>
+
     @Query("SELECT * FROM automation_logs ORDER BY timestamp DESC LIMIT :limit")
     fun getRecentLogs(limit: Int): Flow<List<AutomationLogEntity>>
 

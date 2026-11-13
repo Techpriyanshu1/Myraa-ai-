@@ -79,15 +79,21 @@ class GeminiClient {
                 .post(body)
                 .build()
 
-            val response = client.newCall(request).execute()
-            if (response.isSuccessful && response.body != null) {
+            val (code, errBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                maxAttempts = 2
+            ) {
+                client.newCall(request).execute().use { response ->
+                    val responseBodyStr = response.body?.string() ?: ""
+                    Triple(response.code, responseBodyStr, response.isSuccessful)
+                }
+            }
+
+            if (isOk) {
                 return@withContext ConnectionTestResult.Success(
                     message = "Connection successful with $targetModel!",
                     modelUsed = targetModel
                 )
             } else {
-                val code = response.code
-                val errBody = response.body?.string() ?: ""
                 val humanMsg = when (code) {
                     400 -> "API key is invalid or unauthorized."
                     403 -> "API key does not have permissions or quota exceeded."
@@ -97,9 +103,11 @@ class GeminiClient {
                 }
                 return@withContext ConnectionTestResult.Failure(humanMsg, code)
             }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
         } catch (e: Exception) {
             Log.e("GeminiClient", "Test connection exception", e)
-            return@withContext ConnectionTestResult.Failure("Network error: ${e.localizedMessage ?: "Failed to reach Google servers"}")
+            return@withContext ConnectionTestResult.Failure("Gemini connection failed: ${e.localizedMessage ?: "Network error"}")
         }
     }
 
@@ -128,7 +136,7 @@ class GeminiClient {
         // 2. Direct screen actions reflex (digital mouse clicks, virtual typing)
         parseScreenActionReflex(normalized, trimmed)?.let { return@withContext it }
 
-        // 3. Structured JSON Intelligence via Gemini with Mahi Persona
+        // 3. Structured JSON Intelligence via Gemini with Mahi Persona + Controlled Exponential Backoff
         val cleanKey = apiKey.trim()
         if (cleanKey.isNotBlank()) {
             val candidateModels = listOf(preferredModel) + AVAILABLE_MODELS.filter { it != preferredModel }
@@ -179,10 +187,15 @@ class GeminiClient {
                         .post(body)
                         .build()
 
-                    val response = client.newCall(request).execute()
+                    val (code, rawBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                        maxAttempts = 2
+                    ) {
+                        client.newCall(request).execute().use { response ->
+                            Triple(response.code, response.body?.string() ?: "", response.isSuccessful)
+                        }
+                    }
 
-                    if (response.isSuccessful && response.body != null) {
-                        val rawBody = response.body!!.string()
+                    if (isOk && rawBody.isNotBlank()) {
                         val root = JSONObject(rawBody)
                         val candidates = root.optJSONArray("candidates")
                         if (candidates != null && candidates.length() > 0) {
@@ -198,9 +211,10 @@ class GeminiClient {
                             }
                         }
                     } else {
-                        val err = response.body?.string() ?: ""
-                        Log.w("GeminiClient", "Gemini $model HTTP ${response.code}: $err")
+                        Log.w("GeminiClient", "Gemini $model HTTP $code: ${parseErrorMessage(rawBody)}")
                     }
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
                 } catch (e: Exception) {
                     Log.w("GeminiClient", "Error querying Gemini $model", e)
                 }

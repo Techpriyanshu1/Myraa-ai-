@@ -173,27 +173,38 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
                     .post(requestBody)
                     .build()
 
-                val response = client.newCall(request).execute()
-                if (response.isSuccessful && response.body != null) {
-                    val cacheFile = File(context.cacheDir, "myraa_speech_${System.currentTimeMillis()}.mp3")
-                    response.body!!.byteStream().use { input ->
-                        FileOutputStream(cacheFile).use { output ->
-                            input.copyTo(output)
+                val audioBytes = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                    maxAttempts = 2
+                ) {
+                    client.newCall(request).execute().use { response ->
+                        if (response.isSuccessful && response.body != null) {
+                            response.body!!.bytes()
+                        } else {
+                            val code = response.code
+                            val err = response.body?.string() ?: ""
+                            if (code == 429 || code >= 500) {
+                                throw java.io.IOException("Transient ElevenLabs HTTP $code")
+                            }
+                            Log.w("ElevenLabsClient", "ElevenLabs failed HTTP $code: $err")
+                            onError?.invoke("ElevenLabs error (HTTP $code)")
+                            null
                         }
                     }
-
-                    if (cacheFile.exists() && cacheFile.length() > 200) {
-                        withContext(Dispatchers.Main) {
-                            playAudioFile(cacheFile, onPlaybackStarted, onPlaybackCompleted)
-                        }
-                        playedViaElevenLabs = true
-                        Log.i("ElevenLabsClient", "Mahi voice synthesized successfully: ${cacheFile.length()} bytes")
-                    }
-                } else {
-                    val err = response.body?.string() ?: ""
-                    Log.w("ElevenLabsClient", "ElevenLabs failed HTTP ${response.code}: $err")
-                    onError?.invoke("ElevenLabs error (HTTP ${response.code})")
                 }
+
+                if (audioBytes != null && audioBytes.size > 200) {
+                    val cacheFile = File(context.cacheDir, "myraa_speech_${System.currentTimeMillis()}.mp3")
+                    FileOutputStream(cacheFile).use { output ->
+                        output.write(audioBytes)
+                    }
+                    withContext(Dispatchers.Main) {
+                        playAudioFile(cacheFile, onPlaybackStarted, onPlaybackCompleted)
+                    }
+                    playedViaElevenLabs = true
+                    Log.i("ElevenLabsClient", "Mahi voice synthesized successfully: ${audioBytes.size} bytes")
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 Log.w("ElevenLabsClient", "Error calling ElevenLabs API for $targetVoiceId", e)
                 onError?.invoke(e.localizedMessage ?: "Voice network error")

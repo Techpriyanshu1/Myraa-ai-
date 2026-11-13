@@ -70,6 +70,7 @@ class DeviceActionExecutor(private val context: Context) {
     }
 
     suspend fun launchSpecificPackage(packageName: String, label: String): ExecutionResult = withContext(Dispatchers.Main) {
+        val startMs = System.currentTimeMillis()
         val result = try {
             val intent = context.packageManager.getLaunchIntentForPackage(packageName)?.apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -102,19 +103,31 @@ class DeviceActionExecutor(private val context: Context) {
             )
         }
 
+        val durationMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
         logPipelineOutcome(
             rawPrompt = "Manual Launch: $label",
+            recognizedIntent = "open_app",
             actionType = result.actionType,
             target = result.target,
+            agentInvolved = "App Launcher Agent",
+            permissionStatus = "GRANTED",
+            confirmationStatus = "USER_SELECTED",
             status = if (result.success) "SUCCESS" else "FAILED",
             spokenResponse = result.spokenFeedback ?: result.details,
-            details = result.details
+            details = result.details,
+            errorInfo = if (result.success) "" else result.details,
+            executionDurationMs = durationMs
         )
         result
     }
 
-    suspend fun executeCommand(command: ParsedCommand): ExecutionResult = withContext(Dispatchers.Main) {
-        val result = when (command.actionType.uppercase()) {
+    suspend fun executeCommand(
+        command: ParsedCommand,
+        confirmationStatus: String = "AUTO_APPROVED"
+    ): ExecutionResult = withContext(Dispatchers.Main) {
+        val startMs = System.currentTimeMillis()
+        val normalizedAction = command.actionType.uppercase()
+        val result = when (normalizedAction) {
             "SCREEN_CLICK" -> performScreenClick(command.target)
             "SCREEN_TYPE" -> performScreenType(if (command.extraData.isNotBlank()) command.extraData else command.target)
             "OPEN_APP" -> openApp(command.target)
@@ -135,36 +148,84 @@ class DeviceActionExecutor(private val context: Context) {
             else -> ExecutionResult(true, "CHAT", command.target, "Conversational response delivered")
         }
 
+        val durationMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
+        val agentInvolved = resolveAgentName(normalizedAction)
+        val permissionStatus = resolvePermissionStatus(normalizedAction)
+
         logPipelineOutcome(
             rawPrompt = command.rawPrompt,
+            recognizedIntent = command.intent,
             actionType = result.actionType,
             target = result.target,
+            agentInvolved = agentInvolved,
+            permissionStatus = permissionStatus,
+            confirmationStatus = confirmationStatus,
             status = if (result.success) "SUCCESS" else "FAILED",
             spokenResponse = result.spokenFeedback ?: command.spokenResponse,
-            details = result.details
+            details = result.details,
+            errorInfo = if (result.success) "" else result.details,
+            executionDurationMs = durationMs
         )
 
         return@withContext result
     }
 
+    private fun resolveAgentName(actionType: String): String = when (actionType) {
+        "OPEN_APP", "LIST_APPS" -> "App Launcher Agent"
+        "OPEN_CAMERA", "OPEN_CALCULATOR", "OPEN_CLOCK", "OPEN_SETTINGS", "SETTINGS", "FLASHLIGHT", "VOLUME" -> "Device Action Agent"
+        "ACCESSIBILITY", "SCREEN_CLICK", "SCREEN_TYPE" -> "Accessibility Agent"
+        "PAUSE_LISTENING", "RESUME_LISTENING", "STOP_AI" -> "Voice Recognition Agent"
+        "SHOW_HISTORY" -> "Activity Logger Agent"
+        else -> "Gemini Intelligence Agent"
+    }
+
+    private fun resolvePermissionStatus(actionType: String): String = when (actionType) {
+        "ACCESSIBILITY", "SCREEN_CLICK", "SCREEN_TYPE" ->
+            if (MyraaAccessibilityService.isRunning()) "GRANTED" else "PERMISSION_REQUIRED"
+        "PAUSE_LISTENING", "RESUME_LISTENING", "STOP_AI" ->
+            if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) "GRANTED" else "PERMISSION_REQUIRED"
+        else -> "NOT_REQUIRED"
+    }
+
     suspend fun logPipelineOutcome(
         rawPrompt: String,
+        recognizedIntent: String = "unknown",
         actionType: String,
         target: String,
+        agentInvolved: String = "System Health Agent",
+        permissionStatus: String = "GRANTED",
+        confirmationStatus: String = "AUTO_APPROVED",
         status: String,
         spokenResponse: String,
-        details: String
+        details: String,
+        errorInfo: String = "",
+        executionDurationMs: Long = 0L
     ) {
+        val promptForLog = if (prefs.isCommandTextLoggingEnabled()) {
+            com.example.core.NetworkRetryHelper.sanitizeSensitiveText(rawPrompt)
+        } else {
+            "[Redacted per privacy setting]"
+        }
+        val safeResponse = com.example.core.NetworkRetryHelper.sanitizeSensitiveText(spokenResponse)
+        val safeDetails = com.example.core.NetworkRetryHelper.sanitizeSensitiveText(details)
+        val safeError = com.example.core.NetworkRetryHelper.sanitizeSensitiveText(errorInfo)
+
         withContext(Dispatchers.IO) {
             try {
                 logDao.insertLog(
                     AutomationLogEntity(
-                        voicePrompt = rawPrompt,
+                        voicePrompt = promptForLog,
+                        recognizedIntent = recognizedIntent,
                         actionType = actionType,
                         target = target,
+                        agentInvolved = agentInvolved,
+                        permissionStatus = permissionStatus,
+                        confirmationStatus = confirmationStatus,
                         status = status,
-                        aiResponse = spokenResponse,
-                        executionDetails = details
+                        aiResponse = safeResponse,
+                        executionDetails = safeDetails,
+                        errorInfo = safeError,
+                        executionDurationMs = executionDurationMs
                     )
                 )
             } catch (e: Exception) {

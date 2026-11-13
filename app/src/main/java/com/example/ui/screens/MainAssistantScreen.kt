@@ -94,6 +94,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.agents.AgentFleetManager
+import com.example.agents.InitializationPreflightReport
+import com.example.agents.InitializationVerifier
 import com.example.automation.ActionSecurityPolicy
 import com.example.automation.DeviceActionExecutor
 import com.example.automation.ExecutionResult
@@ -109,6 +111,7 @@ import com.example.ui.components.ActionConfirmationDialog
 import com.example.ui.components.AgentStatusGrid
 import com.example.ui.components.AnimatedAiOrb
 import com.example.ui.components.AuroraWaveGlow
+import com.example.ui.components.InitializationDiagnosticsDialog
 import com.example.ui.components.InstalledAppsDialog
 import com.example.ui.components.PendingConfirmationAction
 import com.example.ui.components.VideoAvatarPlayer
@@ -143,6 +146,7 @@ fun MainAssistantScreen(
     val elevenLabsClient = remember { ElevenLabsClient(context) }
     val actionExecutor = remember { DeviceActionExecutor(context) }
     val fleetManager = remember { AgentFleetManager.getInstance(context, prefs) }
+    val initVerifier = remember { InitializationVerifier(context, prefs, geminiClient, fleetManager) }
 
     val agentReports by fleetManager.agentReports.collectAsState()
     val fleetOverallStatus by fleetManager.fleetOverallStatus.collectAsState()
@@ -164,6 +168,10 @@ fun MainAssistantScreen(
 
     var isSessionActive by remember { mutableStateOf(false) }
     var isListeningPaused by remember { mutableStateOf(false) }
+    var isStartingSession by remember { mutableStateOf(false) }
+    var isProcessingCommand by remember { mutableStateOf(false) }
+    var lastProcessedCommandKey by remember { mutableStateOf("") }
+    var lastProcessedCommandAt by remember { mutableStateOf(0L) }
     var textInput by remember { mutableStateOf("") }
     var currentSpeechTranscript by remember { mutableStateOf("") }
     var currentAiReply by remember {
@@ -176,6 +184,7 @@ fun MainAssistantScreen(
     var showAppsDialog by remember { mutableStateOf(false) }
     var launchableApps by remember { mutableStateOf<List<LaunchableAppInfo>>(emptyList()) }
     var pendingConfirmation by remember { mutableStateOf<PendingConfirmationAction?>(null) }
+    var preflightReportDialog by remember { mutableStateOf<InitializationPreflightReport?>(null) }
 
     lateinit var voiceManagerRef: VoiceRecognitionManager
 
@@ -211,28 +220,65 @@ fun MainAssistantScreen(
         }
     }
 
-    fun startMyraaSession() {
+    fun activateSessionAfterVerification() {
         isSessionActive = true
         isListeningPaused = false
         coroutineScope.launch {
-            val summary = fleetManager.initializeAndStartEligibleAgents()
-            voiceManagerRef.startContinuousListening()
-            ContinuousVoiceService.start(context)
-            if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(context)) {
-                MyraaOverlayService.start(context)
-            }
+            try {
+                val summary = fleetManager.initializeAndStartEligibleAgents()
+                voiceManagerRef.startContinuousListening()
+                ContinuousVoiceService.start(context)
+                if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(context)) {
+                    MyraaOverlayService.start(context)
+                }
 
-            val greeting = if (summary.unavailableAgents.isEmpty()) {
-                "Namaste! MYRAA AI ke sabhi ${summary.totalAgents} agents active hain. Boliye main aapki kya madad karu?"
-            } else {
-                "MYRAA AI active hai (${summary.activeAgents.size}/${summary.totalAgents} agents). Boliye main aapki kya madad kar sakti hoon?"
+                val greeting = if (summary.unavailableAgents.isEmpty()) {
+                    "Namaste! MYRAA AI ke sabhi ${summary.totalAgents} agents active hain. Boliye main aapki kya madad karu?"
+                } else {
+                    "MYRAA AI active hai (${summary.activeAgents.size}/${summary.totalAgents} agents). Boliye main aapki kya madad kar sakti hoon?"
+                }
+                currentAiReply = if (summary.unavailableAgents.isEmpty()) {
+                    greeting
+                } else {
+                    "$greeting\n(${summary.buildConciseSummary()})"
+                }
+                speakMahiResponse(greeting)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Log.e("MainAssistantScreen", "Unable to start listening", e)
+                isSessionActive = false
+                voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                currentAiReply = "Unable to start listening: ${e.localizedMessage ?: "Service failure"}"
             }
-            currentAiReply = if (summary.unavailableAgents.isEmpty()) {
-                greeting
-            } else {
-                "$greeting\n(${summary.buildConciseSummary()})"
+        }
+    }
+
+    fun startMyraaSession() {
+        if (isStartingSession || isSessionActive) return
+        isStartingSession = true
+        coroutineScope.launch {
+            try {
+                voiceManagerRef.setCompanionState(CompanionState.THINKING)
+                val report = initVerifier.verifyAll(checkLiveConnectivity = true)
+                if (!report.canStartVoiceSession) {
+                    voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                    currentAiReply = report.buildSummaryMessage()
+                    preflightReportDialog = report
+                    return@launch
+                }
+                if (report.warningMessages.isNotEmpty()) {
+                    currentAiReply = report.warningMessages.joinToString("\n")
+                }
+                activateSessionAfterVerification()
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                currentAiReply = "Initialization check failed: ${e.localizedMessage}"
+            } finally {
+                isStartingSession = false
             }
-            speakMahiResponse(greeting)
         }
     }
 
@@ -273,85 +319,115 @@ fun MainAssistantScreen(
     }
 
     // Steps 9–11 of Pipeline: Execute validated action, speak actual result via Mahi, log locally
-    fun executeValidatedAndRespond(parsed: ParsedCommand) {
+    fun executeValidatedAndRespond(
+        parsed: ParsedCommand,
+        confirmationStatus: String = "AUTO_APPROVED"
+    ) {
         coroutineScope.launch {
-            when (parsed.actionType.uppercase()) {
-                "PAUSE_LISTENING" -> {
-                    val res = actionExecutor.executeCommand(parsed)
-                    lastExecutedAction = res.actionType
-                    lastActionSuccess = res.success
-                    currentAiReply = parsed.spokenResponse
-                    pauseListeningSession()
-                    speakMahiResponse(parsed.spokenResponse)
-                    return@launch
+            try {
+                when (parsed.actionType.uppercase()) {
+                    "PAUSE_LISTENING" -> {
+                        val res = actionExecutor.executeCommand(parsed, confirmationStatus)
+                        lastExecutedAction = res.actionType
+                        lastActionSuccess = res.success
+                        currentAiReply = parsed.spokenResponse
+                        pauseListeningSession()
+                        speakMahiResponse(parsed.spokenResponse)
+                        return@launch
+                    }
+                    "RESUME_LISTENING" -> {
+                        val res = actionExecutor.executeCommand(parsed, confirmationStatus)
+                        lastExecutedAction = res.actionType
+                        lastActionSuccess = res.success
+                        currentAiReply = parsed.spokenResponse
+                        resumeListeningSession()
+                        speakMahiResponse(parsed.spokenResponse)
+                        return@launch
+                    }
+                    "STOP_AI" -> {
+                        actionExecutor.executeCommand(parsed, confirmationStatus)
+                        lastExecutedAction = "STOP_AI"
+                        lastActionSuccess = true
+                        currentAiReply = parsed.spokenResponse
+                        voiceManagerRef.setCompanionState(CompanionState.TALKING)
+                        elevenLabsClient.speakText(
+                            text = parsed.spokenResponse,
+                            apiKey = prefs.getVoiceApiKey(),
+                            voiceId = prefs.getSelectedVoiceId(),
+                            modelId = prefs.getSelectedVoiceModel(),
+                            allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
+                            speechSpeed = prefs.getSpeechSpeed(),
+                            onPlaybackCompleted = { stopMyraaSession() }
+                        )
+                        return@launch
+                    }
+                    "LIST_APPS" -> {
+                        val res = actionExecutor.executeCommand(parsed, confirmationStatus)
+                        launchableApps = actionExecutor.getInstalledLaunchableApps()
+                        showAppsDialog = true
+                        lastExecutedAction = res.actionType
+                        lastActionSuccess = res.success
+                        currentAiReply = parsed.spokenResponse
+                        speakMahiResponse(parsed.spokenResponse)
+                        return@launch
+                    }
+                    "SHOW_HISTORY" -> {
+                        actionExecutor.executeCommand(parsed, confirmationStatus)
+                        lastExecutedAction = "SHOW_HISTORY"
+                        lastActionSuccess = true
+                        onNavigateToLogs()
+                        return@launch
+                    }
                 }
-                "RESUME_LISTENING" -> {
-                    val res = actionExecutor.executeCommand(parsed)
-                    lastExecutedAction = res.actionType
-                    lastActionSuccess = res.success
-                    currentAiReply = parsed.spokenResponse
-                    resumeListeningSession()
-                    speakMahiResponse(parsed.spokenResponse)
-                    return@launch
-                }
-                "STOP_AI" -> {
-                    actionExecutor.executeCommand(parsed)
-                    lastExecutedAction = "STOP_AI"
-                    lastActionSuccess = true
-                    currentAiReply = parsed.spokenResponse
-                    voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                    elevenLabsClient.speakText(
-                        text = parsed.spokenResponse,
-                        apiKey = prefs.getVoiceApiKey(),
-                        voiceId = prefs.getSelectedVoiceId(),
-                        modelId = prefs.getSelectedVoiceModel(),
-                        allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
-                        speechSpeed = prefs.getSpeechSpeed(),
-                        onPlaybackCompleted = { stopMyraaSession() }
-                    )
-                    return@launch
-                }
-                "LIST_APPS" -> {
-                    val res = actionExecutor.executeCommand(parsed)
-                    launchableApps = actionExecutor.getInstalledLaunchableApps()
-                    showAppsDialog = true
-                    lastExecutedAction = res.actionType
-                    lastActionSuccess = res.success
-                    currentAiReply = parsed.spokenResponse
-                    speakMahiResponse(parsed.spokenResponse)
-                    return@launch
-                }
-                "SHOW_HISTORY" -> {
-                    actionExecutor.executeCommand(parsed)
-                    lastExecutedAction = "SHOW_HISTORY"
-                    lastActionSuccess = true
-                    onNavigateToLogs()
-                    return@launch
-                }
-            }
 
-            // Standard Device / App / Settings / Accessibility / Chat execution
-            val result: ExecutionResult = actionExecutor.executeCommand(parsed)
-            lastExecutedAction = result.actionType
-            lastActionSuccess = result.success
+                // Standard Device / App / Settings / Accessibility / Chat execution
+                val result: ExecutionResult = actionExecutor.executeCommand(parsed, confirmationStatus)
+                lastExecutedAction = result.actionType
+                lastActionSuccess = result.success
 
-            val finalSpeech = when {
-                !result.success -> result.spokenFeedback ?: result.details
-                !result.spokenFeedback.isNullOrBlank() && parsed.actionType != "CHAT" -> result.spokenFeedback
-                else -> parsed.spokenResponse
-            }
-            currentAiReply = finalSpeech
-            if (!result.success) {
+                val finalSpeech = when {
+                    !result.success -> result.spokenFeedback ?: result.details
+                    !result.spokenFeedback.isNullOrBlank() && parsed.actionType != "CHAT" -> result.spokenFeedback
+                    else -> parsed.spokenResponse
+                }
+                currentAiReply = finalSpeech
+                if (!result.success) {
+                    voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                }
+                speakMahiResponse(finalSpeech)
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Log.e("MainAssistantScreen", "Execution pipeline failed", e)
+                fleetManager.recordAgentError("device_action", e.localizedMessage ?: "Execution error")
+                lastExecutedAction = parsed.actionType
+                lastActionSuccess = false
+                currentAiReply = "Action execute karte waqt error aaya: ${e.localizedMessage}"
                 voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                speakMahiResponse("Maaf kijiye, action execute nahi ho paaya.")
             }
-            speakMahiResponse(finalSpeech)
         }
     }
 
-    // Full 11-Step Intelligent Action Pipeline
+    // Full 11-Step Intelligent Action Pipeline with Duplicate Command & Request Prevention
     fun processCommand(commandText: String) {
         val trimmed = commandText.trim()
         if (trimmed.isBlank()) return
+
+        val now = System.currentTimeMillis()
+        val dedupeKey = trimmed.lowercase()
+        if (isProcessingCommand) {
+            Log.d("MainAssistantScreen", "Ignored overlapping command while pipeline busy")
+            return
+        }
+        if (dedupeKey == lastProcessedCommandKey && (now - lastProcessedCommandAt) < 1800L) {
+            Log.d("MainAssistantScreen", "Ignored duplicate command within 1.8s window")
+            return
+        }
+
+        isProcessingCommand = true
+        lastProcessedCommandKey = dedupeKey
+        lastProcessedCommandAt = now
         currentSpeechTranscript = trimmed
 
         coroutineScope.launch {
@@ -368,11 +444,16 @@ fun MainAssistantScreen(
                     val rejectMsg = validation.rejectionReason ?: "Security policy blocked this action."
                     actionExecutor.logPipelineOutcome(
                         rawPrompt = trimmed,
+                        recognizedIntent = parsed.intent,
                         actionType = "BLOCKED",
                         target = parsed.target,
+                        agentInvolved = "Permission Manager Agent",
+                        permissionStatus = "BLOCKED_BY_POLICY",
+                        confirmationStatus = "REJECTED",
                         status = "BLOCKED",
                         spokenResponse = rejectMsg,
-                        details = rejectMsg
+                        details = rejectMsg,
+                        errorInfo = rejectMsg
                     )
                     lastExecutedAction = "BLOCKED"
                     lastActionSuccess = false
@@ -390,15 +471,32 @@ fun MainAssistantScreen(
                 }
 
                 // Steps 9–11: Execute, speak actual outcome, and persist locally
-                executeValidatedAndRespond(parsed)
+                executeValidatedAndRespond(parsed, "AUTO_APPROVED")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 Log.e("MainAssistantScreen", "Error in 11-step command pipeline", e)
                 fleetManager.recordAgentError("gemini_intelligence", e.localizedMessage ?: "Pipeline error")
+                actionExecutor.logPipelineOutcome(
+                    rawPrompt = trimmed,
+                    recognizedIntent = "error",
+                    actionType = "PIPELINE_ERROR",
+                    target = trimmed,
+                    agentInvolved = "System Health Agent",
+                    status = "FAILED",
+                    spokenResponse = "Error processing command",
+                    details = e.localizedMessage ?: "Unknown exception",
+                    errorInfo = e.localizedMessage ?: "Unknown exception"
+                )
+                lastExecutedAction = "ERROR"
+                lastActionSuccess = false
                 voiceManagerRef.setCompanionState(CompanionState.ERROR)
                 currentAiReply = "Command process karne me error aaya: ${e.localizedMessage}"
                 if (isSessionActive && !isListeningPaused) {
                     voiceManagerRef.resumeListeningAfterSpeech()
                 }
+            } finally {
+                isProcessingCommand = false
             }
         }
     }
@@ -476,15 +574,18 @@ fun MainAssistantScreen(
             pending = pending,
             onConfirm = {
                 pendingConfirmation = null
-                executeValidatedAndRespond(pending.command)
+                executeValidatedAndRespond(pending.command, "USER_CONFIRMED")
             },
             onCancel = {
                 pendingConfirmation = null
                 coroutineScope.launch {
                     actionExecutor.logPipelineOutcome(
                         rawPrompt = pending.command.rawPrompt,
+                        recognizedIntent = pending.command.intent,
                         actionType = pending.command.actionType,
                         target = pending.command.target,
+                        agentInvolved = "Permission Manager Agent",
+                        confirmationStatus = "USER_CANCELLED",
                         status = "CANCELLED",
                         spokenResponse = "Action cancelled by user.",
                         details = "User declined confirmation for ${pending.command.actionType}"
@@ -494,6 +595,20 @@ fun MainAssistantScreen(
                 currentAiReply = cancelMsg
                 speakMahiResponse(cancelMsg)
             }
+        )
+    }
+
+    // 11-Point Initialization Diagnostics Dialog
+    preflightReportDialog?.let { report ->
+        InitializationDiagnosticsDialog(
+            report = report,
+            onContinueAnyway = if (report.canStartVoiceSession) {
+                {
+                    preflightReportDialog = null
+                    activateSessionAfterVerification()
+                }
+            } else null,
+            onDismiss = { preflightReportDialog = null }
         )
     }
 
