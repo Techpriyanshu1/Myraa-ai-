@@ -20,6 +20,7 @@ enum class AllowlistedAction(val actionKey: String, val defaultRisk: ActionRiskL
     FLASHLIGHT("FLASHLIGHT", ActionRiskLevel.LOW),
     VOLUME("VOLUME", ActionRiskLevel.LOW),
     WEB_SEARCH("WEB_SEARCH", ActionRiskLevel.LOW),
+    DIAL("DIAL", ActionRiskLevel.MEDIUM),
     PAUSE_LISTENING("PAUSE_LISTENING", ActionRiskLevel.LOW),
     RESUME_LISTENING("RESUME_LISTENING", ActionRiskLevel.LOW),
     STOP_AI("STOP_AI", ActionRiskLevel.LOW),

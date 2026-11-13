@@ -18,12 +18,27 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
-    <!-- App launch queries -->
+    <!-- App, speech, TTS & Shizuku queries (required on Android 11–15) -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+        </intent>
+        <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="moe.shizuku.manager" />
         <package android:name="com.google.android.youtube" />
         <package android:name="com.whatsapp" />
         <package android:name="com.android.chrome" />
@@ -89,7 +104,12 @@
         <!-- Floating Digital Mouse & AI Keyboard Overlay Service -->
         <service
             android:name=".service.DigitalMouseService"
-            android:exported="false" />
+            android:foregroundServiceType="specialUse"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating accessibility pointer and typing indicator overlay" />
+        </service>
 
         <!-- Real Android MediaProjection Screen Sharing Service -->
         <service

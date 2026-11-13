@@ -226,13 +226,20 @@ private fun AgentReportCard(
     onStart: () -> Unit,
     onStop: () -> Unit
 ) {
-    val statusColor = when (report.status) {
-        AgentStatus.ACTIVE -> AuroraEmerald
-        AgentStatus.READY, AgentStatus.INITIALIZING -> CyanPrimary
-        AgentStatus.PERMISSION_REQUIRED, AgentStatus.ERROR -> DangerRed
-        AgentStatus.NOT_CONFIGURED -> AuroraPink
-        AgentStatus.DISABLED -> TextSecondary
+    val isOptionalStandby = report.isOptional && (
+        report.status == AgentStatus.DISABLED || report.status == AgentStatus.PERMISSION_REQUIRED
+    )
+
+    val statusColor = when {
+        report.status == AgentStatus.ACTIVE -> AuroraEmerald
+        report.status == AgentStatus.READY || report.status == AgentStatus.INITIALIZING -> CyanPrimary
+        isOptionalStandby -> TextSecondary
+        report.status == AgentStatus.PERMISSION_REQUIRED || report.status == AgentStatus.ERROR -> DangerRed
+        report.status == AgentStatus.NOT_CONFIGURED -> AuroraPink
+        else -> TextSecondary
     }
+
+    val statusLabel = if (isOptionalStandby) "OPTIONAL STANDBY" else report.status.name
 
     Card(
         modifier = Modifier
@@ -242,10 +249,10 @@ private fun AgentReportCard(
         colors = CardDefaults.cardColors(containerColor = DarkSurface),
         border = BorderStroke(
             1.dp,
-            when (report.status) {
-                AgentStatus.ACTIVE -> AuroraEmerald.copy(alpha = 0.45f)
-                AgentStatus.READY -> CardGlowBorder
-                AgentStatus.PERMISSION_REQUIRED, AgentStatus.ERROR -> DangerRed.copy(alpha = 0.45f)
+            when {
+                report.status == AgentStatus.ACTIVE -> AuroraEmerald.copy(alpha = 0.45f)
+                report.status == AgentStatus.READY -> CardGlowBorder
+                !isOptionalStandby && (report.status == AgentStatus.PERMISSION_REQUIRED || report.status == AgentStatus.ERROR) -> DangerRed.copy(alpha = 0.45f)
                 else -> DarkSurfaceBorder
             }
         )
@@ -289,7 +296,7 @@ private fun AgentReportCard(
                         .padding(horizontal = 10.dp, vertical = 4.dp)
                 ) {
                     Text(
-                        text = report.status.name,
+                        text = statusLabel,
                         color = statusColor,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.ExtraBold
@@ -302,7 +309,7 @@ private fun AgentReportCard(
             Text(
                 text = report.errorReason ?: report.detailMessage,
                 style = MaterialTheme.typography.bodySmall,
-                color = if (report.errorReason != null) DangerRed.copy(alpha = 0.9f) else TextSecondary,
+                color = if (!isOptionalStandby && report.errorReason != null) DangerRed.copy(alpha = 0.9f) else TextSecondary,
                 lineHeight = 18.sp
             )
 

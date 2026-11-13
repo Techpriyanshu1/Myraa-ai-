@@ -33,17 +33,18 @@ sealed class ConnectionTestResult {
 class GeminiClient {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(7, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(22, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
         .build()
 
     companion object {
         val AVAILABLE_MODELS = listOf(
-            "gemini-flash-latest",
-            "gemini-3.8-flash",
+            "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
-            "gemini-pro-latest",
-            "gemini-3.5-flash"
+            "gemini-2.0-flash",
+            "gemini-2.5-pro",
+            "gemini-flash-latest"
         )
     }
 
@@ -53,7 +54,11 @@ class GeminiClient {
             return@withContext ConnectionTestResult.Failure("API key is empty. Please enter your Gemini API key.")
         }
 
-        val targetModel = if (selectedModel.isNotBlank()) selectedModel.trim() else "gemini-flash-latest"
+        val targetModel = if (selectedModel.isNotBlank() && selectedModel !in listOf("gemini-3.8-flash", "gemini-3.5-flash")) {
+            selectedModel.trim()
+        } else {
+            "gemini-2.5-flash"
+        }
         val url = "https://generativelanguage.googleapis.com/v1beta/models/$targetModel:generateContent"
 
         try {
@@ -67,7 +72,10 @@ class GeminiClient {
                     })
                 })
                 put("generationConfig", JSONObject().apply {
-                    put("maxOutputTokens", 10)
+                    put("maxOutputTokens", 32)
+                    if (targetModel.contains("2.5") || targetModel.contains("latest")) {
+                        put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                    }
                 })
             }
 
@@ -95,9 +103,9 @@ class GeminiClient {
                 )
             } else {
                 val humanMsg = when (code) {
-                    400 -> "API key is invalid or unauthorized."
-                    403 -> "API key does not have permissions or quota exceeded."
-                    404 -> "Model $targetModel is not available or deprecated."
+                    400 -> "API key or request is invalid: ${parseErrorMessage(errBody)}"
+                    403 -> "API key lacks permissions or quota exceeded: ${parseErrorMessage(errBody)}"
+                    404 -> "Model $targetModel is not available: ${parseErrorMessage(errBody)}"
                     429 -> "Rate limit exceeded. Please wait a moment."
                     else -> "Connection failed (HTTP $code): ${parseErrorMessage(errBody)}"
                 }
@@ -114,7 +122,8 @@ class GeminiClient {
     suspend fun interpretCommand(
         prompt: String,
         apiKey: String,
-        preferredModel: String = "gemini-flash-latest"
+        preferredModel: String = "gemini-2.5-flash",
+        screenImageBase64: String? = null
     ): ParsedCommand = withContext(Dispatchers.IO) {
         val trimmed = prompt.trim()
         if (trimmed.isEmpty()) {
@@ -136,10 +145,14 @@ class GeminiClient {
         // 2. Direct screen actions reflex (digital mouse clicks, virtual typing)
         parseScreenActionReflex(normalized, trimmed)?.let { return@withContext it }
 
-        // 3. Structured JSON Intelligence via Gemini with Mahi Persona + Controlled Exponential Backoff
+        // 3. Structured JSON Intelligence via Gemini with Mahi Persona + Multimodal Screen Vision
         val cleanKey = apiKey.trim()
+        var lastApiError: String? = null
         if (cleanKey.isNotBlank()) {
-            val candidateModels = listOf(preferredModel) + AVAILABLE_MODELS.filter { it != preferredModel }
+            val safePreferred = preferredModel.trim().takeIf {
+                it.isNotBlank() && it != "gemini-3.8-flash" && it != "gemini-3.5-flash" && it != "gemini-pro-latest"
+            } ?: "gemini-2.5-flash"
+            val candidateModels = listOf(safePreferred) + AVAILABLE_MODELS.filter { it != safePreferred }
 
             for (model in candidateModels.distinct()) {
                 try {
@@ -149,34 +162,50 @@ class GeminiClient {
                         You are MYRAA AI, a warm, respectful Indian AI smartphone assistant speaking in Mahi's voice.
                         Respond ONLY with a valid single JSON object (no markdown fences, no prose outside JSON) using this exact schema:
                         {
-                          "intent": "open_app|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
-                          "actionType": "OPEN_APP|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
-                          "target": "target app, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), or parameter",
+                          "intent": "open_app|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
+                          "actionType": "OPEN_APP|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
+                          "target": "target app, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, or search query",
                           "extraData": "optional text to type or extra info",
                           "riskLevel": "LOW|MEDIUM|HIGH",
                           "requiresConfirmation": false,
-                          "spokenResponse": "Natural 1-2 sentence reply in Hindi, Hinglish, or English matching user language, max 30 words, no markdown or emojis"
+                          "spokenResponse": "Natural 1-2 sentence reply in Hindi, Hinglish, or English matching user language, max 40 words, no markdown or emojis"
                         }
                         STRICT RULES:
                         - Never output executable code or shell commands.
                         - For OPEN_SETTINGS, NEVER claim the setting was toggled ON/OFF; say the settings screen is being opened so the user can change it.
                         - Set requiresConfirmation=true and riskLevel="HIGH" for irreversible or sensitive actions (like locking screen, deleting, uninstalling, sending/paying).
+                        - If a live screenshot is attached, inspect it carefully to answer screen questions or identify visible UI labels to tap/describe.
                     """.trimIndent()
+
+                    val userParts = JSONArray().apply {
+                        put(JSONObject().put("text", "$systemPrompt\n\nUser command: $trimmed"))
+                        if (!screenImageBase64.isNullOrBlank()) {
+                            put(JSONObject().apply {
+                                put("inlineData", JSONObject().apply {
+                                    put("mimeType", "image/jpeg")
+                                    put("data", screenImageBase64)
+                                })
+                            })
+                        }
+                    }
+
+                    val genConfig = JSONObject().apply {
+                        put("temperature", 0.35)
+                        put("maxOutputTokens", 650)
+                        put("responseMimeType", "application/json")
+                        if (model.contains("2.5") || model.contains("latest")) {
+                            put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                        }
+                    }
 
                     val requestJson = JSONObject().apply {
                         put("contents", JSONArray().apply {
                             put(JSONObject().apply {
                                 put("role", "user")
-                                put("parts", JSONArray().apply {
-                                    put(JSONObject().put("text", "$systemPrompt\n\nUser command: $trimmed"))
-                                })
+                                put("parts", userParts)
                             })
                         })
-                        put("generationConfig", JSONObject().apply {
-                            put("temperature", 0.35)
-                            put("maxOutputTokens", 180)
-                            put("responseMimeType", "application/json")
-                        })
+                        put("generationConfig", genConfig)
                     }
 
                     val body = requestJson.toString().toRequestBody("application/json".toMediaType())
@@ -202,27 +231,44 @@ class GeminiClient {
                             val contentObj = candidates.getJSONObject(0).optJSONObject("content")
                             val parts = contentObj?.optJSONArray("parts")
                             if (parts != null && parts.length() > 0) {
-                                val rawText = parts.getJSONObject(0).optString("text").trim()
+                                val rawText = buildString {
+                                    for (i in 0 until parts.length()) {
+                                        val p = parts.optJSONObject(i) ?: continue
+                                        if (!p.optBoolean("thought", false)) {
+                                            val txt = p.optString("text", "")
+                                            if (txt.isNotBlank()) append(txt)
+                                        }
+                                    }
+                                }.trim()
                                 val structured = extractStructuredJson(rawText, trimmed)
                                 if (structured != null) {
                                     Log.i("GeminiClient", "Structured JSON parsed via $model -> ${structured.actionType}")
                                     return@withContext structured
+                                } else {
+                                    lastApiError = "Gemini ($model) returned empty response."
                                 }
                             }
                         }
                     } else {
-                        Log.w("GeminiClient", "Gemini $model HTTP $code: ${parseErrorMessage(rawBody)}")
+                        val errMsg = parseErrorMessage(rawBody)
+                        lastApiError = "HTTP $code: $errMsg"
+                        Log.w("GeminiClient", "Gemini $model HTTP $code: $errMsg")
+                        if (code == 400 || code == 401 || code == 403) {
+                            // Invalid key/permission won't succeed on fallback models
+                            break
+                        }
                     }
                 } catch (ce: kotlinx.coroutines.CancellationException) {
                     throw ce
                 } catch (e: Exception) {
+                    lastApiError = e.localizedMessage ?: "Network error"
                     Log.w("GeminiClient", "Error querying Gemini $model", e)
                 }
             }
         }
 
-        // 4. Fallback bilingual conversation engine (Mahi persona)
-        return@withContext intelligentConversationalEngine(trimmed)
+        // 4. Fallback bilingual conversation engine (or report real Gemini error if key is present)
+        return@withContext intelligentConversationalEngine(trimmed, hasConfiguredKey = cleanKey.isNotBlank(), apiError = lastApiError)
     }
 
     private fun extractStructuredJson(rawText: String, rawPrompt: String): ParsedCommand? {
@@ -295,6 +341,14 @@ class GeminiClient {
         for (prefix in prefixes) {
             if (lower.startsWith(prefix)) {
                 result = result.substring(prefix.length).trim().trimStart(',', ' ').trim()
+                break
+            }
+        }
+        val politePrefixes = listOf("please ", "can you ", "could you ", "zara ", "bhai ")
+        val lowerAfterWake = result.lowercase()
+        for (polite in politePrefixes) {
+            if (lowerAfterWake.startsWith(polite)) {
+                result = result.substring(polite.length).trim()
                 break
             }
         }
@@ -422,17 +476,19 @@ class GeminiClient {
             )
         }
 
-        // Device Settings Intents (NEVER claim setting changed, only opened settings screen)
+        // Device Settings Intents (works with or without the word "setting", NEVER claims toggled)
         val settingsMap = listOf(
-            listOf("wifi setting", "wi-fi setting", "wifi", "wi-fi") to ("wifi" to "Wi-Fi"),
-            listOf("bluetooth setting", "bluetooth") to ("bluetooth" to "Bluetooth"),
-            listOf("display setting", "brightness setting", "screen setting", "display") to ("display" to "Display"),
-            listOf("sound setting", "audio setting", "ringtone setting", "sound") to ("sound" to "Sound"),
-            listOf("location setting", "gps setting", "location") to ("location" to "Location"),
-            listOf("notification setting", "notifications setting", "notification") to ("notifications" to "Notification"),
-            listOf("app setting", "apps setting", "application setting") to ("apps" to "App")
+            listOf("wifi", "wi-fi") to ("wifi" to "Wi-Fi"),
+            listOf("bluetooth") to ("bluetooth" to "Bluetooth"),
+            listOf("display", "brightness") to ("display" to "Display"),
+            listOf("sound settings", "audio settings", "ringtone") to ("sound" to "Sound"),
+            listOf("location settings", "gps settings") to ("location" to "Location"),
+            listOf("notification settings", "notifications settings") to ("notifications" to "Notification"),
+            listOf("app settings", "apps settings", "application settings") to ("apps" to "App")
         )
-        if (lower.contains("setting")) {
+        if (lower.contains("setting") ||
+            lower in listOf("open wifi", "open wi-fi", "wifi kholo", "open bluetooth", "bluetooth kholo", "wifi on", "bluetooth on")
+        ) {
             for ((keywords, pair) in settingsMap) {
                 if (keywords.any { lower.contains(it) }) {
                     val (targetKey, label) = pair
@@ -445,13 +501,15 @@ class GeminiClient {
                     )
                 }
             }
-            return ParsedCommand(
-                spokenResponse = "Device settings open kar rahi hoon.",
-                actionType = "OPEN_SETTINGS",
-                target = "settings",
-                rawPrompt = rawPrompt,
-                intent = "open_settings"
-            )
+            if (lower.contains("setting")) {
+                return ParsedCommand(
+                    spokenResponse = "Device settings open kar rahi hoon.",
+                    actionType = "OPEN_SETTINGS",
+                    target = "settings",
+                    rawPrompt = rawPrompt,
+                    intent = "open_settings"
+                )
+            }
         }
 
         // Built-in Device Utilities: Camera, Calculator, Clock
@@ -556,8 +614,39 @@ class GeminiClient {
             )
         }
 
+        // Direct Dialer Intent ("dial 9876543210", "call 100")
+        val dialMatch = Regex("^(dial|call)\\s+([+0-9\\s-]{3,20})$", RegexOption.IGNORE_CASE).find(normalized)
+        if (dialMatch != null) {
+            val number = dialMatch.groupValues[2].trim()
+            return ParsedCommand(
+                spokenResponse = "Dialer me $number open kar rahi hoon.",
+                actionType = "DIAL",
+                target = number,
+                rawPrompt = rawPrompt,
+                intent = "dial",
+                riskLevel = "MEDIUM"
+            )
+        }
+
+        // Direct Web Search Intent ("search <query>", "google <query>")
+        val searchPrefixes = listOf("search for ", "search ", "google search ", "google ")
+        for (prefix in searchPrefixes) {
+            if (lower.startsWith(prefix)) {
+                val query = normalized.substring(prefix.length).trim()
+                if (query.isNotBlank()) {
+                    return ParsedCommand(
+                        spokenResponse = "\"$query\" search kar rahi hoon.",
+                        actionType = "WEB_SEARCH",
+                        target = query,
+                        rawPrompt = rawPrompt,
+                        intent = "web_search"
+                    )
+                }
+            }
+        }
+
         // Generic App Launch ("open youtube", "launch spotify", "whatsapp kholo")
-        val openPrefixes = listOf("open app ", "open ", "launch ", "start ", "chalao ", "kholo ")
+        val openPrefixes = listOf("open app ", "open the ", "open ", "launch ", "start ", "chalao ", "kholo ")
         for (prefix in openPrefixes) {
             if (lower.startsWith(prefix)) {
                 val app = normalized.substring(prefix.length).trim()
@@ -591,42 +680,50 @@ class GeminiClient {
         return null
     }
 
-    private fun intelligentConversationalEngine(text: String): ParsedCommand {
+    private fun intelligentConversationalEngine(
+        text: String,
+        hasConfiguredKey: Boolean = false,
+        apiError: String? = null
+    ): ParsedCommand {
         val lower = text.lowercase().trim()
 
-        val answer = when {
-            lower.contains("who are you") || lower.contains("tum kaun ho") || lower.contains("aap kaun ho") ||
-                lower.contains("your name") || lower.contains("tera naam") || lower.contains("apna naam batao") ->
-                "Namaste! Main Myraa hoon, aapki personal AI assistant. Main Hindi, Hinglish aur English me baat aur smartphone automation me madad karti hoon."
+        val answer = if (hasConfiguredKey && !apiError.isNullOrBlank()) {
+            "Gemini API se connect nahi ho paaya ($apiError). Kripya Settings me Gemini key, internet ya model verify karein."
+        } else {
+            when {
+                lower.contains("who are you") || lower.contains("tum kaun ho") || lower.contains("aap kaun ho") ||
+                    lower.contains("your name") || lower.contains("tera naam") || lower.contains("apna naam batao") ->
+                    "Namaste! Main Myraa hoon, aapki personal AI assistant. Main Hindi, Hinglish aur English me baat aur smartphone automation me madad karti hoon."
 
-            lower.contains("how are you") || lower.contains("kaise ho") || lower.contains("kya haal") ||
-                lower.contains("kaisi ho") || lower.contains("kaisa chal raha") ->
-                "Main bilkul theek hoon! Aap bataiye, aaj main aapki kya madad kar sakti hoon?"
+                lower.contains("how are you") || lower.contains("kaise ho") || lower.contains("kya haal") ||
+                    lower.contains("kaisi ho") || lower.contains("kaisa chal raha") ->
+                    "Main bilkul theek hoon! Aap bataiye, aaj main aapki kya madad kar sakti hoon?"
 
-            lower.contains("kya kar sakti ho") || lower.contains("what can you do") || lower.contains("features") || lower.contains("madad") ->
-                "Main apps launch kar sakti hoon, device settings, camera, calculator aur clock open kar sakti hoon, aur Gemini AI ke saath natural baat kar sakti hoon."
+                lower.contains("kya kar sakti ho") || lower.contains("what can you do") || lower.contains("features") || lower.contains("madad") ->
+                    "Main apps launch kar sakti hoon, device settings, camera, calculator aur clock open kar sakti hoon, aur Gemini AI ke saath natural baat kar sakti hoon."
 
-            lower.contains("namaste") || lower.contains("hello") || lower.contains("hi") || lower.contains("hey") || lower.contains("suno") ->
-                "Namaste! Main active hoon aur sun rahi hoon. Boliye kya kaam hai?"
+                lower.contains("namaste") || lower.contains("hello") || lower.contains("hi") || lower.contains("hey") || lower.contains("suno") ->
+                    "Namaste! Main active hoon aur sun rahi hoon. Boliye kya kaam hai?"
 
-            lower.contains("thank") || lower.contains("dhanyawad") || lower.contains("shukriya") ->
-                "Aapka swagat hai! Hamesha madad ke liye taiyyar hoon."
+                lower.contains("thank") || lower.contains("dhanyawad") || lower.contains("shukriya") ->
+                    "Aapka swagat hai! Hamesha madad ke liye taiyyar hoon."
 
-            lower.contains("time") || lower.contains("samay") || lower.contains("kitne baje") -> {
-                val timeStr = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
-                "Abhi samay ho raha hai $timeStr."
-            }
+                lower.contains("time") || lower.contains("samay") || lower.contains("kitne baje") -> {
+                    val timeStr = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
+                    "Abhi samay ho raha hai $timeStr."
+                }
 
-            lower.contains("date") || lower.contains("today") || lower.contains("tareekh") -> {
-                val dateStr = SimpleDateFormat("EEEE, MMMM dd, yyyy", Locale.getDefault()).format(Date())
-                "Aaj $dateStr hai."
-            }
+                lower.contains("date") || lower.contains("today") || lower.contains("tareekh") -> {
+                    val dateStr = SimpleDateFormat("EEEE, MMMM dd, yyyy", Locale.getDefault()).format(Date())
+                    "Aaj $dateStr hai."
+                }
 
-            else -> {
-                if (text.any { it in '\u0900'..'\u097F' } || listOf("kya", "hai", "ho", "kaise", "mera", "meri", "aap", "tum", "karo", "nahi", "haan").any { lower.contains(it) }) {
-                    "Main aapki baat samajh gayi. Gemini cloud reasoning ke liye API Settings me valid Gemini key configure karein ya mujhe koi app ya setting open karne ko kahein."
-                } else {
-                    "I heard \"$text\". Configure your Gemini API key in Settings for full conversational answers, or ask me to open an app or device setting."
+                else -> {
+                    if (text.any { it in '\u0900'..'\u097F' } || listOf("kya", "hai", "ho", "kaise", "mera", "meri", "aap", "tum", "karo", "nahi", "haan").any { lower.contains(it) }) {
+                        "Main aapki baat samajh gayi. Gemini cloud reasoning ke liye API Settings me valid Gemini key configure karein ya mujhe koi app ya setting open karne ko kahein."
+                    } else {
+                        "I heard \"$text\". Configure your Gemini API key in Settings for full conversational answers, or ask me to open an app or device setting."
+                    }
                 }
             }
         }

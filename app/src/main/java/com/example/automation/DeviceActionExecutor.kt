@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraAccessException
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
@@ -139,6 +140,7 @@ class DeviceActionExecutor(private val context: Context) {
             "VOLUME" -> adjustVolume(command.target)
             "ACCESSIBILITY" -> performAccessibilityAction(command.target)
             "WEB_SEARCH" -> performWebSearch(command.target)
+            "DIAL" -> dialPhoneNumber(command.target)
             "PAUSE_LISTENING" -> ExecutionResult(true, "PAUSE_LISTENING", "voice", "Voice listening paused by user")
             "RESUME_LISTENING" -> ExecutionResult(true, "RESUME_LISTENING", "voice", "Voice listening resumed by user")
             "STOP_AI" -> ExecutionResult(true, "STOP_AI", "session", "MYRAA AI session stopped by user")
@@ -172,7 +174,7 @@ class DeviceActionExecutor(private val context: Context) {
 
     private fun resolveAgentName(actionType: String): String = when (actionType) {
         "OPEN_APP", "LIST_APPS" -> "App Launcher Agent"
-        "OPEN_CAMERA", "OPEN_CALCULATOR", "OPEN_CLOCK", "OPEN_SETTINGS", "SETTINGS", "FLASHLIGHT", "VOLUME" -> "Device Action Agent"
+        "OPEN_CAMERA", "OPEN_CALCULATOR", "OPEN_CLOCK", "OPEN_SETTINGS", "SETTINGS", "FLASHLIGHT", "VOLUME", "DIAL", "WEB_SEARCH" -> "Device Action Agent"
         "ACCESSIBILITY", "SCREEN_CLICK", "SCREEN_TYPE" -> "Accessibility Agent"
         "PAUSE_LISTENING", "RESUME_LISTENING", "STOP_AI" -> "Voice Recognition Agent"
         "SHOW_HISTORY" -> "Activity Logger Agent"
@@ -252,6 +254,25 @@ class DeviceActionExecutor(private val context: Context) {
         if (query == "clock" || query == "alarm") return openClock()
         if (query == "settings") return openSystemSettings("settings")
 
+        // 0. Direct package-name launch if Gemini passed a qualified package name
+        if (query.contains('.')) {
+            val pkgIntent = pm.getLaunchIntentForPackage(query)?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (pkgIntent != null) {
+                try {
+                    context.startActivity(pkgIntent)
+                    return ExecutionResult(
+                        success = true,
+                        actionType = "OPEN_APP",
+                        target = query,
+                        details = "Launched package $query",
+                        spokenFeedback = "$appName open kar diya hai."
+                    )
+                } catch (_: Exception) {}
+            }
+        }
+
         // 1. Check user-selected preferred apps first
         val installed = getInstalledLaunchableApps()
         val userSelectedMatch = installed.firstOrNull {
@@ -262,14 +283,16 @@ class DeviceActionExecutor(private val context: Context) {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             if (intent != null) {
-                context.startActivity(intent)
-                return ExecutionResult(
-                    success = true,
-                    actionType = "OPEN_APP",
-                    target = userSelectedMatch.label,
-                    details = "Launched user-selected app ${userSelectedMatch.label} (${userSelectedMatch.packageName})",
-                    spokenFeedback = "${userSelectedMatch.label} open kar diya hai."
-                )
+                try {
+                    context.startActivity(intent)
+                    return ExecutionResult(
+                        success = true,
+                        actionType = "OPEN_APP",
+                        target = userSelectedMatch.label,
+                        details = "Launched user-selected app ${userSelectedMatch.label} (${userSelectedMatch.packageName})",
+                        spokenFeedback = "${userSelectedMatch.label} open kar diya hai."
+                    )
+                } catch (_: Exception) {}
             }
         }
 
@@ -282,20 +305,44 @@ class DeviceActionExecutor(private val context: Context) {
             "maps" to "com.google.android.apps.maps",
             "google maps" to "com.google.android.apps.maps",
             "spotify" to "com.spotify.music",
-            "gmail" to "com.google.android.gm"
+            "gmail" to "com.google.android.gm",
+            "instagram" to "com.instagram.android",
+            "facebook" to "com.facebook.katana",
+            "telegram" to "org.telegram.messenger",
+            "paytm" to "net.one97.paytm",
+            "phonepe" to "com.phonepe.app",
+            "gpay" to "com.google.android.apps.nbu.paisa.user",
+            "google pay" to "com.google.android.apps.nbu.paisa.user",
+            "play store" to "com.android.vending",
+            "google play" to "com.android.vending",
+            "amazon" to "in.amazon.mShop.android.shopping",
+            "flipkart" to "com.flipkart.android",
+            "snapchat" to "com.snapchat.android",
+            "twitter" to "com.twitter.android",
+            "x" to "com.twitter.android",
+            "photos" to "com.google.android.apps.photos",
+            "gallery" to "com.google.android.apps.photos",
+            "messages" to "com.google.android.apps.messaging",
+            "phone" to "com.google.android.dialer",
+            "dialer" to "com.google.android.dialer",
+            "contacts" to "com.google.android.contacts",
+            "calendar" to "com.google.android.calendar",
+            "files" to "com.google.android.apps.nbu.files"
         )
         directPackages[query]?.let { pkg ->
             val launchIntent = pm.getLaunchIntentForPackage(pkg)
             if (launchIntent != null) {
-                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                context.startActivity(launchIntent)
-                return ExecutionResult(
-                    success = true,
-                    actionType = "OPEN_APP",
-                    target = appName,
-                    details = "Launched official app intent for $pkg",
-                    spokenFeedback = "$appName open kar diya hai."
-                )
+                try {
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    context.startActivity(launchIntent)
+                    return ExecutionResult(
+                        success = true,
+                        actionType = "OPEN_APP",
+                        target = appName,
+                        details = "Launched official app intent for $pkg",
+                        spokenFeedback = "$appName open kar diya hai."
+                    )
+                } catch (_: Exception) {}
             }
         }
 
@@ -308,14 +355,38 @@ class DeviceActionExecutor(private val context: Context) {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             if (launchIntent != null) {
-                context.startActivity(launchIntent)
-                return ExecutionResult(
-                    success = true,
-                    actionType = "OPEN_APP",
-                    target = exactOrPartialMatch.label,
-                    details = "Launched installed app ${exactOrPartialMatch.label} (${exactOrPartialMatch.packageName})",
-                    spokenFeedback = "${exactOrPartialMatch.label} open kar diya hai."
-                )
+                try {
+                    context.startActivity(launchIntent)
+                    return ExecutionResult(
+                        success = true,
+                        actionType = "OPEN_APP",
+                        target = exactOrPartialMatch.label,
+                        details = "Launched installed app ${exactOrPartialMatch.label} (${exactOrPartialMatch.packageName})",
+                        spokenFeedback = "${exactOrPartialMatch.label} open kar diya hai."
+                    )
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Fallback category intents for generic system targets (dialer/phone/browser)
+        if (query in listOf("phone", "dialer", "call")) {
+            return try {
+                val dialIntent = Intent(Intent.ACTION_DIAL).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                context.startActivity(dialIntent)
+                ExecutionResult(true, "OPEN_APP", "Dialer", "Opened Phone Dialer", "Phone dialer open kar diya hai.")
+            } catch (_: Exception) {
+                ExecutionResult(false, "OPEN_APP", appName, "Dialer not available", "Phone dialer available nahi hai.")
+            }
+        }
+        if (query in listOf("browser", "internet", "web")) {
+            return try {
+                val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(browserIntent)
+                ExecutionResult(true, "OPEN_APP", "Browser", "Opened default web browser", "Browser open kar diya hai.")
+            } catch (_: Exception) {
+                ExecutionResult(false, "OPEN_APP", appName, "Web browser not available", "Browser available nahi hai.")
             }
         }
 
@@ -435,14 +506,26 @@ class DeviceActionExecutor(private val context: Context) {
                     putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
                 }
             }
-            context.startActivity(intent)
-            ExecutionResult(
-                success = true,
-                actionType = "OPEN_SETTINGS",
-                target = label,
-                details = "Opened $label screen ($action). Setting state was NOT modified automatically.",
-                spokenFeedback = "$label screen open kar di hai. Aap yahan se apni pasand ke mutabik badal sakte hain."
-            )
+            if (intent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(intent)
+                ExecutionResult(
+                    success = true,
+                    actionType = "OPEN_SETTINGS",
+                    target = label,
+                    details = "Opened $label screen ($action). Setting state was NOT modified automatically.",
+                    spokenFeedback = "$label screen open kar di hai. Aap yahan se apni pasand ke mutabik badal sakte hain."
+                )
+            } else {
+                val fallback = Intent(Settings.ACTION_SETTINGS).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                context.startActivity(fallback)
+                ExecutionResult(
+                    success = true,
+                    actionType = "OPEN_SETTINGS",
+                    target = "System Settings",
+                    details = "Opened general System Settings screen (specific action $action unsupported on this ROM).",
+                    spokenFeedback = "System settings screen open kar di hai."
+                )
+            }
         } catch (e: Exception) {
             ExecutionResult(
                 success = false,
@@ -460,9 +543,16 @@ class DeviceActionExecutor(private val context: Context) {
 
         val turnOn = target.contains("on", ignoreCase = true) || target.contains("start", ignoreCase = true) || target.contains("enable", ignoreCase = true)
         return try {
-            val cameraId = cameraManager.cameraIdList.firstOrNull()
-                ?: return ExecutionResult(false, "FLASHLIGHT", target, "No camera flash unit found", "Is device me flash light nahi mili.")
-            cameraManager.setTorchMode(cameraId, turnOn)
+            val flashCameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                val isBack = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                hasFlash && isBack
+            } ?: cameraManager.cameraIdList.firstOrNull { id ->
+                cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            } ?: return ExecutionResult(false, "FLASHLIGHT", target, "No camera flash unit found", "Is device me flash light nahi mili.")
+
+            cameraManager.setTorchMode(flashCameraId, turnOn)
             val stateLabel = if (turnOn) "ON" else "OFF"
             ExecutionResult(
                 success = true,
@@ -471,7 +561,7 @@ class DeviceActionExecutor(private val context: Context) {
                 details = "Flashlight torch set to $stateLabel",
                 spokenFeedback = if (turnOn) "Flashlight on kar di hai." else "Flashlight band kar di hai."
             )
-        } catch (e: CameraAccessException) {
+        } catch (e: Exception) {
             ExecutionResult(false, "FLASHLIGHT", target, "Torch control error: ${e.message}", "Flashlight control nahi ho paaya.")
         }
     }
@@ -542,12 +632,20 @@ class DeviceActionExecutor(private val context: Context) {
 
     private fun performWebSearch(query: String): ExecutionResult {
         return try {
-            val intent = Intent(Intent.ACTION_WEB_SEARCH).apply {
+            val searchIntent = Intent(Intent.ACTION_WEB_SEARCH).apply {
                 putExtra(SearchManager.QUERY, query)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(intent)
-            ExecutionResult(true, "WEB_SEARCH", query, "Dispatched web search query for '$query'", "'$query' search kar rahi hoon.")
+            if (searchIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(searchIntent)
+                ExecutionResult(true, "WEB_SEARCH", query, "Dispatched web search query for '$query'", "'$query' search kar rahi hoon.")
+            } else {
+                val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=${Uri.encode(query)}")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(browserIntent)
+                ExecutionResult(true, "WEB_SEARCH", query, "Opened browser search for '$query'", "'$query' browser me search kar rahi hoon.")
+            }
         } catch (e: Exception) {
             try {
                 val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=${Uri.encode(query)}")).apply {
@@ -558,6 +656,26 @@ class DeviceActionExecutor(private val context: Context) {
             } catch (e2: Exception) {
                 ExecutionResult(false, "WEB_SEARCH", query, "Web search failed: ${e2.message}", "Web search open nahi ho paaya.")
             }
+        }
+    }
+
+    private fun dialPhoneNumber(target: String): ExecutionResult {
+        val cleanNumber = target.replace(Regex("[^+0-9*#]"), "").trim()
+        if (cleanNumber.isBlank()) {
+            return ExecutionResult(false, "DIAL", target, "No valid phone number provided.", "Kripya sahi phone number batayein.")
+        }
+        return try {
+            val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$cleanNumber")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (dialIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(dialIntent)
+                ExecutionResult(true, "DIAL", cleanNumber, "Opened system dialer for $cleanNumber", "Dialer me $cleanNumber open kar diya hai.")
+            } else {
+                ExecutionResult(false, "DIAL", cleanNumber, "No phone dialer app available on device.", "Is device par dialer app available nahi hai.")
+            }
+        } catch (e: Exception) {
+            ExecutionResult(false, "DIAL", cleanNumber, "Failed to open dialer: ${e.message}", "Dialer open nahi ho paaya.")
         }
     }
 

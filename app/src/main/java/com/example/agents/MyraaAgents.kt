@@ -414,12 +414,12 @@ class ShizukuIntegrationAgent(
             !status.isInstalled -> AgentValidationResult(
                 isValid = false,
                 statusOnFailure = AgentStatus.DISABLED,
-                reason = "Optional: Shizuku app is not installed on this device."
+                reason = "Optional add-on standby (Shizuku app not installed; standard automation works normally)."
             )
             !status.isRunning -> AgentValidationResult(
                 isValid = false,
                 statusOnFailure = AgentStatus.DISABLED,
-                reason = "Optional: Shizuku service is not running."
+                reason = "Optional add-on standby (Shizuku service is not running)."
             )
             else -> AgentValidationResult(true)
         }
@@ -433,7 +433,7 @@ class ShizukuIntegrationAgent(
             AgentValidationResult(
                 isValid = false,
                 statusOnFailure = AgentStatus.PERMISSION_REQUIRED,
-                reason = "Optional: Authorize MYRAA AI inside Shizuku Manager."
+                reason = "Optional add-on standby: authorize MYRAA AI inside Shizuku app if rootless ADB is desired."
             )
         }
     }

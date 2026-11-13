@@ -293,4 +293,27 @@ class MyraaCoreVerificationTest {
         assertEquals(com.example.voice.CompanionState.IDLE, voiceManager.companionState.value)
         voiceManager.destroy()
     }
+
+    @Test
+    fun `GeminiClient uses real models and parses dial, search, and polite intents`() = runTest {
+        assertFalse(GeminiClient.AVAILABLE_MODELS.contains("gemini-3.8-flash"))
+        assertTrue(GeminiClient.AVAILABLE_MODELS.contains("gemini-2.5-flash"))
+
+        prefs.setSelectedGeminiModel("gemini-3.8-flash")
+        assertEquals("gemini-2.5-flash", prefs.getSelectedGeminiModel())
+
+        val gemini = GeminiClient()
+        val dialCmd = gemini.interpretCommand("Hey Myraa, dial 9876543210", "")
+        assertEquals("DIAL", dialCmd.actionType)
+        assertEquals("9876543210", dialCmd.target)
+        assertTrue(ActionSecurityPolicy.validate(dialCmd).allowed)
+
+        val searchCmd = gemini.interpretCommand("search android 15 features", "")
+        assertEquals("WEB_SEARCH", searchCmd.actionType)
+        assertEquals("android 15 features", searchCmd.target)
+
+        val wifiDirect = gemini.interpretCommand("please open wifi", "")
+        assertEquals("OPEN_SETTINGS", wifiDirect.actionType)
+        assertEquals("wifi", wifiDirect.target)
+    }
 }

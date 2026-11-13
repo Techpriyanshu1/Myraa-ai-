@@ -156,6 +156,7 @@ fun MainAssistantScreen(
     }
 
     val isRealScreenSharing by RealScreenCaptureService.isSharingActive.collectAsState()
+    val screenShareError by RealScreenCaptureService.lastError.collectAsState()
     val servicePaused by ContinuousVoiceService.isPaused.collectAsState()
 
     val screenShareLauncher = rememberLauncherForActivityResult(
@@ -232,15 +233,17 @@ fun MainAssistantScreen(
                     MyraaOverlayService.start(context)
                 }
 
-                val greeting = if (summary.unavailableAgents.isEmpty()) {
-                    "Namaste! MYRAA AI ke sabhi ${summary.totalAgents} agents active hain. Boliye main aapki kya madad karu?"
+                val mandatoryUnavailable = summary.unavailableAgents.filter { !it.isOptional }
+                val greeting = if (mandatoryUnavailable.isEmpty()) {
+                    "Namaste! MYRAA AI active hai (${summary.activeAgents.size}/${summary.totalAgents} agents ready). Boliye main aapki kya madad karu?"
                 } else {
                     "MYRAA AI active hai (${summary.activeAgents.size}/${summary.totalAgents} agents). Boliye main aapki kya madad kar sakti hoon?"
                 }
-                currentAiReply = if (summary.unavailableAgents.isEmpty()) {
+                currentAiReply = if (mandatoryUnavailable.isEmpty()) {
                     greeting
                 } else {
-                    "$greeting\n(${summary.buildConciseSummary()})"
+                    val coreReasons = mandatoryUnavailable.joinToString("; ") { "${it.name}: ${it.errorReason ?: it.detailMessage}" }
+                    "$greeting\n($coreReasons)"
                 }
                 speakMahiResponse(greeting)
             } catch (ce: kotlinx.coroutines.CancellationException) {
@@ -432,11 +435,16 @@ fun MainAssistantScreen(
 
         coroutineScope.launch {
             try {
-                // Step 3 & 4: Gemini Structured JSON Parsing
+                // Step 3 & 4: Gemini Structured JSON Parsing (+ Live Screen Vision when sharing)
                 voiceManagerRef.setCompanionState(CompanionState.THINKING)
                 val apiKey = prefs.getGeminiApiKey()
                 val model = prefs.getSelectedGeminiModel()
-                val parsed = geminiClient.interpretCommand(trimmed, apiKey, model)
+                val screenSnapshot = if (isRealScreenSharing) {
+                    RealScreenCaptureService.latestScreenFrameBase64.value
+                } else {
+                    null
+                }
+                val parsed = geminiClient.interpretCommand(trimmed, apiKey, model, screenSnapshot)
 
                 // Step 5, 6 & 7: Allowlist & Risk Validation
                 val validation = ActionSecurityPolicy.validate(parsed)
@@ -559,12 +567,17 @@ fun MainAssistantScreen(
         }
     }
 
+    LaunchedEffect(screenShareError) {
+        if (!screenShareError.isNullOrBlank()) {
+            currentAiReply = screenShareError!!
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             voiceManager.destroy()
             elevenLabsClient.shutdown()
             ContinuousVoiceService.stop(context)
-            RealScreenCaptureService.stop(context)
         }
     }
 
@@ -690,15 +703,13 @@ fun MainAssistantScreen(
                         onClick = {
                             if (isRealScreenSharing) {
                                 RealScreenCaptureService.stop(context)
-                            } else if (!Settings.canDrawOverlays(context)) {
-                                context.startActivity(
-                                    Intent(
-                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                        Uri.parse("package:${context.packageName}")
-                                    )
-                                )
+                                currentAiReply = "Screen share band kar diya gaya hai."
                             } else {
-                                screenShareLauncher.launch(projectionManager.createScreenCaptureIntent())
+                                try {
+                                    screenShareLauncher.launch(projectionManager.createScreenCaptureIntent())
+                                } catch (e: Exception) {
+                                    currentAiReply = "Screen share launch nahi ho paaya: ${e.localizedMessage ?: "Unsupported"}"
+                                }
                             }
                         },
                         modifier = Modifier.testTag("screen_share_toggle_button")

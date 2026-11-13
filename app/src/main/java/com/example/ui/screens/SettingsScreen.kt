@@ -18,29 +18,38 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -51,9 +60,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,13 +74,21 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.api.ConnectionTestResult
+import com.example.data.api.ElevenLabsClient
+import com.example.data.api.GeminiClient
+import com.example.data.api.VoiceTestResult
 import com.example.data.pref.SecurePreferences
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.AuroraPink
 import com.example.ui.theme.CardGlowBorder
 import com.example.ui.theme.CyanPrimary
+import com.example.ui.theme.DangerRed
 import com.example.ui.theme.DarkBackground
 import com.example.ui.theme.DarkSurface
 import com.example.ui.theme.DarkSurfaceBorder
@@ -77,6 +96,7 @@ import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VioletSecondary
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -90,15 +110,34 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val prefs = remember { SecurePreferences(context) }
+    val geminiClient = remember { GeminiClient() }
+    val elevenLabsClient = remember { ElevenLabsClient(context) }
 
     var geminiKey by remember { mutableStateOf(prefs.getGeminiApiKey()) }
+    var showGeminiKey by remember { mutableStateOf(false) }
+    var selectedGeminiModel by remember { mutableStateOf(prefs.getSelectedGeminiModel()) }
+    var isModelDropdownExpanded by remember { mutableStateOf(false) }
+    var isTestingGemini by remember { mutableStateOf(false) }
+    var geminiTestResult by remember { mutableStateOf<ConnectionTestResult?>(null) }
+
     var voiceKey by remember { mutableStateOf(prefs.getVoiceApiKey()) }
+    var showVoiceKey by remember { mutableStateOf(false) }
     var selectedVoiceId by remember { mutableStateOf(prefs.getSelectedVoiceId()) }
+    var isTestingVoice by remember { mutableStateOf(false) }
+    var voiceTestResult by remember { mutableStateOf<VoiceTestResult?>(null) }
+
     var isOverlayEnabled by remember { mutableStateOf(prefs.isOverlayEnabled()) }
     var isContinuousListening by remember { mutableStateOf(prefs.isContinuousListeningEnabled()) }
 
     var savedMessage by remember { mutableStateOf<String?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            elevenLabsClient.shutdown()
+        }
+    }
 
     val voices = listOf(
         Pair("Mahi (Default Indian Conversational)", SecurePreferences.VOICE_MAHI)
@@ -196,7 +235,7 @@ fun SettingsScreen(
                 }
             }
 
-            // Gemini API Key Card
+            // Gemini API Configuration & Live Test Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = DarkSurface),
@@ -219,14 +258,32 @@ fun SettingsScreen(
                             fontWeight = FontWeight.Bold
                         )
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     OutlinedTextField(
                         value = geminiKey,
-                        onValueChange = { geminiKey = it },
+                        onValueChange = {
+                            geminiKey = it
+                            geminiTestResult = null
+                        },
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("settings_gemini_key"),
+                        label = { Text("Gemini API Key") },
                         placeholder = { Text("Paste Gemini Key from Google AI Studio") },
+                        visualTransformation = if (showGeminiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(
+                                onClick = { showGeminiKey = !showGeminiKey },
+                                modifier = Modifier.testTag("settings_toggle_gemini_key")
+                            ) {
+                                Icon(
+                                    imageVector = if (showGeminiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (showGeminiKey) "Hide API Key" else "Show API Key",
+                                    tint = TextSecondary
+                                )
+                            }
+                        },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = CyanPrimary,
                             unfocusedBorderColor = DarkSurfaceBorder,
@@ -238,6 +295,117 @@ fun SettingsScreen(
                         singleLine = true,
                         shape = RoundedCornerShape(12.dp)
                     )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    ExposedDropdownMenuBox(
+                        expanded = isModelDropdownExpanded,
+                        onExpandedChange = { isModelDropdownExpanded = !isModelDropdownExpanded }
+                    ) {
+                        OutlinedTextField(
+                            value = selectedGeminiModel,
+                            onValueChange = {},
+                            readOnly = true,
+                            label = { Text("Gemini Reasoning Model") },
+                            trailingIcon = {
+                                ExposedDropdownMenuDefaults.TrailingIcon(expanded = isModelDropdownExpanded)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor(MenuAnchorType.PrimaryNotEditable)
+                                .testTag("settings_gemini_model"),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = CyanPrimary,
+                                unfocusedBorderColor = DarkSurfaceBorder,
+                                focusedTextColor = TextPrimary,
+                                unfocusedTextColor = TextPrimary,
+                                focusedContainerColor = DarkSurfaceElevated,
+                                unfocusedContainerColor = DarkSurfaceElevated
+                            ),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        ExposedDropdownMenu(
+                            expanded = isModelDropdownExpanded,
+                            onDismissRequest = { isModelDropdownExpanded = false },
+                            modifier = Modifier.background(DarkSurfaceElevated)
+                        ) {
+                            GeminiClient.AVAILABLE_MODELS.forEach { model ->
+                                DropdownMenuItem(
+                                    text = { Text(model, color = TextPrimary) },
+                                    onClick = {
+                                        selectedGeminiModel = model
+                                        prefs.setSelectedGeminiModel(model)
+                                        isModelDropdownExpanded = false
+                                        geminiTestResult = null
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            if (isTestingGemini) return@OutlinedButton
+                            isTestingGemini = true
+                            geminiTestResult = null
+                            val cleanKey = geminiKey.trim()
+                            prefs.setGeminiApiKey(cleanKey)
+                            prefs.setSelectedGeminiModel(selectedGeminiModel)
+                            coroutineScope.launch {
+                                geminiTestResult = geminiClient.testConnection(cleanKey, selectedGeminiModel)
+                                isTestingGemini = false
+                            }
+                        },
+                        enabled = !isTestingGemini,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, VioletSecondary),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_test_gemini_button")
+                    ) {
+                        if (isTestingGemini) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = CyanPrimary
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Testing Gemini Connection...", color = TextPrimary, fontSize = 13.sp)
+                        } else {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = VioletSecondary, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save & Test Gemini Connection", color = VioletSecondary, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
+                    }
+
+                    geminiTestResult?.let { result ->
+                        Spacer(modifier = Modifier.height(8.dp))
+                        val isSuccess = result is ConnectionTestResult.Success
+                        val statusColor = if (isSuccess) AuroraEmerald else DangerRed
+                        val msg = when (result) {
+                            is ConnectionTestResult.Success -> result.message
+                            is ConnectionTestResult.Failure -> result.errorMessage
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(statusColor.copy(alpha = 0.14f))
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(text = msg, color = statusColor, fontSize = 12.sp)
+                        }
+                    }
                 }
             }
 
@@ -264,6 +432,42 @@ fun SettingsScreen(
                             fontWeight = FontWeight.Bold
                         )
                     }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedTextField(
+                        value = voiceKey,
+                        onValueChange = {
+                            voiceKey = it
+                            voiceTestResult = null
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_voice_key"),
+                        label = { Text("ElevenLabs API Key (Optional for Neural Mahi)") },
+                        placeholder = { Text("sk_... (leave blank for Native TTS)") },
+                        visualTransformation = if (showVoiceKey) VisualTransformation.None else PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        trailingIcon = {
+                            IconButton(onClick = { showVoiceKey = !showVoiceKey }) {
+                                Icon(
+                                    imageVector = if (showVoiceKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                    contentDescription = if (showVoiceKey) "Hide ElevenLabs Key" else "Show ElevenLabs Key",
+                                    tint = TextSecondary
+                                )
+                            }
+                        },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = AuroraPink,
+                            unfocusedBorderColor = DarkSurfaceBorder,
+                            focusedTextColor = TextPrimary,
+                            unfocusedTextColor = TextPrimary,
+                            focusedContainerColor = DarkSurfaceElevated,
+                            unfocusedContainerColor = DarkSurfaceElevated
+                        ),
+                        singleLine = true,
+                        shape = RoundedCornerShape(12.dp)
+                    )
 
                     Spacer(modifier = Modifier.height(10.dp))
 
@@ -299,6 +503,66 @@ fun SettingsScreen(
                                     modifier = Modifier.size(18.dp)
                                 )
                             }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            if (isTestingVoice) return@OutlinedButton
+                            isTestingVoice = true
+                            voiceTestResult = null
+                            val cleanVoiceKey = voiceKey.trim()
+                            prefs.setVoiceApiKey(cleanVoiceKey)
+                            prefs.setSelectedVoiceId(selectedVoiceId)
+                            coroutineScope.launch {
+                                voiceTestResult = elevenLabsClient.testVoiceConnection(cleanVoiceKey, selectedVoiceId)
+                                isTestingVoice = false
+                            }
+                        },
+                        enabled = !isTestingVoice,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AuroraPink),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_test_voice_button")
+                    ) {
+                        if (isTestingVoice) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = AuroraPink)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Testing Mahi Voice...", color = TextPrimary, fontSize = 13.sp)
+                        } else {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = AuroraPink, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Test ElevenLabs Mahi Voice", color = AuroraPink, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
+                    }
+
+                    voiceTestResult?.let { result ->
+                        Spacer(modifier = Modifier.height(8.dp))
+                        val isSuccess = result is VoiceTestResult.Success
+                        val statusColor = if (isSuccess) AuroraEmerald else DangerRed
+                        val msg = when (result) {
+                            is VoiceTestResult.Success -> result.message
+                            is VoiceTestResult.Failure -> result.errorMessage
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(statusColor.copy(alpha = 0.14f))
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(text = msg, color = statusColor, fontSize = 12.sp)
                         }
                     }
                 }
@@ -387,8 +651,9 @@ fun SettingsScreen(
             // Save Settings Button
             Button(
                 onClick = {
-                    prefs.setGeminiApiKey(geminiKey)
-                    prefs.setVoiceApiKey(voiceKey)
+                    prefs.setGeminiApiKey(geminiKey.trim())
+                    prefs.setSelectedGeminiModel(selectedGeminiModel)
+                    prefs.setVoiceApiKey(voiceKey.trim())
                     prefs.setSelectedVoiceId(selectedVoiceId)
                     prefs.setOverlayEnabled(isOverlayEnabled)
                     prefs.setContinuousListeningEnabled(isContinuousListening)
