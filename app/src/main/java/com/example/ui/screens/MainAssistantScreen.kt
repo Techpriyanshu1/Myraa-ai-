@@ -449,7 +449,17 @@ fun MainAssistantScreen(
                 } else {
                     null
                 }
-                val parsed = geminiClient.interpretCommand(trimmed, apiKey, model, screenSnapshot)
+                val parsed = geminiClient.interpretCommand(
+                    prompt = trimmed,
+                    apiKey = apiKey,
+                    preferredModel = model,
+                    screenImageBase64 = screenSnapshot,
+                    onModelAutoUpdated = { workingModel ->
+                        if (workingModel != model) {
+                            prefs.setSelectedGeminiModel(workingModel)
+                        }
+                    }
+                )
                 if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connection failed", ignoreCase = true) && !parsed.spokenResponse.contains("API key", ignoreCase = true)) {
                     fleetManager.clearAgentError("gemini_intelligence")
                 }

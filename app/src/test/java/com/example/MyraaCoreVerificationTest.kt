@@ -295,12 +295,27 @@ class MyraaCoreVerificationTest {
     }
 
     @Test
-    fun `GeminiClient uses real models and parses dial, search, and polite intents`() = runTest {
+    fun `GeminiClient uses real models, ranks discovered models, and parses dial, search, and polite intents`() = runTest {
         assertFalse(GeminiClient.AVAILABLE_MODELS.contains("gemini-3.8-flash"))
-        assertTrue(GeminiClient.AVAILABLE_MODELS.contains("gemini-2.5-flash"))
+        assertTrue(GeminiClient.AVAILABLE_MODELS.contains("gemini-3-flash-preview"))
+        assertTrue(GeminiClient.AVAILABLE_MODELS.contains("gemini-3.1-pro-preview"))
 
         prefs.setSelectedGeminiModel("gemini-3.8-flash")
-        assertEquals("gemini-2.5-flash", prefs.getSelectedGeminiModel())
+        assertEquals(SecurePreferences.DEFAULT_GEMINI_MODEL, prefs.getSelectedGeminiModel())
+
+        val sampleModelsJson = """
+            {
+              "models": [
+                {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
+                {"name": "models/gemini-2.5-flash-preview-tts", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3.1-pro-preview", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-3-flash-preview", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-flash-latest", "supportedGenerationMethods": ["generateContent"]}
+              ]
+            }
+        """.trimIndent()
+        val parsedModels = GeminiClient.parseModelsJson(sampleModelsJson)
+        assertEquals(listOf("gemini-3-flash-preview", "gemini-flash-latest", "gemini-3.1-pro-preview"), parsedModels)
 
         val gemini = GeminiClient()
         val dialCmd = gemini.interpretCommand("Hey Myraa, dial 9876543210", "")

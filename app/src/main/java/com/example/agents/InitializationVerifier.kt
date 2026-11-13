@@ -94,6 +94,9 @@ class InitializationVerifier(
             }
             checks += when (conn) {
                 is ConnectionTestResult.Success -> {
+                    if (conn.modelUsed != prefs.getSelectedGeminiModel()) {
+                        prefs.setSelectedGeminiModel(conn.modelUsed)
+                    }
                     fleetManager.clearAgentError("gemini_intelligence")
                     PreflightCheckItem(
                         id = "gemini_connectivity",

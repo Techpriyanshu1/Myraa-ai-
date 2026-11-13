@@ -21,8 +21,8 @@ class SecurePreferences(private val context: Context) {
         const val MODEL_ELEVEN_MULTILINGUAL_V2 = "eleven_multilingual_v2"
         const val MODEL_ELEVEN_FLASH_V2_5 = "eleven_flash_v2_5"
 
-        // Default Gemini Model
-        const val DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+        // Default Gemini Model (with live /v1beta/models auto-discovery fallback)
+        const val DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
     }
 
     // --- GEMINI API ---
@@ -49,7 +49,7 @@ class SecurePreferences(private val context: Context) {
 
     fun getSelectedGeminiModel(): String {
         val saved = prefs.getString("selected_gemini_model", DEFAULT_GEMINI_MODEL)?.trim().orEmpty()
-        if (saved.isBlank() || saved == "gemini-3.8-flash" || saved == "gemini-3.5-flash" || saved == "gemini-pro-latest") {
+        if (saved.isBlank() || saved == "gemini-3.8-flash") {
             return DEFAULT_GEMINI_MODEL
         }
         return saved

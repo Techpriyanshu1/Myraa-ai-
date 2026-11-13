@@ -40,16 +40,134 @@ class GeminiClient {
 
     companion object {
         val AVAILABLE_MODELS = listOf(
+            "gemini-3-flash-preview",
+            "gemini-flash-latest",
+            "gemini-3.1-pro-preview",
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
             "gemini-2.0-flash",
-            "gemini-2.5-pro",
-            "gemini-flash-latest"
+            "gemini-2.5-pro"
         )
+
+        private val discoveredModelsCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+        private val verifiedModelByKey = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+        /**
+         * Parses Google's `/v1beta/models` response JSON and returns sorted `generateContent`-capable
+         * Gemini model IDs prioritizing fast flash models and newer Gemini 3/3.1 families.
+         */
+        fun parseModelsJson(jsonStr: String): List<String> {
+            if (jsonStr.isBlank()) return emptyList()
+            return try {
+                val root = JSONObject(jsonStr)
+                val modelsArr = root.optJSONArray("models") ?: return emptyList()
+                val candidates = mutableListOf<String>()
+                for (i in 0 until modelsArr.length()) {
+                    val obj = modelsArr.optJSONObject(i) ?: continue
+                    val fullName = obj.optString("name", "").trim()
+                    val shortName = fullName.removePrefix("models/")
+                    if (!shortName.startsWith("gemini-", ignoreCase = true)) continue
+
+                    val lower = shortName.lowercase()
+                    if (lower.contains("embedding") ||
+                        lower.contains("tts") ||
+                        lower.contains("image") ||
+                        lower.contains("imagen") ||
+                        lower.contains("veo") ||
+                        lower.contains("native-audio") ||
+                        lower.contains("live") ||
+                        lower.contains("robotics") ||
+                        lower.contains("computer-use") ||
+                        lower.contains("deep-research") ||
+                        lower.contains("aqa")
+                    ) {
+                        continue
+                    }
+
+                    val methods = obj.optJSONArray("supportedGenerationMethods")
+                    var supportsGenerate = false
+                    if (methods != null) {
+                        for (m in 0 until methods.length()) {
+                            if (methods.optString(m) == "generateContent") {
+                                supportsGenerate = true
+                                break
+                            }
+                        }
+                    }
+                    if (supportsGenerate) {
+                        candidates += shortName
+                    }
+                }
+                candidates.distinct().sortedWith(
+                    compareBy<String>(
+                        { modelRankTier(it) },
+                        { if (it.contains("lite", ignoreCase = true)) 1 else 0 },
+                        { if (it.contains("preview", ignoreCase = true) || it.contains("exp", ignoreCase = true)) 1 else 0 }
+                    )
+                )
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        private fun modelRankTier(name: String): Int {
+            val l = name.lowercase()
+            return when {
+                l.startsWith("gemini-3") && l.contains("flash") -> 0
+                l == "gemini-flash-latest" -> 1
+                l.contains("flash") && !l.startsWith("gemini-1") -> 2
+                l.startsWith("gemini-3") && l.contains("pro") -> 3
+                l.contains("pro") && !l.startsWith("gemini-1") -> 4
+                else -> 5
+            }
+        }
     }
 
     private fun supportsZeroThinkingBudget(model: String): Boolean {
         return model == "gemini-2.5-flash" || model == "gemini-2.5-flash-lite"
+    }
+
+    /**
+     * Queries Google's `/v1beta/models` endpoint to find which Gemini models
+     * are actively enabled for this specific API key.
+     */
+    suspend fun discoverAvailableModels(
+        apiKey: String,
+        forceRefresh: Boolean = false
+    ): List<String> = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank()) return@withContext emptyList()
+        if (!forceRefresh) {
+            discoveredModelsCache[cleanKey]?.let { if (it.isNotEmpty()) return@withContext it }
+        }
+
+        try {
+            val request = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models?pageSize=100")
+                .addHeader("x-goog-api-key", cleanKey)
+                .get()
+                .build()
+
+            val (code, bodyStr) = com.example.core.NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
+                client.newCall(request).execute().use { resp ->
+                    Pair(resp.code, resp.body?.string() ?: "")
+                }
+            }
+
+            if (code in 200..299 && bodyStr.isNotBlank()) {
+                val parsed = parseModelsJson(bodyStr)
+                if (parsed.isNotEmpty()) {
+                    discoveredModelsCache[cleanKey] = parsed
+                    Log.i("GeminiClient", "Discovered ${parsed.size} live Gemini models: ${parsed.take(5)}")
+                }
+                return@withContext parsed
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            Log.w("GeminiClient", "Model discovery failed", e)
+        }
+        emptyList()
     }
 
     suspend fun testConnection(apiKey: String, selectedModel: String): ConnectionTestResult = withContext(Dispatchers.IO) {
@@ -59,9 +177,20 @@ class GeminiClient {
         }
 
         val safePreferred = selectedModel.trim().takeIf {
-            it.isNotBlank() && it !in listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-pro-latest")
-        } ?: "gemini-2.5-flash"
-        val candidateModels = (listOf(safePreferred) + AVAILABLE_MODELS).distinct()
+            it.isNotBlank() && it != "gemini-3.8-flash"
+        } ?: AVAILABLE_MODELS.first()
+
+        // Discover live enabled models for this key so retired 2.x keys automatically resolve to 3.x / latest
+        val discovered = discoverAvailableModels(cleanKey, forceRefresh = true)
+        val candidateModels = if (discovered.isNotEmpty()) {
+            buildList {
+                if (safePreferred in discovered) add(safePreferred)
+                addAll(discovered)
+                addAll(AVAILABLE_MODELS)
+            }.distinct()
+        } else {
+            (listOf(safePreferred) + AVAILABLE_MODELS).distinct()
+        }
 
         var lastFailure = ConnectionTestResult.Failure("Gemini connection failed.")
 
@@ -78,7 +207,7 @@ class GeminiClient {
                         })
                     })
                     put("generationConfig", JSONObject().apply {
-                        put("maxOutputTokens", 32)
+                        put("maxOutputTokens", 256)
                         if (supportsZeroThinkingBudget(targetModel)) {
                             put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                         }
@@ -103,6 +232,7 @@ class GeminiClient {
                 }
 
                 if (isOk) {
+                    verifiedModelByKey[cleanKey] = targetModel
                     return@withContext ConnectionTestResult.Success(
                         message = "Connection successful with $targetModel!",
                         modelUsed = targetModel
@@ -137,8 +267,9 @@ class GeminiClient {
     suspend fun interpretCommand(
         prompt: String,
         apiKey: String,
-        preferredModel: String = "gemini-2.5-flash",
-        screenImageBase64: String? = null
+        preferredModel: String = AVAILABLE_MODELS.first(),
+        screenImageBase64: String? = null,
+        onModelAutoUpdated: ((String) -> Unit)? = null
     ): ParsedCommand = withContext(Dispatchers.IO) {
         val trimmed = prompt.trim()
         if (trimmed.isEmpty()) {
@@ -165,11 +296,25 @@ class GeminiClient {
         var lastApiError: String? = null
         if (cleanKey.isNotBlank()) {
             val safePreferred = preferredModel.trim().takeIf {
-                it.isNotBlank() && it != "gemini-3.8-flash" && it != "gemini-3.5-flash" && it != "gemini-pro-latest"
-            } ?: "gemini-2.5-flash"
-            val candidateModels = listOf(safePreferred) + AVAILABLE_MODELS.filter { it != safePreferred }
+                it.isNotBlank() && it != "gemini-3.8-flash"
+            } ?: AVAILABLE_MODELS.first()
 
-            for (model in candidateModels.distinct()) {
+            val cachedVerified = verifiedModelByKey[cleanKey]
+            val initialDiscovered = discoveredModelsCache[cleanKey].orEmpty()
+            val queue = ArrayDeque<String>()
+            val attempted = mutableSetOf<String>()
+
+            if (!cachedVerified.isNullOrBlank()) queue.add(cachedVerified)
+            queue.add(safePreferred)
+            initialDiscovered.forEach { if (!queue.contains(it)) queue.add(it) }
+            AVAILABLE_MODELS.forEach { if (!queue.contains(it)) queue.add(it) }
+
+            var didLiveDiscovery = initialDiscovered.isNotEmpty()
+
+            while (queue.isNotEmpty()) {
+                val model = queue.removeFirst()
+                if (!attempted.add(model)) continue
+
                 try {
                     val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
 
@@ -206,7 +351,7 @@ class GeminiClient {
 
                     val genConfig = JSONObject().apply {
                         put("temperature", 0.35)
-                        put("maxOutputTokens", 650)
+                        put("maxOutputTokens", 2048)
                         put("responseMimeType", "application/json")
                         if (supportsZeroThinkingBudget(model)) {
                             put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
@@ -257,6 +402,10 @@ class GeminiClient {
                                 }.trim()
                                 val structured = extractStructuredJson(rawText, trimmed)
                                 if (structured != null) {
+                                    verifiedModelByKey[cleanKey] = model
+                                    if (model != safePreferred) {
+                                        onModelAutoUpdated?.invoke(model)
+                                    }
                                     Log.i("GeminiClient", "Structured JSON parsed via $model -> ${structured.actionType}")
                                     return@withContext structured
                                 } else {
@@ -271,6 +420,19 @@ class GeminiClient {
                         if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
                             // Invalid key/permission won't succeed on fallback models
                             break
+                        }
+                        // On 404 / deprecated model, dynamically discover live models enabled for this key
+                        if (!didLiveDiscovery && (code == 404 || code == 400)) {
+                            didLiveDiscovery = true
+                            val liveModels = discoverAvailableModels(cleanKey, forceRefresh = true)
+                            if (liveModels.isNotEmpty()) {
+                                // Prepend discovered active models right at the front of the queue
+                                liveModels.asReversed().forEach { discoveredModel ->
+                                    if (!attempted.contains(discoveredModel) && !queue.contains(discoveredModel)) {
+                                        queue.addFirst(discoveredModel)
+                                    }
+                                }
+                            }
                         }
                     }
                 } catch (ce: kotlinx.coroutines.CancellationException) {
