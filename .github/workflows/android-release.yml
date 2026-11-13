@@ -48,19 +48,9 @@ jobs:
             gradle :app:assembleDebug
           fi
 
-      - name: Upload Debug APK Artifact
+      - name: Upload Debug APK Artifact (No Tag Created)
         uses: actions/upload-artifact@v4
         with:
           name: myraa-ai-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: MYRAA AI v1.0.${{ github.run_number }}
-          body: |
-            Automated MYRAA AI Debug APK build from commit ${{ github.sha }}.
-            - Default Assistant Voice: Mahi
-            - Android 14 / 15 compatible
-          files: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30

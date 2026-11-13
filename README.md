@@ -4,6 +4,11 @@
 
 MYRAA AI is a native Android (Kotlin + Jetpack Compose + Material 3) voice-controlled AI assistant supporting natural **Hindi, Hinglish, and English** commands, powered by the user's own **Gemini API** key and **ElevenLabs** (default assistant voice: **Mahi**), with modular device automation agents and transparent on-device security & audit logs.
 
+## Direct APK Download (No Git Tag Required)
+
+- **Ready-to-Install Debug APK in Repo:** Download [`apk/MYRAA-AI-debug.apk`](apk/MYRAA-AI-debug.apk) directly from GitHub (`View raw` / `Download`)—no release tags required.
+- **GitHub Actions Build Artifact:** Every push to `main`/`master` also builds and uploads `myraa-ai-debug-apk` under the **Actions** tab without creating any Git tags.
+
 ---
 
 ## Key Features
