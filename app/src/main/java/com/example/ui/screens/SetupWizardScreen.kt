@@ -113,6 +113,7 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VioletSecondary
 import com.example.voice.CompanionState
+import com.example.voice.MyraaSessionCoordinator
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -199,6 +200,7 @@ fun SetupWizardScreen(
         prefs.setSelectedVoiceModel(voiceModel)
         prefs.setNativeTtsFallbackEnabled(false)
         prefs.setSetupCompleted(true)
+        MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
         fleetManager.refreshFleetStatus(clearErrors = true)
         onSetupCompleted()
     }
@@ -672,9 +674,13 @@ fun SetupWizardScreen(
                                         if (!isTestingVoice) {
                                             isTestingVoice = true
                                             voiceTestResult = null
+                                            val cleanVoice = voiceKey.trim()
+                                            if (cleanVoice.isNotBlank()) {
+                                                prefs.setVoiceApiKey(cleanVoice)
+                                            }
                                             coroutineScope.launch {
                                                 voiceTestResult = elevenLabsClient.testVoiceConnection(
-                                                    apiKey = voiceKey,
+                                                    apiKey = cleanVoice,
                                                     voiceId = mahiVoiceId,
                                                     modelId = voiceModel
                                                 )

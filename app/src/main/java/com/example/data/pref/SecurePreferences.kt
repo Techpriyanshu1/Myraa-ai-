@@ -23,6 +23,11 @@ class SecurePreferences(private val context: Context) {
 
         // Default Gemini Model (with live /v1beta/models auto-discovery fallback)
         const val DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+
+        // Voice Provider Modes
+        const val VOICE_PROVIDER_AUTO = "auto"
+        const val VOICE_PROVIDER_GEMINI = "gemini"
+        const val VOICE_PROVIDER_ELEVENLABS = "elevenlabs"
     }
 
     // --- GEMINI API ---
@@ -45,6 +50,9 @@ class SecurePreferences(private val context: Context) {
         val trimmed = key.trim()
         val encrypted = keystoreVault.encrypt(trimmed)
         prefs.edit().putString("gemini_api_key_vault", encrypted).apply()
+        if (trimmed.isNotBlank()) {
+            recordFirstConfiguredVoiceProviderIfUnset(VOICE_PROVIDER_GEMINI)
+        }
     }
 
     fun getSelectedGeminiModel(): String {
@@ -69,6 +77,60 @@ class SecurePreferences(private val context: Context) {
         val trimmed = key.trim()
         val encrypted = keystoreVault.encrypt(trimmed)
         prefs.edit().putString("voice_api_key_vault", encrypted).apply()
+        if (trimmed.isNotBlank()) {
+            recordFirstConfiguredVoiceProviderIfUnset(VOICE_PROVIDER_ELEVENLABS)
+        }
+    }
+
+    fun getVoiceProviderMode(): String {
+        val mode = prefs.getString("voice_provider_mode", VOICE_PROVIDER_AUTO) ?: VOICE_PROVIDER_AUTO
+        return when (mode) {
+            VOICE_PROVIDER_GEMINI, VOICE_PROVIDER_ELEVENLABS, VOICE_PROVIDER_AUTO -> mode
+            else -> VOICE_PROVIDER_AUTO
+        }
+    }
+
+    fun setVoiceProviderMode(mode: String) {
+        val normalized = when (mode.lowercase()) {
+            VOICE_PROVIDER_GEMINI -> VOICE_PROVIDER_GEMINI
+            VOICE_PROVIDER_ELEVENLABS -> VOICE_PROVIDER_ELEVENLABS
+            else -> VOICE_PROVIDER_AUTO
+        }
+        prefs.edit().putString("voice_provider_mode", normalized).apply()
+    }
+
+    fun getFirstConfiguredVoiceProvider(): String {
+        return prefs.getString("first_configured_voice_provider", "") ?: ""
+    }
+
+    fun recordFirstConfiguredVoiceProviderIfUnset(provider: String) {
+        if (getFirstConfiguredVoiceProvider().isBlank() &&
+            (provider == VOICE_PROVIDER_GEMINI || provider == VOICE_PROVIDER_ELEVENLABS)
+        ) {
+            prefs.edit().putString("first_configured_voice_provider", provider).apply()
+        }
+    }
+
+    /**
+     * Resolves which AI voice engine to try first:
+     * - Explicit user choice (`gemini` or `elevenlabs`) if that key is configured
+     * - Otherwise `auto`: uses whichever API key the user provided first (`first_configured_voice_provider`),
+     *   falling back cleanly to whichever key is available.
+     */
+    fun getEffectiveVoiceProvider(): String {
+        val hasGemini = getGeminiApiKey().isNotBlank()
+        val hasEleven = getVoiceApiKey().isNotBlank()
+        return when (getVoiceProviderMode()) {
+            VOICE_PROVIDER_ELEVENLABS -> if (hasEleven || !hasGemini) VOICE_PROVIDER_ELEVENLABS else VOICE_PROVIDER_GEMINI
+            VOICE_PROVIDER_GEMINI -> if (hasGemini || !hasEleven) VOICE_PROVIDER_GEMINI else VOICE_PROVIDER_ELEVENLABS
+            else -> {
+                when (getFirstConfiguredVoiceProvider()) {
+                    VOICE_PROVIDER_ELEVENLABS -> if (hasEleven) VOICE_PROVIDER_ELEVENLABS else VOICE_PROVIDER_GEMINI
+                    VOICE_PROVIDER_GEMINI -> if (hasGemini) VOICE_PROVIDER_GEMINI else if (hasEleven) VOICE_PROVIDER_ELEVENLABS else VOICE_PROVIDER_GEMINI
+                    else -> if (hasEleven && !hasGemini) VOICE_PROVIDER_ELEVENLABS else VOICE_PROVIDER_GEMINI
+                }
+            }
+        }
     }
 
     fun getSelectedVoiceId(): String {
@@ -207,6 +269,10 @@ class SecurePreferences(private val context: Context) {
 
     fun deleteGeminiCredentials() {
         prefs.edit().remove("gemini_api_key_vault").apply()
+        if (getFirstConfiguredVoiceProvider() == VOICE_PROVIDER_GEMINI) {
+            val replacement = if (hasStoredVoiceKey()) VOICE_PROVIDER_ELEVENLABS else ""
+            prefs.edit().putString("first_configured_voice_provider", replacement).apply()
+        }
     }
 
     fun deleteVoiceCredentials() {
@@ -215,6 +281,10 @@ class SecurePreferences(private val context: Context) {
             .remove("selected_voice_id_vault")
             .remove("selected_voice_id")
             .apply()
+        if (getFirstConfiguredVoiceProvider() == VOICE_PROVIDER_ELEVENLABS) {
+            val replacement = if (hasStoredGeminiKey()) VOICE_PROVIDER_GEMINI else ""
+            prefs.edit().putString("first_configured_voice_provider", replacement).apply()
+        }
     }
 
     fun deleteAllCredentials() {
@@ -223,6 +293,7 @@ class SecurePreferences(private val context: Context) {
             .remove("voice_api_key_vault")
             .remove("selected_voice_id_vault")
             .remove("selected_voice_id")
+            .remove("first_configured_voice_provider")
             .apply()
     }
 }

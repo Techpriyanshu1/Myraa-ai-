@@ -484,4 +484,86 @@ class MyraaCoreVerificationTest {
         prefs.setAvatarModeEnabled(false)
         assertFalse(prefs.isAvatarModeEnabled())
     }
+
+    @Test
+    fun `Voice provider auto mode uses whichever API key was provided first and supports explicit switching`() {
+        // Case 1: Gemini key entered first -> Auto picks Gemini even after ElevenLabs is added later
+        prefs.setGeminiApiKey("AIzaSyFirstKey12345")
+        assertEquals(SecurePreferences.VOICE_PROVIDER_GEMINI, prefs.getFirstConfiguredVoiceProvider())
+        prefs.setVoiceApiKey("sk_second_eleven_12345")
+        assertEquals(SecurePreferences.VOICE_PROVIDER_AUTO, prefs.getVoiceProviderMode())
+        assertEquals(SecurePreferences.VOICE_PROVIDER_GEMINI, prefs.getEffectiveVoiceProvider())
+
+        // Explicit switch to ElevenLabs overrides Auto
+        prefs.setVoiceProviderMode(SecurePreferences.VOICE_PROVIDER_ELEVENLABS)
+        assertEquals(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, prefs.getEffectiveVoiceProvider())
+
+        // Case 2: Reset -> ElevenLabs key entered first -> Auto picks ElevenLabs even after Gemini is added later
+        prefs.deleteAllCredentials()
+        prefs.setVoiceProviderMode(SecurePreferences.VOICE_PROVIDER_AUTO)
+        prefs.setVoiceApiKey("sk_first_eleven_99999")
+        assertEquals(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, prefs.getFirstConfiguredVoiceProvider())
+        prefs.setGeminiApiKey("AIzaSySecondKey67890")
+        assertEquals(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, prefs.getEffectiveVoiceProvider())
+
+        // Explicit switch to Gemini overrides Auto
+        prefs.setVoiceProviderMode(SecurePreferences.VOICE_PROVIDER_GEMINI)
+        assertEquals(SecurePreferences.VOICE_PROVIDER_GEMINI, prefs.getEffectiveVoiceProvider())
+    }
+
+    @Test
+    fun `pickBestClickableElement rejects zero or offscreen bounds and selects accurate clickable button`() {
+        val zeroBounds = com.example.service.ScreenUiElement(
+            text = "Subscribe",
+            bounds = android.graphics.Rect(0, 0, 0, 0),
+            isClickable = true,
+            isEditable = false,
+            className = "android.widget.Button"
+        )
+        val offscreenBounds = com.example.service.ScreenUiElement(
+            text = "Subscribe",
+            bounds = android.graphics.Rect(-500, 100, -100, 200),
+            isClickable = true,
+            isEditable = false,
+            className = "android.widget.Button"
+        )
+        val nonClickableBanner = com.example.service.ScreenUiElement(
+            text = "Subscribe to channel now",
+            bounds = android.graphics.Rect(0, 0, 1080, 1900),
+            isClickable = false,
+            isEditable = false,
+            className = "android.view.ViewGroup"
+        )
+        val exactClickableButton = com.example.service.ScreenUiElement(
+            text = "Subscribe",
+            bounds = android.graphics.Rect(720, 920, 980, 1020),
+            isClickable = true,
+            isEditable = false,
+            className = "android.widget.Button"
+        )
+
+        val picked = com.example.service.MyraaAccessibilityService.pickBestClickableElement(
+            elements = listOf(zeroBounds, offscreenBounds, nonClickableBanner, exactClickableButton),
+            query = "Subscribe",
+            screenWidth = 1080,
+            screenHeight = 2200
+        )
+        assertNotNull(picked)
+        assertEquals(android.graphics.Rect(720, 920, 980, 1020), picked!!.bounds)
+    }
+
+    @Test
+    fun `VoiceRecognitionManager suspendListeningForProcessing sets state cleanly`() {
+        val voiceManager = com.example.voice.VoiceRecognitionManager(
+            context = context,
+            onAudioCaptured = {}
+        )
+        voiceManager.suspendListeningForProcessing(com.example.voice.CompanionState.THINKING)
+        assertEquals(com.example.voice.CompanionState.THINKING, voiceManager.companionState.value)
+        assertEquals(0f, voiceManager.rmsLevel.value)
+
+        voiceManager.suspendListeningForProcessing(com.example.voice.CompanionState.TALKING)
+        assertEquals(com.example.voice.CompanionState.TALKING, voiceManager.companionState.value)
+        voiceManager.destroy()
+    }
 }

@@ -91,6 +91,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.data.pref.SecurePreferences
 import com.example.service.RealScreenCaptureService
 import com.example.ui.components.ActionConfirmationDialog
 import com.example.ui.components.AnimatedAiOrb
@@ -152,6 +153,10 @@ fun MainAssistantScreen(
     val rmsLevel by coordinator.rmsLevel.collectAsState()
     val liveVoiceStatus by coordinator.liveVoiceStatus.collectAsState()
     val voiceError by coordinator.voiceError.collectAsState()
+    val voiceOutputError by coordinator.voiceOutputError.collectAsState()
+    val voiceProviderMode by coordinator.voiceProviderMode.collectAsState()
+    val effectiveVoiceProvider by coordinator.effectiveVoiceProvider.collectAsState()
+    val firstConfiguredVoiceProvider by coordinator.firstConfiguredVoiceProvider.collectAsState()
     val currentSpeechTranscript by coordinator.currentSpeechTranscript.collectAsState()
     val currentAiReply by coordinator.currentAiReply.collectAsState()
     val lastExecutedAction by coordinator.lastExecutedAction.collectAsState()
@@ -396,7 +401,8 @@ fun MainAssistantScreen(
                     }
                 }
 
-                if (!voiceError.isNullOrBlank()) {
+                val bannerError = voiceError?.takeIf { it.isNotBlank() } ?: voiceOutputError?.takeIf { it.isNotBlank() }
+                if (!bannerError.isNullOrBlank()) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -406,7 +412,7 @@ fun MainAssistantScreen(
                             .padding(horizontal = 12.dp, vertical = 6.dp)
                     ) {
                         Text(
-                            text = voiceError ?: "",
+                            text = bannerError,
                             color = AuroraPink,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold,
@@ -773,6 +779,61 @@ fun MainAssistantScreen(
                     letterSpacing = 0.7.sp,
                     textAlign = TextAlign.Center
                 )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Sleek Voice Mode API Selector (Auto uses 1st configured API)
+                val firstLabel = when (firstConfiguredVoiceProvider) {
+                    SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> "1st: 11Labs"
+                    SecurePreferences.VOICE_PROVIDER_GEMINI -> "1st: Gemini"
+                    else -> "1st API"
+                }
+                val activeVoiceLabel = if (effectiveVoiceProvider == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) {
+                    "ElevenLabs"
+                } else {
+                    "Gemini Voice"
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(DarkSurfaceElevated)
+                            .padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        listOf(
+                            Triple(SecurePreferences.VOICE_PROVIDER_AUTO, "Auto ($firstLabel)", "voice_provider_auto"),
+                            Triple(SecurePreferences.VOICE_PROVIDER_GEMINI, "Gemini", "voice_provider_gemini"),
+                            Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "voice_provider_elevenlabs")
+                        ).forEach { (modeKey, title, tag) ->
+                            val selected = voiceProviderMode == modeKey
+                            val accent = if (modeKey == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) AuroraPink else CyanPrimary
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(if (selected) accent.copy(alpha = 0.22f) else Color.Transparent)
+                                    .clickable { coordinator.setVoiceProviderMode(modeKey) }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                                    .testTag(tag),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = title,
+                                    color = if (selected) accent else TextSecondary,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Voice Engine: $activeVoiceLabel",
+                        color = TextSecondary,
+                        fontSize = 10.sp
+                    )
+                }
             }
         }
     }

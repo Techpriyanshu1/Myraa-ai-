@@ -17,6 +17,7 @@ import com.example.data.db.AppDatabase
 import com.example.data.pref.SecurePreferences
 import com.example.memory.MemoryCoreManager
 import com.example.service.ContinuousVoiceService
+import com.example.service.DigitalMouseService
 import com.example.service.MyraaAccessibilityService
 import com.example.service.MyraaOverlayService
 import com.example.service.RealScreenCaptureService
@@ -24,6 +25,7 @@ import com.example.ui.components.PendingConfirmationAction
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -104,6 +106,20 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     private val _navigateToLogsEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val navigateToLogsEvent: SharedFlow<Unit> = _navigateToLogsEvent.asSharedFlow()
 
+    private val _voiceProviderMode = MutableStateFlow(prefs.getVoiceProviderMode())
+    val voiceProviderMode: StateFlow<String> = _voiceProviderMode.asStateFlow()
+
+    private val _effectiveVoiceProvider = MutableStateFlow(prefs.getEffectiveVoiceProvider())
+    val effectiveVoiceProvider: StateFlow<String> = _effectiveVoiceProvider.asStateFlow()
+
+    private val _firstConfiguredVoiceProvider = MutableStateFlow(prefs.getFirstConfiguredVoiceProvider())
+    val firstConfiguredVoiceProvider: StateFlow<String> = _firstConfiguredVoiceProvider.asStateFlow()
+
+    private val _voiceOutputError = MutableStateFlow<String?>(null)
+    val voiceOutputError: StateFlow<String?> = _voiceOutputError.asStateFlow()
+
+    private var activeSpeakJob: Job? = null
+
     @Volatile
     private var isProcessingCommand = false
 
@@ -131,13 +147,25 @@ class MyraaSessionCoordinator private constructor(context: Context) {
         coordinatorScope.launch {
             memoryManager.ensurePermanentMemorySeeded()
         }
+        refreshVoiceProviderState()
         fleetManager.refreshFleetStatus(clearErrors = true)
         prewarmVoiceGreeting()
     }
 
+    fun setVoiceProviderMode(mode: String) {
+        prefs.setVoiceProviderMode(mode)
+        refreshVoiceProviderState()
+    }
+
+    fun refreshVoiceProviderState() {
+        _voiceProviderMode.value = prefs.getVoiceProviderMode()
+        _effectiveVoiceProvider.value = prefs.getEffectiveVoiceProvider()
+        _firstConfiguredVoiceProvider.value = prefs.getFirstConfiguredVoiceProvider()
+    }
+
     fun prewarmVoiceGreeting() {
         val geminiKey = prefs.getGeminiApiKey()
-        if (prefs.getVoiceApiKey().isBlank() && geminiKey.isNotBlank()) {
+        if (prefs.getEffectiveVoiceProvider() == SecurePreferences.VOICE_PROVIDER_GEMINI && geminiKey.isNotBlank()) {
             elevenLabsClient.prewarmPhrase(GREETING_TEXT, geminiKey)
         }
     }
@@ -147,6 +175,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     }
 
     fun refreshFleetOnResume() {
+        refreshVoiceProviderState()
         fleetManager.refreshFleetStatus(clearErrors = true)
     }
 
@@ -159,8 +188,10 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     }
 
     fun speakMahiResponse(text: String) {
-        coordinatorScope.launch {
-            voiceManager.setCompanionState(CompanionState.TALKING)
+        activeSpeakJob?.cancel()
+        activeSpeakJob = coordinatorScope.launch {
+            _voiceOutputError.value = null
+            voiceManager.suspendListeningForProcessing(CompanionState.TALKING)
             elevenLabsClient.speakText(
                 text = text,
                 apiKey = prefs.getVoiceApiKey(),
@@ -168,7 +199,9 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                 modelId = prefs.getSelectedVoiceModel(),
                 speechSpeed = prefs.getSpeechSpeed(),
                 onPlaybackStarted = {
-                    voiceManager.setCompanionState(CompanionState.TALKING)
+                    _voiceOutputError.value = null
+                    fleetManager.clearAgentError("mahi_voice_output")
+                    voiceManager.suspendListeningForProcessing(CompanionState.TALKING)
                 },
                 onPlaybackCompleted = {
                     if (_isSessionActive.value && !_isListeningPaused.value) {
@@ -178,6 +211,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                     }
                 },
                 onError = { err ->
+                    _voiceOutputError.value = err
                     fleetManager.recordAgentError("mahi_voice_output", err)
                     if (_isSessionActive.value && !_isListeningPaused.value) {
                         voiceManager.resumeListeningAfterSpeech()
@@ -236,6 +270,13 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                 } catch (e: Exception) {
                     Log.w("MyraaCoordinator", "Could not start MyraaOverlayService", e)
                 }
+                try {
+                    if (Settings.canDrawOverlays(appContext)) {
+                        DigitalMouseService.start(appContext)
+                    }
+                } catch (e: Exception) {
+                    Log.w("MyraaCoordinator", "Could not start DigitalMouseService", e)
+                }
 
                 val mandatoryUnavailable = summary.unavailableAgents.filter { !it.isOptional }
                 _currentAiReply.value = if (mandatoryUnavailable.isEmpty()) {
@@ -261,12 +302,15 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     fun stopSession(notifyService: Boolean = true) {
         _isSessionActive.value = false
         _isListeningPaused.value = false
+        activeSpeakJob?.cancel()
+        activeSpeakJob = null
         voiceManager.stopContinuousListening()
         elevenLabsClient.stopSpeaking()
         if (notifyService) {
             try { ContinuousVoiceService.stop(appContext) } catch (_: Exception) {}
         }
         try { MyraaOverlayService.stop(appContext) } catch (_: Exception) {}
+        try { DigitalMouseService.stop(appContext) } catch (_: Exception) {}
         coordinatorScope.launch {
             fleetManager.stopAllAgents()
         }
@@ -380,7 +424,9 @@ class MyraaSessionCoordinator private constructor(context: Context) {
 
         coordinatorScope.launch {
             try {
-                voiceManager.setCompanionState(CompanionState.THINKING)
+                activeSpeakJob?.cancel()
+                elevenLabsClient.stopSpeaking()
+                voiceManager.suspendListeningForProcessing(CompanionState.THINKING)
                 val apiKey = prefs.getGeminiApiKey()
                 val model = prefs.getSelectedGeminiModel()
                 val screenSnapshot = if (RealScreenCaptureService.isSharingActive.value) {
@@ -443,7 +489,9 @@ class MyraaSessionCoordinator private constructor(context: Context) {
 
         coordinatorScope.launch {
             try {
-                voiceManager.setCompanionState(CompanionState.THINKING)
+                activeSpeakJob?.cancel()
+                elevenLabsClient.stopSpeaking()
+                voiceManager.suspendListeningForProcessing(CompanionState.THINKING)
                 val apiKey = prefs.getGeminiApiKey()
                 val model = prefs.getSelectedGeminiModel()
                 val screenSnapshot = if (RealScreenCaptureService.isSharingActive.value) {
@@ -561,7 +609,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                         _lastExecutedAction.value = "STOP_AI"
                         _lastActionSuccess.value = true
                         _currentAiReply.value = parsed.spokenResponse
-                        voiceManager.setCompanionState(CompanionState.TALKING)
+                        voiceManager.suspendListeningForProcessing(CompanionState.TALKING)
                         elevenLabsClient.speakText(
                             text = parsed.spokenResponse,
                             apiKey = prefs.getVoiceApiKey(),

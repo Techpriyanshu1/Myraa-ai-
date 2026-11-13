@@ -98,6 +98,7 @@ import com.example.ui.theme.DarkSurfaceElevated
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.VioletSecondary
+import com.example.voice.MyraaSessionCoordinator
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -129,6 +130,8 @@ fun SettingsScreen(
     var voiceKey by remember { mutableStateOf(prefs.getVoiceApiKey()) }
     var showVoiceKey by remember { mutableStateOf(false) }
     var selectedVoiceId by remember { mutableStateOf(prefs.getSelectedVoiceId()) }
+    var selectedVoiceProviderMode by remember { mutableStateOf(prefs.getVoiceProviderMode()) }
+    var firstVoiceProvider by remember { mutableStateOf(prefs.getFirstConfiguredVoiceProvider()) }
     var isTestingVoice by remember { mutableStateOf(false) }
     var voiceTestResult by remember { mutableStateOf<VoiceTestResult?>(null) }
 
@@ -364,6 +367,8 @@ fun SettingsScreen(
                             val cleanKey = geminiKey.trim()
                             prefs.setGeminiApiKey(cleanKey)
                             prefs.setSelectedGeminiModel(selectedGeminiModel)
+                            firstVoiceProvider = prefs.getFirstConfiguredVoiceProvider()
+                            MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
                             coroutineScope.launch {
                                 val res = geminiClient.testConnection(cleanKey, selectedGeminiModel)
                                 geminiTestResult = res
@@ -525,7 +530,68 @@ fun SettingsScreen(
                         }
                     }
 
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text(
+                        text = "Voice API Engine Priority",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = TextPrimary,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    val firstApiText = when (firstVoiceProvider) {
+                        SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> "First API given: ElevenLabs"
+                        SecurePreferences.VOICE_PROVIDER_GEMINI -> "First API given: Gemini"
+                        else -> "Auto uses whichever API key you provide first"
+                    }
+                    Text(
+                        text = firstApiText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
                     Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        listOf(
+                            Triple(SecurePreferences.VOICE_PROVIDER_AUTO, "Auto (1st)", "settings_voice_provider_auto"),
+                            Triple(SecurePreferences.VOICE_PROVIDER_GEMINI, "Gemini", "settings_voice_provider_gemini"),
+                            Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "settings_voice_provider_elevenlabs")
+                        ).forEach { (modeKey, label, tag) ->
+                            val selected = selectedVoiceProviderMode == modeKey
+                            val accent = if (modeKey == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) AuroraPink else CyanPrimary
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (selected) accent.copy(alpha = 0.2f) else DarkSurfaceElevated)
+                                    .border(
+                                        1.dp,
+                                        if (selected) accent else DarkSurfaceBorder,
+                                        RoundedCornerShape(10.dp)
+                                    )
+                                    .clickable {
+                                        selectedVoiceProviderMode = modeKey
+                                        prefs.setVoiceProviderMode(modeKey)
+                                        MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
+                                        voiceTestResult = null
+                                    }
+                                    .padding(vertical = 10.dp)
+                                    .testTag(tag),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    color = if (selected) accent else TextSecondary,
+                                    fontSize = 12.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
 
                     OutlinedButton(
                         onClick = {
@@ -535,6 +601,9 @@ fun SettingsScreen(
                             val cleanVoiceKey = voiceKey.trim()
                             prefs.setVoiceApiKey(cleanVoiceKey)
                             prefs.setSelectedVoiceId(selectedVoiceId)
+                            prefs.setVoiceProviderMode(selectedVoiceProviderMode)
+                            firstVoiceProvider = prefs.getFirstConfiguredVoiceProvider()
+                            MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
                             coroutineScope.launch {
                                 val res = elevenLabsClient.testVoiceConnection(cleanVoiceKey, selectedVoiceId)
                                 voiceTestResult = res
@@ -683,6 +752,9 @@ fun SettingsScreen(
                     }
                     prefs.setVoiceApiKey(voiceKey.trim())
                     prefs.setSelectedVoiceId(selectedVoiceId)
+                    prefs.setVoiceProviderMode(selectedVoiceProviderMode)
+                    firstVoiceProvider = prefs.getFirstConfiguredVoiceProvider()
+                    MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
                     prefs.setOverlayEnabled(isOverlayEnabled)
                     prefs.setContinuousListeningEnabled(isContinuousListening)
                     fleetManager.refreshFleetStatus(clearErrors = true)

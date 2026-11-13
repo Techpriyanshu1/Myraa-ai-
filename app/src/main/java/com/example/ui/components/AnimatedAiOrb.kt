@@ -70,12 +70,12 @@ fun AnimatedAiOrb(
         label = "listening_pulse"
     )
 
-    // Rotation angle for thinking state
+    // Rotation angle for thinking state (4.5s loop repeating cleanly until answer arrives)
     val rotationAngle by infiniteTransition.animateFloat(
         initialValue = 0f,
         targetValue = 360f,
         animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 3500, easing = LinearEasing),
+            animation = tween(durationMillis = 4500, easing = LinearEasing),
             repeatMode = RepeatMode.Restart
         ),
         label = "thinking_rotation"

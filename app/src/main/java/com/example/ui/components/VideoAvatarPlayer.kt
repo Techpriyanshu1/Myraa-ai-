@@ -101,6 +101,29 @@ fun VideoAvatarPlayer(
         switchVideo(targetAsset)
     }
 
+    // Keep THINKING animation strictly to ~4.5 seconds per cycle and repeat until answer arrives
+    LaunchedEffect(companionState) {
+        if (companionState == CompanionState.THINKING) {
+            while (companionState == CompanionState.THINKING) {
+                kotlinx.coroutines.delay(4500L)
+                if (companionState != CompanionState.THINKING) break
+                try {
+                    val mp = playerHolder[0]
+                    if (mp != null && currentAssetHolder[0] == "thinking.mp4") {
+                        mp.seekTo(0)
+                        if (!mp.isPlaying) {
+                            mp.start()
+                        }
+                    } else {
+                        switchVideo("thinking.mp4")
+                    }
+                } catch (e: Exception) {
+                    Log.w("VideoAvatarPlayer", "Thinking loop restart warning", e)
+                }
+            }
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             try {

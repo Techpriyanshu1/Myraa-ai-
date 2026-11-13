@@ -120,6 +120,83 @@ class MyraaAccessibilityService : AccessibilityService() {
         return scroll(forward)
     }
 
+    fun clampToScreen(x: Float, y: Float): Pair<Float, Float> {
+        val (w, h) = getScreenDimensions()
+        val clampedX = x.coerceIn(2f, (w - 2f).coerceAtLeast(2f))
+        val clampedY = y.coerceIn(2f, (h - 2f).coerceAtLeast(2f))
+        return clampedX to clampedY
+    }
+
+    fun findBestClickableElement(query: String): ScreenUiElement? {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return null
+        val (w, h) = getScreenDimensions()
+        val candidates = mutableListOf<ScreenUiElement>()
+
+        val root = rootInActiveWindow
+        if (root != null) {
+            collectBestCandidatesForQuery(root, cleanQuery, w, h, candidates)
+        }
+        if (candidates.isEmpty()) {
+            candidates.addAll(getVisibleScreenElements())
+        }
+        return pickBestClickableElement(
+            elements = candidates,
+            query = cleanQuery,
+            screenWidth = w.toInt(),
+            screenHeight = h.toInt()
+        )
+    }
+
+    private fun collectBestCandidatesForQuery(
+        node: AccessibilityNodeInfo?,
+        query: String,
+        screenWidth: Float,
+        screenHeight: Float,
+        out: MutableList<ScreenUiElement>
+    ) {
+        if (node == null) return
+        val label = (node.text?.toString() ?: node.contentDescription?.toString() ?: "").trim()
+        if (label.isNotBlank() && (label.contains(query, ignoreCase = true) || query.contains(label, ignoreCase = true))) {
+            val nodeBounds = Rect()
+            node.getBoundsInScreen(nodeBounds)
+            var chosenBounds = nodeBounds
+            var chosenClickable = node.isClickable || node.isEditable
+
+            if (!chosenClickable) {
+                val screenArea = screenWidth * screenHeight
+                var parent = node.parent
+                while (parent != null) {
+                    if (parent.isClickable || parent.isEditable) {
+                        val pBounds = Rect()
+                        parent.getBoundsInScreen(pBounds)
+                        val pArea = pBounds.width().toFloat() * pBounds.height().toFloat()
+                        if (pBounds.width() > 2 && pBounds.height() > 2 && pArea < screenArea * 0.60f) {
+                            chosenBounds = pBounds
+                            chosenClickable = true
+                            break
+                        }
+                    }
+                    parent = parent.parent
+                }
+            }
+
+            out.add(
+                ScreenUiElement(
+                    text = label,
+                    bounds = chosenBounds,
+                    isClickable = chosenClickable,
+                    isEditable = node.isEditable,
+                    className = node.className?.toString() ?: ""
+                )
+            )
+        }
+
+        for (i in 0 until node.childCount) {
+            collectBestCandidatesForQuery(node.getChild(i), query, screenWidth, screenHeight, out)
+        }
+    }
+
     private fun getScreenDimensions(): Pair<Float, Float> {
         return try {
             val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -256,5 +333,49 @@ class MyraaAccessibilityService : AccessibilityService() {
         val isServiceConnected: StateFlow<Boolean> = _isServiceConnected.asStateFlow()
 
         fun isRunning(): Boolean = instance != null
+
+        fun pickBestClickableElement(
+            elements: List<ScreenUiElement>,
+            query: String,
+            screenWidth: Int = 1080,
+            screenHeight: Int = 2200
+        ): ScreenUiElement? {
+            val q = query.trim().lowercase()
+            if (q.isBlank()) return null
+            val screenRect = Rect(0, 0, screenWidth.coerceAtLeast(1), screenHeight.coerceAtLeast(1))
+            val screenArea = screenWidth.toFloat().coerceAtLeast(1f) * screenHeight.toFloat().coerceAtLeast(1f)
+            val wordRegex = Regex("\\b${Regex.escape(q)}\\b")
+
+            data class Scored(val element: ScreenUiElement, val score: Int, val area: Long)
+
+            val scored = elements.mapNotNull { el ->
+                val b = el.bounds
+                if (b.width() <= 2 || b.height() <= 2) return@mapNotNull null
+                if (!Rect.intersects(screenRect, b)) return@mapNotNull null
+
+                val elText = el.text.trim().lowercase()
+                if (elText.isBlank()) return@mapNotNull null
+
+                val matchScore = when {
+                    elText == q -> 1000
+                    wordRegex.containsMatchIn(elText) -> 600
+                    elText.contains(q) -> 350
+                    elText.length >= 3 && q.contains(elText) -> 220
+                    else -> return@mapNotNull null
+                }
+
+                var totalScore = matchScore
+                if (el.isClickable || el.isEditable) totalScore += 250
+                val area = b.width().toLong() * b.height().toLong()
+                if (area > screenArea * 0.60f) totalScore -= 450
+
+                Scored(el, totalScore, area)
+            }
+
+            return scored
+                .sortedWith(compareByDescending<Scored> { it.score }.thenBy { it.area })
+                .firstOrNull()
+                ?.element
+        }
     }
 }

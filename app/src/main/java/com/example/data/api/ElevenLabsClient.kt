@@ -2,9 +2,12 @@ package com.example.data.api
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaPlayer
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
@@ -19,8 +22,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -44,19 +47,24 @@ sealed class VoiceTestResult {
 
 /**
  * Pure AI Neural Voice Client (NO Android native TextToSpeech).
- * - Uses ElevenLabs Neural Voice when an ElevenLabs key is configured.
- * - Uses Gemini Neural Voice (Mahi / Aoede) via shared HTTP/2 connection pool + zero-disk-I/O AudioTrack streaming
- *   + parallel sentence pipelining + phrase caching for near-instant playback latency.
+ * - Supports user-selectable voice provider priority (`Auto (1st API)`, `Gemini`, `ElevenLabs`).
+ * - Uses ElevenLabs Neural Voice when selected/configured.
+ * - Uses Gemini Neural Voice (Mahi / Aoede) via shared HTTP/2 connection pool + zero-disk-I/O
+ *   AudioTrack streaming (with MediaPlayer WAV fallback) + AudioFocus management.
  */
 class ElevenLabsClient(private val context: Context) {
 
     private val client = SharedHttpClient.instance
     private val securePrefs by lazy { SecurePreferences(context.applicationContext) }
+    private val audioManager by lazy {
+        context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
     private val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var activeMediaPlayer: MediaPlayer? = null
     private var activeAudioTrack: AudioTrack? = null
     private var activeSpeechJob: Job? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile
@@ -113,31 +121,47 @@ class ElevenLabsClient(private val context: Context) {
             )
         }
 
-        // If no ElevenLabs key is provided, automatically test Gemini Neural Voice using stored Gemini key
-        if (cleanKey.isBlank()) {
-            val geminiKey = try {
-                securePrefs.getGeminiApiKey().trim()
-            } catch (_: Exception) {
-                ""
-            }
-            if (geminiKey.isBlank()) {
-                return@withContext VoiceTestResult.Failure(
-                    "Voice API key is missing. Please enter your ElevenLabs API key.",
-                    true
-                )
-            }
+        val geminiKey = try {
+            securePrefs.getGeminiApiKey().trim()
+        } catch (_: Exception) {
+            ""
+        }
+
+        if (cleanKey.isBlank() && geminiKey.isBlank()) {
+            return@withContext VoiceTestResult.Failure(
+                "Voice API key is missing. Please enter your ElevenLabs API key.",
+                true
+            )
+        }
+
+        val preferredEngine = try {
+            securePrefs.getEffectiveVoiceProvider()
+        } catch (_: Exception) {
+            if (cleanKey.isNotBlank()) SecurePreferences.VOICE_PROVIDER_ELEVENLABS
+            else SecurePreferences.VOICE_PROVIDER_GEMINI
+        }
+
+        val useGeminiFirst = (preferredEngine == SecurePreferences.VOICE_PROVIDER_GEMINI && geminiKey.isNotBlank()) ||
+            cleanKey.isBlank()
+
+        if (useGeminiFirst) {
             val geminiRes = synthesizeWithGeminiTts(
                 text = "Namaste! Main Myraa hoon, Gemini voice ready hai.",
                 geminiApiKey = geminiKey
             )
             return@withContext when (geminiRes) {
                 is GeminiTtsOutcome.Success -> {
-                    if (geminiRes.isRawPcm) {
-                        playPcmDirectSuspend(geminiRes.audioBytes, geminiRes.sampleRate, ++speechGenerationId, {}, {})
-                    } else {
-                        val cacheFile = File(context.cacheDir, "test_gemini_voice_${System.currentTimeMillis()}.${geminiRes.fileExtension}")
-                        cacheFile.writeBytes(geminiRes.audioBytes)
-                        playAudioFileSuspend(cacheFile, ++speechGenerationId, {}, {})
+                    requestSpeechAudioFocus()
+                    try {
+                        if (geminiRes.isRawPcm) {
+                            playPcmDirectSuspend(geminiRes.audioBytes, geminiRes.sampleRate, ++speechGenerationId, {}, {})
+                        } else {
+                            val cacheFile = File(context.cacheDir, "test_gemini_voice_${System.currentTimeMillis()}.${geminiRes.fileExtension}")
+                            cacheFile.writeBytes(geminiRes.audioBytes)
+                            playAudioFileSuspend(cacheFile, ++speechGenerationId, {}, {})
+                        }
+                    } finally {
+                        abandonSpeechAudioFocus()
                     }
                     VoiceTestResult.Success(
                         message = "Gemini Neural Voice (Mahi • ${geminiRes.modelUsed}) verified!",
@@ -174,9 +198,14 @@ class ElevenLabsClient(private val context: Context) {
                 if (response.isSuccessful && response.body != null) {
                     val bytes = response.body!!.bytes()
                     if (bytes.size > 200) {
-                        val cacheFile = File(context.cacheDir, "test_voice_${System.currentTimeMillis()}.mp3")
-                        cacheFile.writeBytes(bytes)
-                        playAudioFileSuspend(cacheFile, ++speechGenerationId, {}, {})
+                        requestSpeechAudioFocus()
+                        try {
+                            val cacheFile = File(context.cacheDir, "test_voice_${System.currentTimeMillis()}.mp3")
+                            cacheFile.writeBytes(bytes)
+                            playAudioFileSuspend(cacheFile, ++speechGenerationId, {}, {})
+                        } finally {
+                            abandonSpeechAudioFocus()
+                        }
                         return@withContext VoiceTestResult.Success(
                             message = "Voice connection verified with Mahi ($cleanVoiceId)!",
                             audioBytes = bytes.size
@@ -220,114 +249,235 @@ class ElevenLabsClient(private val context: Context) {
 
         stopSpeaking()
         val myGenId = ++speechGenerationId
-        val cleanKey = apiKey.trim()
+        val cleanElevenKey = apiKey.trim()
         val targetVoiceId = if (voiceId.isNotBlank()) voiceId.trim() else DEFAULT_MAHI_VOICE_ID
-
-        // 1. ElevenLabs Neural Voice (when ElevenLabs key is configured)
-        if (cleanKey.isNotBlank()) {
-            try {
-                val url = "https://api.elevenlabs.io/v1/text-to-speech/$targetVoiceId?optimize_streaming_latency=3"
-                val jsonPayload = JSONObject().apply {
-                    put("text", cleanText)
-                    put("model_id", if (modelId.isNotBlank()) modelId.trim() else MODEL_ELEVEN_FLASH_V2_5)
-                    put("voice_settings", JSONObject().apply {
-                        put("stability", 0.5)
-                        put("similarity_boost", 0.75)
-                    })
-                }
-
-                val requestBody = jsonPayload.toString().toRequestBody("application/json".toMediaType())
-                val request = Request.Builder()
-                    .url(url)
-                    .addHeader("xi-api-key", cleanKey)
-                    .addHeader("Content-Type", "application/json")
-                    .addHeader("Accept", "audio/mpeg")
-                    .post(requestBody)
-                    .build()
-
-                val audioBytes = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
-                    client.newCall(request).execute().use { response ->
-                        if (response.isSuccessful && response.body != null) {
-                            response.body!!.bytes()
-                        } else {
-                            val code = response.code
-                            if (code == 429 || code >= 500) {
-                                throw java.io.IOException("Transient ElevenLabs HTTP $code")
-                            }
-                            Log.w("ElevenLabsClient", "ElevenLabs failed HTTP $code")
-                            onError?.invoke("ElevenLabs error (HTTP $code)")
-                            null
-                        }
-                    }
-                }
-
-                if (audioBytes != null && audioBytes.size > 200 && myGenId == speechGenerationId) {
-                    val cacheFile = File(context.cacheDir, "myraa_speech_${System.currentTimeMillis()}.mp3")
-                    FileOutputStream(cacheFile).use { it.write(audioBytes) }
-                    playAudioFileSuspend(cacheFile, myGenId, onPlaybackStarted, onPlaybackCompleted)
-                    return@withContext
-                }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                Log.w("ElevenLabsClient", "Error calling ElevenLabs API", e)
-                onError?.invoke(e.localizedMessage ?: "Voice network error")
-            }
-        }
-
-        // 2. Fast Gemini Neural AI TTS (parallel chunked pipeline + direct AudioTrack PCM playback)
         val geminiKey = try {
             securePrefs.getGeminiApiKey().trim()
         } catch (_: Exception) {
             ""
         }
 
-        if (geminiKey.isBlank()) {
-            onError?.invoke("AI Voice requires a Gemini or ElevenLabs API key.")
-            withContext(Dispatchers.Main) { onPlaybackCompleted() }
+        if (cleanElevenKey.isBlank() && geminiKey.isBlank()) {
+            withContext(Dispatchers.Main) {
+                if (onError != null) {
+                    onError.invoke("AI Voice requires a Gemini or ElevenLabs API key.")
+                } else {
+                    onPlaybackCompleted()
+                }
+            }
             return@withContext
         }
 
-        val chunks = splitIntoFastSpeechChunks(cleanText)
         val startNotified = java.util.concurrent.atomic.AtomicBoolean(false)
         fun notifyStartOnce() {
             if (startNotified.compareAndSet(false, true)) {
-                mainHandler.post { if (myGenId == speechGenerationId) onPlaybackStarted() }
+                mainHandler.post {
+                    if (myGenId == speechGenerationId) onPlaybackStarted()
+                }
             }
         }
 
+        val preferredEngine = try {
+            securePrefs.getEffectiveVoiceProvider()
+        } catch (_: Exception) {
+            if (cleanElevenKey.isNotBlank()) SecurePreferences.VOICE_PROVIDER_ELEVENLABS
+            else SecurePreferences.VOICE_PROVIDER_GEMINI
+        }
+
+        requestSpeechAudioFocus()
+        var didInvokeError = false
+
         try {
-            // Launch all chunks in parallel so chunk 2+ synthesizes WHILE chunk 1 is playing!
-            val deferredResults: List<Deferred<GeminiTtsOutcome>> = chunks.map { chunk ->
-                async(Dispatchers.IO) {
-                    val cacheKey = "${GEMINI_VOICE_MAHI}:${chunk.lowercase()}"
-                    val cached = phrasePcmCache[cacheKey]
-                    if (cached != null) {
-                        GeminiTtsOutcome.Success(
-                            audioBytes = cached.pcmBytes,
-                            fileExtension = "pcm",
-                            modelUsed = "cache",
-                            isRawPcm = true,
-                            sampleRate = cached.sampleRate
-                        )
+            val tryOrder: List<String> = when (preferredEngine) {
+                SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> listOfNotNull(
+                    SecurePreferences.VOICE_PROVIDER_ELEVENLABS.takeIf { cleanElevenKey.isNotBlank() },
+                    SecurePreferences.VOICE_PROVIDER_GEMINI.takeIf { geminiKey.isNotBlank() }
+                )
+                else -> listOfNotNull(
+                    SecurePreferences.VOICE_PROVIDER_GEMINI.takeIf { geminiKey.isNotBlank() },
+                    SecurePreferences.VOICE_PROVIDER_ELEVENLABS.takeIf { cleanElevenKey.isNotBlank() }
+                )
+            }
+
+            var lastFailure: String? = null
+            var spokeSuccessfully = false
+
+            for (engine in tryOrder) {
+                if (myGenId != speechGenerationId) break
+                val err = when (engine) {
+                    SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> speakWithElevenLabs(
+                        cleanText = cleanText,
+                        cleanKey = cleanElevenKey,
+                        targetVoiceId = targetVoiceId,
+                        modelId = modelId,
+                        genId = myGenId,
+                        onStarted = { notifyStartOnce() }
+                    )
+                    SecurePreferences.VOICE_PROVIDER_GEMINI -> speakWithGeminiTts(
+                        cleanText = cleanText,
+                        geminiKey = geminiKey,
+                        genId = myGenId,
+                        onStarted = { notifyStartOnce() }
+                    )
+                    else -> "Unsupported voice engine"
+                }
+
+                if (err == null) {
+                    spokeSuccessfully = true
+                    break
+                } else {
+                    lastFailure = err
+                    Log.w("ElevenLabsClient", "Voice engine $engine failed, checking fallback: $err")
+                }
+            }
+
+            if (!spokeSuccessfully && myGenId == speechGenerationId && lastFailure != null) {
+                didInvokeError = true
+                withContext(Dispatchers.Main) {
+                    onError?.invoke(lastFailure)
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            Log.w("ElevenLabsClient", "Voice playback pipeline failed", e)
+            if (myGenId == speechGenerationId) {
+                didInvokeError = true
+                val errMsg = "AI voice error: ${e.localizedMessage ?: "Playback failed"}"
+                withContext(Dispatchers.Main) {
+                    onError?.invoke(errMsg)
+                }
+            }
+        } finally {
+            abandonSpeechAudioFocus()
+            if (!didInvokeError) {
+                withContext(Dispatchers.Main) {
+                    if (myGenId == speechGenerationId) {
+                        onPlaybackCompleted()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Synthesizes & plays speech with ElevenLabs. Returns null on success, or a readable error message.
+     */
+    private suspend fun speakWithElevenLabs(
+        cleanText: String,
+        cleanKey: String,
+        targetVoiceId: String,
+        modelId: String,
+        genId: Long,
+        onStarted: () -> Unit
+    ): String? {
+        if (cleanKey.isBlank()) return "ElevenLabs API key missing."
+        return try {
+            val url = "https://api.elevenlabs.io/v1/text-to-speech/$targetVoiceId?optimize_streaming_latency=3"
+            val jsonPayload = JSONObject().apply {
+                put("text", cleanText)
+                put("model_id", if (modelId.isNotBlank()) modelId.trim() else MODEL_ELEVEN_FLASH_V2_5)
+                put("voice_settings", JSONObject().apply {
+                    put("stability", 0.5)
+                    put("similarity_boost", 0.75)
+                })
+            }
+
+            val requestBody = jsonPayload.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("xi-api-key", cleanKey)
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Accept", "audio/mpeg")
+                .post(requestBody)
+                .build()
+
+            var httpError: String? = null
+            val audioBytes = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful && response.body != null) {
+                        response.body!!.bytes()
                     } else {
-                        synthesizeWithGeminiTts(chunk, geminiKey).also { res ->
-                            if (res is GeminiTtsOutcome.Success && res.isRawPcm && chunk.length <= 140) {
-                                if (phrasePcmCache.size > 24) phrasePcmCache.clear()
-                                phrasePcmCache[cacheKey] = CachedPcmAudio(res.audioBytes, res.sampleRate)
-                            }
+                        val code = response.code
+                        if (code == 429 || code >= 500) {
+                            throw java.io.IOException("Transient ElevenLabs HTTP $code")
                         }
+                        httpError = "ElevenLabs error (HTTP $code)"
+                        null
                     }
                 }
             }
 
-            var playedAnyChunk = false
-            var lastErrorReason: String? = null
+            if (audioBytes != null && audioBytes.size > 200 && genId == speechGenerationId) {
+                val cacheFile = File(context.cacheDir, "myraa_speech_${System.currentTimeMillis()}.mp3")
+                FileOutputStream(cacheFile).use { it.write(audioBytes) }
+                playAudioFileSuspend(cacheFile, genId, onStarted, {})
+                null
+            } else {
+                httpError ?: "ElevenLabs returned empty audio."
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            "ElevenLabs unavailable: ${e.localizedMessage ?: "Network error"}"
+        }
+    }
 
-            for (deferred in deferredResults) {
-                if (myGenId != speechGenerationId) break
-                val outcome = deferred.await()
-                if (myGenId != speechGenerationId) break
+    /**
+     * Synthesizes & plays speech with Gemini Neural Voice using safe sequential prefetch
+     * (starts chunk i+1 right as chunk i begins playback, preventing 429 bursts).
+     * Returns null on success, or a readable error message.
+     */
+    private suspend fun speakWithGeminiTts(
+        cleanText: String,
+        geminiKey: String,
+        genId: Long,
+        onStarted: () -> Unit
+    ): String? {
+        if (geminiKey.isBlank()) return "Gemini API key missing."
+        val chunks = splitIntoFastSpeechChunks(cleanText)
+
+        var playedAnyChunk = false
+        var lastErrorReason: String? = null
+
+        coroutineScope {
+            suspend fun fetchChunk(chunk: String): GeminiTtsOutcome {
+                val cacheKey = "${GEMINI_VOICE_MAHI}:${chunk.lowercase()}"
+                val cached = phrasePcmCache[cacheKey]
+                if (cached != null) {
+                    return GeminiTtsOutcome.Success(
+                        audioBytes = cached.pcmBytes,
+                        fileExtension = "pcm",
+                        modelUsed = "cache",
+                        isRawPcm = true,
+                        sampleRate = cached.sampleRate
+                    )
+                }
+                return synthesizeWithGeminiTts(chunk, geminiKey).also { res ->
+                    if (res is GeminiTtsOutcome.Success && res.isRawPcm && chunk.length <= 170) {
+                        if (phrasePcmCache.size > 24) phrasePcmCache.clear()
+                        phrasePcmCache[cacheKey] = CachedPcmAudio(res.audioBytes, res.sampleRate)
+                    }
+                }
+            }
+
+            var nextDeferred: Deferred<GeminiTtsOutcome>? = null
+
+            for (i in chunks.indices) {
+                if (genId != speechGenerationId) break
+
+                val outcome = if (nextDeferred != null) {
+                    nextDeferred.await().also { nextDeferred = null }
+                } else {
+                    fetchChunk(chunks[i])
+                }
+
+                if (genId != speechGenerationId) break
+
+                if (i + 1 < chunks.size && outcome is GeminiTtsOutcome.Success) {
+                    val nextChunk = chunks[i + 1]
+                    nextDeferred = async(Dispatchers.IO) { fetchChunk(nextChunk) }
+                }
 
                 when (outcome) {
                     is GeminiTtsOutcome.Success -> {
@@ -336,8 +486,8 @@ class ElevenLabsClient(private val context: Context) {
                             playPcmDirectSuspend(
                                 pcmData = outcome.audioBytes,
                                 sampleRate = outcome.sampleRate,
-                                genId = myGenId,
-                                onStart = { notifyStartOnce() },
+                                genId = genId,
+                                onStart = onStarted,
                                 onEnd = {}
                             )
                         } else {
@@ -348,43 +498,34 @@ class ElevenLabsClient(private val context: Context) {
                             FileOutputStream(cacheFile).use { it.write(outcome.audioBytes) }
                             playAudioFileSuspend(
                                 file = cacheFile,
-                                genId = myGenId,
-                                onStart = { notifyStartOnce() },
+                                genId = genId,
+                                onStart = onStarted,
                                 onEnd = {}
                             )
                         }
                     }
                     is GeminiTtsOutcome.Failure -> {
                         lastErrorReason = outcome.reason
-                        Log.w("ElevenLabsClient", "Gemini TTS chunk failed: ${outcome.reason}")
+                        Log.w("ElevenLabsClient", "Gemini TTS chunk $i failed: ${outcome.reason}")
                     }
                 }
             }
+        }
 
-            if (!playedAnyChunk && lastErrorReason != null) {
-                onError?.invoke("Gemini AI voice unavailable: $lastErrorReason")
-            }
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            Log.w("ElevenLabsClient", "Gemini TTS playback pipeline failed", e)
-            onError?.invoke("Gemini AI voice error: ${e.localizedMessage ?: "Playback failed"}")
-        } finally {
-            withContext(Dispatchers.Main) {
-                if (myGenId == speechGenerationId) {
-                    onPlaybackCompleted()
-                }
-            }
+        return if (playedAnyChunk || genId != speechGenerationId) {
+            null
+        } else {
+            "Gemini AI voice unavailable: ${lastErrorReason ?: "Synthesis failed"}"
         }
     }
 
     /**
-     * Splits multi-sentence text into small chunks (<= 110 chars) so the first sentence
-     * reaches AudioTrack immediately while subsequent sentences synthesize in parallel.
+     * Keeps typical replies in a single fast request (<= 140 chars) while splitting longer multi-sentence
+     * answers into clean sentence groups for sequential prefetch pipelining.
      */
     internal fun splitIntoFastSpeechChunks(text: String): List<String> {
         val clean = text.trim()
-        if (clean.length <= 95) return listOf(clean)
+        if (clean.length <= 140) return listOf(clean)
 
         val rawSentences = clean.split(Regex("(?<=[.!?।])\\s+"))
             .map { it.trim() }
@@ -397,7 +538,7 @@ class ElevenLabsClient(private val context: Context) {
         for (sentence in rawSentences) {
             if (current.isEmpty()) {
                 current.append(sentence)
-            } else if (current.length + 1 + sentence.length <= 105) {
+            } else if (current.length + 1 + sentence.length <= 140) {
                 current.append(' ').append(sentence)
             } else {
                 chunks.add(current.toString())
@@ -437,6 +578,7 @@ class ElevenLabsClient(private val context: Context) {
 
         var didDiscovery = !discoveredTtsModelsCache[cleanKey].isNullOrEmpty()
         var lastError = "Gemini TTS synthesis failed."
+        val spokenDirectiveText = "Speak aloud clearly in a warm, natural voice without adding extra words:\n$text"
 
         while (queue.isNotEmpty()) {
             val model = queue.removeFirst()
@@ -449,7 +591,7 @@ class ElevenLabsClient(private val context: Context) {
                         put(JSONObject().apply {
                             put("role", "user")
                             put("parts", JSONArray().apply {
-                                put(JSONObject().put("text", text))
+                                put(JSONObject().put("text", spokenDirectiveText))
                             })
                         })
                     })
@@ -579,7 +721,6 @@ class ElevenLabsClient(private val context: Context) {
                     return GeminiTtsOutcome.Success(rawBytes, "mp3", "", isRawPcm = false)
                 }
                 val sampleRate = Regex("rate=(\\d+)").find(mimeType)?.groupValues?.get(1)?.toIntOrNull() ?: 24000
-                // Keep raw PCM16 for zero-latency direct AudioTrack streaming (no WAV wrapping/disk I/O!)
                 return GeminiTtsOutcome.Success(rawBytes, "pcm", "", isRawPcm = true, sampleRate = sampleRate)
             }
             null
@@ -589,6 +730,40 @@ class ElevenLabsClient(private val context: Context) {
         }
     }
 
+    private fun requestSpeechAudioFocus() {
+        try {
+            val am = audioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(attrs)
+                    .setAcceptsDelayedFocusGain(false)
+                    .build()
+                audioFocusRequest = req
+                am.requestAudioFocus(req)
+            } else {
+                @Suppress("DEPRECATION")
+                am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun abandonSpeechAudioFocus() {
+        try {
+            val am = audioManager ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
+                audioFocusRequest = null
+            } else {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(null)
+            }
+        } catch (_: Exception) {}
+    }
+
     private suspend fun playPcmDirectSuspend(
         pcmData: ByteArray,
         sampleRate: Int,
@@ -596,12 +771,15 @@ class ElevenLabsClient(private val context: Context) {
         onStart: () -> Unit,
         onEnd: () -> Unit
     ) = withContext(Dispatchers.IO) {
-        if (pcmData.isEmpty() || genId != speechGenerationId) {
+        val validLength = pcmData.size and -2
+        if (validLength <= 0 || genId != speechGenerationId) {
             onEnd()
             return@withContext
         }
 
         var track: AudioTrack? = null
+        var fallbackToWav = false
+
         try {
             val minBuf = AudioTrack.getMinBufferSize(
                 sampleRate,
@@ -609,61 +787,61 @@ class ElevenLabsClient(private val context: Context) {
                 AudioFormat.ENCODING_PCM_16BIT
             )
             if (minBuf <= 0) {
-                onEnd()
-                return@withContext
-            }
-            val streamBufSize = maxOf(minBuf * 2, 8192)
+                fallbackToWav = true
+            } else {
+                val streamBufSize = maxOf(minBuf * 2, 16384)
+                track = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(streamBufSize)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
 
-            track = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                        .build()
-                )
-                .setBufferSizeInBytes(streamBufSize)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+                if (track.state != AudioTrack.STATE_INITIALIZED || genId != speechGenerationId) {
+                    fallbackToWav = genId == speechGenerationId
+                } else {
+                    activeAudioTrack = track
+                    val startedAt = System.currentTimeMillis()
+                    onStart()
+                    track.setVolume(1.0f)
+                    track.play()
 
-            if (track.state != AudioTrack.STATE_INITIALIZED || genId != speechGenerationId) {
-                try { track.release() } catch (_: Exception) {}
-                onEnd()
-                return@withContext
-            }
+                    var offset = 0
+                    val writeChunk = 4096
+                    while (offset < validLength && isActive && genId == speechGenerationId) {
+                        val toWrite = minOf(writeChunk, validLength - offset)
+                        val written = track.write(pcmData, offset, toWrite)
+                        if (written <= 0) {
+                            if (offset == 0) fallbackToWav = true
+                            break
+                        }
+                        offset += written
+                    }
 
-            activeAudioTrack = track
-            val startedAt = System.currentTimeMillis()
-            onStart()
-            track.play()
-
-            var offset = 0
-            val writeChunk = 4096
-            while (offset < pcmData.size && isActive && genId == speechGenerationId) {
-                val toWrite = minOf(writeChunk, pcmData.size - offset)
-                val written = track.write(pcmData, offset, toWrite)
-                if (written <= 0) break
-                offset += written
-            }
-
-            if (genId == speechGenerationId && isActive) {
-                val totalAudioMs = (pcmData.size * 1000L) / (sampleRate * 2L)
-                val elapsed = System.currentTimeMillis() - startedAt
-                val remaining = (totalAudioMs - elapsed).coerceAtLeast(0L)
-                if (remaining > 0L) {
-                    delay(remaining + 60L)
+                    if (!fallbackToWav && genId == speechGenerationId && isActive) {
+                        val totalAudioMs = (validLength * 1000L) / (sampleRate * 2L)
+                        val elapsed = System.currentTimeMillis() - startedAt
+                        val remaining = (totalAudioMs - elapsed).coerceAtLeast(0L)
+                        delay(remaining + 180L)
+                    }
                 }
             }
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
-            Log.e("ElevenLabsClient", "AudioTrack playback error", e)
+            Log.e("ElevenLabsClient", "AudioTrack playback error, trying WAV fallback", e)
+            fallbackToWav = genId == speechGenerationId
         } finally {
             try {
                 track?.let {
@@ -674,7 +852,54 @@ class ElevenLabsClient(private val context: Context) {
                 }
             } catch (_: Exception) {}
             if (activeAudioTrack == track) activeAudioTrack = null
-            onEnd()
+        }
+
+        if (fallbackToWav && genId == speechGenerationId) {
+            val wavFile = File(context.cacheDir, "myraa_pcm_fallback_${System.currentTimeMillis()}.wav")
+            try {
+                writePcm16AsWavFile(pcmData, validLength, sampleRate, wavFile)
+                playAudioFileSuspend(wavFile, genId, onStart, onEnd)
+                return@withContext
+            } catch (ce: CancellationException) {
+                try { wavFile.delete() } catch (_: Exception) {}
+                throw ce
+            } catch (e: Exception) {
+                Log.e("ElevenLabsClient", "WAV fallback playback failed", e)
+                try { wavFile.delete() } catch (_: Exception) {}
+            }
+        }
+
+        onEnd()
+    }
+
+    private fun writePcm16AsWavFile(pcmData: ByteArray, dataLength: Int, sampleRate: Int, outFile: File) {
+        val byteRate = sampleRate * 1 * 16 / 8
+        val chunkSize = 36 + dataLength
+        FileOutputStream(outFile).use { out ->
+            fun writeIntLE(v: Int) {
+                out.write(v and 0xFF)
+                out.write((v shr 8) and 0xFF)
+                out.write((v shr 16) and 0xFF)
+                out.write((v shr 24) and 0xFF)
+            }
+            fun writeShortLE(v: Int) {
+                out.write(v and 0xFF)
+                out.write((v shr 8) and 0xFF)
+            }
+            out.write("RIFF".toByteArray(Charsets.US_ASCII))
+            writeIntLE(chunkSize)
+            out.write("WAVE".toByteArray(Charsets.US_ASCII))
+            out.write("fmt ".toByteArray(Charsets.US_ASCII))
+            writeIntLE(16)
+            writeShortLE(1)
+            writeShortLE(1)
+            writeIntLE(sampleRate)
+            writeIntLE(byteRate)
+            writeShortLE(2)
+            writeShortLE(16)
+            out.write("data".toByteArray(Charsets.US_ASCII))
+            writeIntLE(dataLength)
+            out.write(pcmData, 0, dataLength)
         }
     }
 
@@ -684,6 +909,12 @@ class ElevenLabsClient(private val context: Context) {
         onStart: () -> Unit,
         onEnd: () -> Unit
     ) = suspendCancellableCoroutine<Unit> { cont ->
+        cont.invokeOnCancellation {
+            mainHandler.post {
+                releaseMediaPlayerOnly()
+                try { file.delete() } catch (_: Exception) {}
+            }
+        }
         mainHandler.post {
             if (genId != speechGenerationId) {
                 try { file.delete() } catch (_: Exception) {}
@@ -782,6 +1013,7 @@ class ElevenLabsClient(private val context: Context) {
             Log.e("ElevenLabsClient", "Error stopping AudioTrack", e)
         }
         activeAudioTrack = null
+        abandonSpeechAudioFocus()
     }
 
     fun shutdown() {

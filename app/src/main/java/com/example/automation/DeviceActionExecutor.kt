@@ -752,15 +752,32 @@ class DeviceActionExecutor(private val context: Context) {
                 spokenFeedback = "Screen click ke liye Accessibility Service enable karein."
             )
 
-        val elements = accessibility.getVisibleScreenElements()
-        val match = elements.firstOrNull { it.text.contains(target, ignoreCase = true) }
+        if (com.example.service.DigitalMouseService.instance == null && Settings.canDrawOverlays(context)) {
+            com.example.service.DigitalMouseService.start(context)
+        }
 
+        val match = accessibility.findBestClickableElement(target)
         return if (match != null) {
-            val x = match.bounds.centerX().toFloat()
-            val y = match.bounds.centerY().toFloat()
-            com.example.service.DigitalMouseService.instance?.animateClick(x, y)
-                ?: accessibility.dispatchClickAt(x, y)
-            ExecutionResult(true, "SCREEN_CLICK", target, "Digital mouse clicked on \"${match.text}\" at ($x, $y)", "\"${match.text}\" par tap kar diya hai.")
+            val (x, y) = accessibility.clampToScreen(
+                match.bounds.exactCenterX(),
+                match.bounds.exactCenterY()
+            )
+            val mouse = com.example.service.DigitalMouseService.instance
+            if (mouse != null) {
+                mouse.animateClick(x, y)
+            } else {
+                val dispatched = accessibility.dispatchClickAt(x, y)
+                if (!dispatched) {
+                    accessibility.clickByText(target)
+                }
+            }
+            ExecutionResult(
+                success = true,
+                actionType = "SCREEN_CLICK",
+                target = target,
+                details = "Digital mouse clicked on \"${match.text}\" at (${x.toInt()}, ${y.toInt()})",
+                spokenFeedback = "\"${match.text}\" par tap kar diya hai."
+            )
         } else {
             val clicked = accessibility.clickByText(target)
             ExecutionResult(
@@ -783,8 +800,16 @@ class DeviceActionExecutor(private val context: Context) {
                 spokenFeedback = "Screen typing ke liye Accessibility Service enable karein."
             )
 
-        com.example.service.DigitalMouseService.instance?.animateTyping(textToType)
-            ?: accessibility.typeTextIntoFocused(textToType)
+        if (com.example.service.DigitalMouseService.instance == null && Settings.canDrawOverlays(context)) {
+            com.example.service.DigitalMouseService.start(context)
+        }
+
+        val mouse = com.example.service.DigitalMouseService.instance
+        if (mouse != null) {
+            mouse.animateTyping(textToType)
+        } else {
+            accessibility.typeTextIntoFocused(textToType)
+        }
 
         return ExecutionResult(true, "SCREEN_TYPE", textToType, "AI Virtual Keyboard typed \"$textToType\" into screen field", "\"$textToType\" type kar diya hai.")
     }

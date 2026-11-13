@@ -78,8 +78,8 @@ class DigitalMouseService : Service() {
         }
 
         mouseParams = WindowManager.LayoutParams(
-            160,
-            160,
+            180,
+            180,
             layoutType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -88,6 +88,11 @@ class DigitalMouseService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
             x = 300
             y = 500
         }
@@ -97,6 +102,21 @@ class DigitalMouseService : Service() {
             windowManager?.addView(mouseOverlayView, mouseParams)
         } catch (e: Exception) {
             Log.e("DigitalMouseService", "Failed adding mouse overlay view", e)
+        }
+    }
+
+    private fun computeWindowOriginOffset(overlay: View, params: WindowManager.LayoutParams): Pair<Float, Float> {
+        return try {
+            if (!overlay.isAttachedToWindow) return 0f to 0f
+            val loc = IntArray(2)
+            overlay.getLocationOnScreen(loc)
+            if (loc[0] == 0 && loc[1] == 0 && (params.x != 0 || params.y != 0)) {
+                0f to 0f
+            } else {
+                (loc[0] - params.x).toFloat() to (loc[1] - params.y).toFloat()
+            }
+        } catch (_: Exception) {
+            0f to 0f
         }
     }
 
@@ -158,15 +178,19 @@ class DigitalMouseService : Service() {
                 } ?: onFinished()
                 return@post
             }
+
+            val (offsetX, offsetY) = computeWindowOriginOffset(overlay, params)
+            val destParamX = targetX - DigitalMouseView.TIP_OFFSET_PX - offsetX
+            val destParamY = targetY - DigitalMouseView.TIP_OFFSET_PX - offsetY
             val currentX = params.x.toFloat()
             val currentY = params.y.toFloat()
 
             val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 400
+                duration = 380
                 addUpdateListener { va ->
                     val progress = va.animatedFraction
-                    params.x = (currentX + (targetX - currentX) * progress).toInt()
-                    params.y = (currentY + (targetY - currentY) * progress).toInt()
+                    params.x = (currentX + (destParamX - currentX) * progress).toInt()
+                    params.y = (currentY + (destParamY - currentY) * progress).toInt()
                     try {
                         windowManager?.updateViewLayout(overlay, params)
                     } catch (_: Exception) {}
@@ -175,9 +199,14 @@ class DigitalMouseService : Service() {
 
             animator.addListener(object : android.animation.AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: android.animation.Animator) {
+                    params.x = destParamX.toInt()
+                    params.y = destParamY.toInt()
+                    try {
+                        windowManager?.updateViewLayout(overlay, params)
+                    } catch (_: Exception) {}
                     overlay.triggerRipple()
                     MyraaAccessibilityService.instance?.dispatchClickAt(targetX, targetY) {
-                        mainHandler.postDelayed({ onFinished() }, 200)
+                        mainHandler.postDelayed({ onFinished() }, 180)
                     } ?: onFinished()
                 }
             })
@@ -230,18 +259,24 @@ class DigitalMouseService : Service() {
                 return@post
             }
 
-            params.x = startX.toInt()
-            params.y = startY.toInt()
+            val (offsetX, offsetY) = computeWindowOriginOffset(overlay, params)
+            val startParamX = startX - DigitalMouseView.TIP_OFFSET_PX - offsetX
+            val startParamY = startY - DigitalMouseView.TIP_OFFSET_PX - offsetY
+            val endParamX = endX - DigitalMouseView.TIP_OFFSET_PX - offsetX
+            val endParamY = endY - DigitalMouseView.TIP_OFFSET_PX - offsetY
+
+            params.x = startParamX.toInt()
+            params.y = startParamY.toInt()
             try {
                 windowManager?.updateViewLayout(overlay, params)
             } catch (_: Exception) {}
 
             val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 500
+                duration = 420
                 addUpdateListener { va ->
                     val progress = va.animatedFraction
-                    params.x = (startX + (endX - startX) * progress).toInt()
-                    params.y = (startY + (endY - startY) * progress).toInt()
+                    params.x = (startParamX + (endParamX - startParamX) * progress).toInt()
+                    params.y = (startParamY + (endParamY - startParamY) * progress).toInt()
                     try {
                         windowManager?.updateViewLayout(overlay, params)
                     } catch (_: Exception) {}
@@ -328,8 +363,12 @@ class DigitalMouseService : Service() {
     }
 }
 
-// Glowing Cyber Arrow & Tap Ripple Cursor View
+// Glowing Cyber Arrow & Tap Ripple Cursor View (tip aligned cleanly inside bounds so ripple never clips)
 class DigitalMouseView(context: Context) : View(context) {
+
+    companion object {
+        const val TIP_OFFSET_PX = 48f
+    }
 
     private val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFF00E5FF.toInt()
@@ -353,18 +392,18 @@ class DigitalMouseView(context: Context) : View(context) {
     private var rippleAlpha = 0
 
     private val cursorPath = Path().apply {
-        moveTo(0f, 0f)
-        lineTo(40f, 26f)
-        lineTo(24f, 28f)
-        lineTo(32f, 48f)
-        lineTo(22f, 52f)
-        lineTo(14f, 32f)
-        lineTo(0f, 42f)
+        moveTo(TIP_OFFSET_PX, TIP_OFFSET_PX)
+        lineTo(TIP_OFFSET_PX + 42f, TIP_OFFSET_PX + 28f)
+        lineTo(TIP_OFFSET_PX + 25f, TIP_OFFSET_PX + 30f)
+        lineTo(TIP_OFFSET_PX + 34f, TIP_OFFSET_PX + 50f)
+        lineTo(TIP_OFFSET_PX + 23f, TIP_OFFSET_PX + 55f)
+        lineTo(TIP_OFFSET_PX + 14f, TIP_OFFSET_PX + 34f)
+        lineTo(TIP_OFFSET_PX, TIP_OFFSET_PX + 44f)
         close()
     }
 
     fun triggerRipple() {
-        val anim = ValueAnimator.ofFloat(0f, 50f).apply {
+        val anim = ValueAnimator.ofFloat(0f, 44f).apply {
             duration = 350
             addUpdateListener { va ->
                 rippleRadius = va.animatedValue as Float
@@ -377,12 +416,10 @@ class DigitalMouseView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        // Draw ripple click wave
         if (rippleRadius > 0f && rippleAlpha > 0) {
             ripplePaint.alpha = rippleAlpha
-            canvas.drawCircle(0f, 0f, rippleRadius, ripplePaint)
+            canvas.drawCircle(TIP_OFFSET_PX, TIP_OFFSET_PX, rippleRadius, ripplePaint)
         }
-        // Draw cyber mouse cursor
         canvas.drawPath(cursorPath, cursorPaint)
         canvas.drawPath(cursorPath, borderPaint)
     }

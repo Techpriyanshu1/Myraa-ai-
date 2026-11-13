@@ -135,10 +135,20 @@ class VoiceRecognitionManager(
     }
 
     fun setCompanionState(state: CompanionState) {
+        if (state == CompanionState.THINKING || state == CompanionState.TALKING) {
+            stopCaptureLoop()
+        }
         _companionState.value = state
-        if (state == CompanionState.IDLE || state == CompanionState.ERROR) {
+        if (state == CompanionState.IDLE || state == CompanionState.ERROR || state == CompanionState.THINKING || state == CompanionState.TALKING) {
             _rmsLevel.value = 0f
         }
+    }
+
+    fun suspendListeningForProcessing(state: CompanionState) {
+        forceFinishUtterance = false
+        stopCaptureLoop()
+        _rmsLevel.value = 0f
+        _companionState.value = state
     }
 
     fun resumeListeningAfterSpeech() {
