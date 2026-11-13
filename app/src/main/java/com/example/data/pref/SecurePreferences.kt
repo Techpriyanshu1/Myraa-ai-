@@ -68,13 +68,27 @@ class SecurePreferences(private val context: Context) {
     }
 
     fun getSelectedVoiceId(): String {
-        return prefs.getString("selected_voice_id", VOICE_MAHI) ?: VOICE_MAHI
+        val encrypted = prefs.getString("selected_voice_id_vault", "") ?: ""
+        if (encrypted.isNotBlank()) {
+            val decrypted = keystoreVault.decrypt(encrypted).trim()
+            if (decrypted.isNotBlank()) return decrypted
+        }
+        val legacy = prefs.getString("selected_voice_id", "")?.trim() ?: ""
+        if (legacy.isNotBlank()) {
+            setSelectedVoiceId(legacy)
+            return legacy
+        }
+        return VOICE_MAHI
     }
 
     fun setSelectedVoiceId(voiceId: String) {
         val trimmed = voiceId.trim()
         val effective = if (trimmed.isNotBlank()) trimmed else VOICE_MAHI
-        prefs.edit().putString("selected_voice_id", effective).apply()
+        val encrypted = keystoreVault.encrypt(effective)
+        prefs.edit()
+            .putString("selected_voice_id_vault", encrypted)
+            .remove("selected_voice_id")
+            .apply()
     }
 
     fun getSelectedVoiceModel(): String {
@@ -178,7 +192,8 @@ class SecurePreferences(private val context: Context) {
     fun deleteVoiceCredentials() {
         prefs.edit()
             .remove("voice_api_key_vault")
-            .putString("selected_voice_id", VOICE_MAHI)
+            .remove("selected_voice_id_vault")
+            .remove("selected_voice_id")
             .apply()
     }
 
@@ -186,7 +201,8 @@ class SecurePreferences(private val context: Context) {
         prefs.edit()
             .remove("gemini_api_key_vault")
             .remove("voice_api_key_vault")
-            .putString("selected_voice_id", VOICE_MAHI)
+            .remove("selected_voice_id_vault")
+            .remove("selected_voice_id")
             .apply()
     }
 }

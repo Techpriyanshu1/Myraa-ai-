@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -15,11 +16,14 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import androidx.core.content.IntentCompat
 import com.example.MainActivity
 import com.example.R
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +35,14 @@ class RealScreenCaptureService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            stopProjection()
+            stopSelf()
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -50,18 +62,30 @@ class RealScreenCaptureService : Service() {
         }
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-        val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        val resultData = IntentCompat.getParcelableExtra(intent, EXTRA_RESULT_DATA, Intent::class.java)
 
         if (resultCode == Activity.RESULT_OK && resultData != null) {
-            startForeground(NOTIFICATION_ID, buildNotification("Myraa AI is sharing your screen"))
+            val notification = buildNotification("MYRAA AI is sharing your screen")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
 
             val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
+            mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)?.also { projection ->
+                // Android 14+ requires registering callback before creating VirtualDisplay
+                projection.registerCallback(projectionCallback, mainHandler)
+            }
 
             startVirtualDisplay()
             _isSharingActive.value = true
             DigitalMouseService.start(this)
-            Log.i("RealScreenCapture", "Real Android MediaProjection Screen Sharing active")
+            Log.i("RealScreenCapture", "Android MediaProjection Screen Sharing active")
         } else {
             stopSelf()
         }
@@ -71,25 +95,28 @@ class RealScreenCaptureService : Service() {
 
     private fun startVirtualDisplay() {
         val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
-        windowManager.defaultDisplay.getRealMetrics(metrics)
-
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val density = metrics.densityDpi
+        val (width, height, density) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            val dpi = resources.displayMetrics.densityDpi
+            Triple(bounds.width().coerceAtLeast(1), bounds.height().coerceAtLeast(1), dpi)
+        } else {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(metrics)
+            Triple(metrics.widthPixels.coerceAtLeast(1), metrics.heightPixels.coerceAtLeast(1), metrics.densityDpi)
+        }
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         imageReader?.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage()
-            // Real screen frames captured for AI vision analysis
             image?.close()
-        }, null)
+        }, mainHandler)
 
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "MyraaRealScreenShare",
             width, height, density,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader?.surface, null, null
+            imageReader?.surface, null, mainHandler
         )
     }
 
@@ -99,6 +126,7 @@ class RealScreenCaptureService : Service() {
             virtualDisplay = null
             imageReader?.close()
             imageReader = null
+            mediaProjection?.unregisterCallback(projectionCallback)
             mediaProjection?.stop()
             mediaProjection = null
         } catch (e: Exception) {
@@ -109,6 +137,7 @@ class RealScreenCaptureService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        mainHandler.removeCallbacksAndMessages(null)
         stopProjection()
     }
 
@@ -116,10 +145,10 @@ class RealScreenCaptureService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Myraa Screen Sharing Service",
+                "MYRAA Screen Sharing Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Real-time screen share with Myraa AI assistant"
+                description = "Real-time screen share with MYRAA AI assistant"
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
@@ -134,7 +163,7 @@ class RealScreenCaptureService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("🔴 Myraa AI • Live Screen Share")
+            .setContentTitle("MYRAA AI • Screen Share Active")
             .setContentText(text)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)

@@ -3,7 +3,6 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Normal permissions -->
-    <uses-permission android:name="android.intent.action.CALL" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
@@ -75,7 +74,11 @@
         <service
             android:name=".service.MyraaOverlayService"
             android:foregroundServiceType="specialUse"
-            android:exported="false" />
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating MYRAA AI voice assistant overlay orb" />
+        </service>
 
         <!-- Continuous Voice Microphone Foreground Service -->
         <service

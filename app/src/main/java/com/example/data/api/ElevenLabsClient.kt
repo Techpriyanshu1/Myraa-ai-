@@ -300,15 +300,15 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
             val containsHindi = text.any { it in '\u0900'..'\u097F' } || isLikelyHindiText(text)
             try {
                 if (containsHindi) {
-                    val hiLocale = Locale("hi", "IN")
+                    val hiLocale = Locale.forLanguageTag("hi-IN")
                     val avail = localTts?.isLanguageAvailable(hiLocale) ?: TextToSpeech.LANG_NOT_SUPPORTED
                     if (avail >= TextToSpeech.LANG_AVAILABLE) {
                         localTts?.language = hiLocale
                     } else {
-                        localTts?.language = Locale("en", "IN")
+                        localTts?.language = Locale.forLanguageTag("en-IN")
                     }
                 } else {
-                    localTts?.language = Locale("en", "IN")
+                    localTts?.language = Locale.forLanguageTag("en-IN")
                 }
                 localTts?.setPitch(1.05f)
                 localTts?.setSpeechRate(speechSpeed)
@@ -347,6 +347,7 @@ class ElevenLabsClient(private val context: Context) : TextToSpeech.OnInitListen
     }
 
     fun stopSpeaking() {
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             activeMediaPlayer?.let {
                 if (it.isPlaying) it.stop()

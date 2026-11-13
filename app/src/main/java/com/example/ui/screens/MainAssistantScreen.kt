@@ -43,7 +43,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ListAlt
+import androidx.compose.material.icons.automirrored.filled.ScreenShare
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.StopScreenShare
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Mic
@@ -51,9 +53,7 @@ import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PowerSettingsNew
-import androidx.compose.material.icons.filled.ScreenShare
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.StopScreenShare
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -704,7 +704,7 @@ fun MainAssistantScreen(
                         modifier = Modifier.testTag("screen_share_toggle_button")
                     ) {
                         Icon(
-                            imageVector = if (isRealScreenSharing) Icons.Default.StopScreenShare else Icons.Default.ScreenShare,
+                            imageVector = if (isRealScreenSharing) Icons.AutoMirrored.Filled.StopScreenShare else Icons.AutoMirrored.Filled.ScreenShare,
                             contentDescription = "Screen Share",
                             tint = if (isRealScreenSharing) AuroraPink else CyanPrimary
                         )

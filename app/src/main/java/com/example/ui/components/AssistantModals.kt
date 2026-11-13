@@ -18,9 +18,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Launch
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Launch
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Star
@@ -300,7 +300,7 @@ fun InstalledAppsDialog(
                                         modifier = Modifier.testTag("launch_app_${app.packageName}")
                                     ) {
                                         Icon(
-                                            imageVector = Icons.Default.Launch,
+                                            imageVector = Icons.AutoMirrored.Filled.Launch,
                                             contentDescription = "Launch ${app.label}",
                                             tint = CyanPrimary
                                         )

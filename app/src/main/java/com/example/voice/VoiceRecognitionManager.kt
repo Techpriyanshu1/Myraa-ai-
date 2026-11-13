@@ -128,6 +128,7 @@ class VoiceRecognitionManager(
             return
         }
 
+        mainHandler.removeCallbacksAndMessages(null)
         mainHandler.post {
             try {
                 // Cancel pending recognition session to avoid ERROR_RECOGNIZER_BUSY (code 8)
@@ -180,7 +181,7 @@ class VoiceRecognitionManager(
 
                 // If continuous mode is on, attempt retry or trigger system prompt
                 mainHandler.postDelayed({
-                    if (isSessionActive && _companionState.value != CompanionState.TALKING) {
+                    if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
                         restartListeningInternal()
                     }
                 }, 700)
@@ -215,10 +216,25 @@ class VoiceRecognitionManager(
 
     override fun onError(error: Int) {
         Log.d("VoiceRecognition", "onError code: $error")
+        if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+            isSessionActive = false
+            isPaused = false
+            mainHandler.removeCallbacksAndMessages(null)
+            try {
+                speechRecognizer?.cancel()
+                speechRecognizer?.destroy()
+            } catch (ignored: Exception) {}
+            speechRecognizer = null
+            _rmsLevel.value = 0f
+            _errorMessage.value = "Microphone permission is required for voice recognition."
+            _companionState.value = CompanionState.ERROR
+            return
+        }
+
         // If recognizer is busy or client failed, recreate it
-        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || 
-            error == SpeechRecognizer.ERROR_CLIENT || 
-            error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+            error == SpeechRecognizer.ERROR_CLIENT ||
+            error == SpeechRecognizer.ERROR_AUDIO) {
             try {
                 speechRecognizer?.cancel()
                 speechRecognizer?.destroy()
@@ -226,13 +242,15 @@ class VoiceRecognitionManager(
             speechRecognizer = null
         }
 
-        // On no-match or timeout, seamlessly continue listening without bothering user
+        // On no-match or timeout, seamlessly continue listening without stacking retries
         if (isSessionActive && !isPaused) {
+            val retryDelayMs = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_AUDIO) 850L else 400L
+            mainHandler.removeCallbacksAndMessages(null)
             mainHandler.postDelayed({
                 if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
                     restartListeningInternal()
                 }
-            }, 350)
+            }, retryDelayMs)
         }
     }
 
