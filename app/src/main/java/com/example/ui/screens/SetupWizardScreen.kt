@@ -152,10 +152,16 @@ fun SetupWizardScreen(
         isMicPermissionGranted = granted
     }
 
-    // Refresh permission statuses on resume
+    // Refresh permission statuses on resume & clean up TTS/player on exit
     LaunchedEffect(Unit) {
         isAccessibilityGranted = MyraaAccessibilityService.isRunning()
         isOverlayPermissionGranted = Settings.canDrawOverlays(context)
+    }
+
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            elevenLabsClient.shutdown()
+        }
     }
 
     Scaffold(

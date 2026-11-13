@@ -69,7 +69,7 @@ class DeviceActionExecutor(private val context: Context) {
         }
     }
 
-    suspend fun launchSpecificPackage(packageName: String, label: String): ExecutionResult = withContext(Dispatchers.Main) {
+    suspend fun launchSpecificPackage(packageName: String, label: String): ExecutionResult = withContext(Dispatchers.IO) {
         val startMs = System.currentTimeMillis()
         val result = try {
             val intent = context.packageManager.getLaunchIntentForPackage(packageName)?.apply {
@@ -124,7 +124,7 @@ class DeviceActionExecutor(private val context: Context) {
     suspend fun executeCommand(
         command: ParsedCommand,
         confirmationStatus: String = "AUTO_APPROVED"
-    ): ExecutionResult = withContext(Dispatchers.Main) {
+    ): ExecutionResult = withContext(Dispatchers.IO) {
         val startMs = System.currentTimeMillis()
         val normalizedAction = command.actionType.uppercase()
         val result = when (normalizedAction) {
