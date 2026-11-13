@@ -18,7 +18,8 @@ enum class CompanionState {
     IDLE,
     LISTENING,
     THINKING,
-    TALKING
+    TALKING,
+    ERROR
 }
 
 class VoiceRecognitionManager(
@@ -29,6 +30,8 @@ class VoiceRecognitionManager(
 
     private var speechRecognizer: SpeechRecognizer? = null
     var isSessionActive = false
+        private set
+    var isPaused = false
         private set
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -50,12 +53,37 @@ class VoiceRecognitionManager(
 
     fun startContinuousListening() {
         isSessionActive = true
+        isPaused = false
+        _errorMessage.value = null
+        restartListeningInternal()
+    }
+
+    fun pauseListening() {
+        isPaused = true
+        mainHandler.removeCallbacksAndMessages(null)
+        try {
+            speechRecognizer?.stopListening()
+            speechRecognizer?.cancel()
+        } catch (e: Exception) {
+            Log.e("VoiceRecognition", "Error pausing recognizer", e)
+        }
+        _companionState.value = CompanionState.IDLE
+        _rmsLevel.value = 0f
+    }
+
+    fun resumeListening() {
+        if (!isSessionActive) {
+            startContinuousListening()
+            return
+        }
+        isPaused = false
         _errorMessage.value = null
         restartListeningInternal()
     }
 
     fun stopContinuousListening() {
         isSessionActive = false
+        isPaused = false
         mainHandler.removeCallbacksAndMessages(null)
         try {
             speechRecognizer?.stopListening()
@@ -71,16 +99,19 @@ class VoiceRecognitionManager(
 
     fun setCompanionState(state: CompanionState) {
         _companionState.value = state
-        if (state == CompanionState.IDLE) {
+        if (state == CompanionState.IDLE || state == CompanionState.ERROR) {
             _rmsLevel.value = 0f
         }
     }
 
     // Called as soon as Myraa completes speaking to immediately resume listening for next command!
     fun resumeListeningAfterSpeech() {
-        if (!isSessionActive) return
+        if (!isSessionActive || isPaused) {
+            _companionState.value = CompanionState.IDLE
+            return
+        }
         mainHandler.postDelayed({
-            if (isSessionActive) {
+            if (isSessionActive && !isPaused) {
                 _companionState.value = CompanionState.LISTENING
                 restartListeningInternal()
             }
@@ -88,7 +119,7 @@ class VoiceRecognitionManager(
     }
 
     fun restartListeningInternal() {
-        if (!isSessionActive) return
+        if (!isSessionActive || isPaused) return
 
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             Log.w("VoiceRecognition", "Speech recognition service not available on device, triggering fallback")
@@ -196,9 +227,9 @@ class VoiceRecognitionManager(
         }
 
         // On no-match or timeout, seamlessly continue listening without bothering user
-        if (isSessionActive) {
+        if (isSessionActive && !isPaused) {
             mainHandler.postDelayed({
-                if (isSessionActive && _companionState.value != CompanionState.TALKING) {
+                if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
                     restartListeningInternal()
                 }
             }, 350)
@@ -213,7 +244,7 @@ class VoiceRecognitionManager(
             _companionState.value = CompanionState.THINKING
             onCommandReceived(text)
         } else {
-            if (isSessionActive && _companionState.value != CompanionState.TALKING) {
+            if (isSessionActive && !isPaused && _companionState.value != CompanionState.TALKING) {
                 restartListeningInternal()
             }
         }

@@ -4,7 +4,9 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.util.Log
@@ -16,6 +18,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -42,12 +45,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Mouse
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.ScreenShare
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.StopScreenShare
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -56,6 +63,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -64,6 +72,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -84,13 +93,24 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.agents.AgentFleetManager
+import com.example.automation.ActionSecurityPolicy
 import com.example.automation.DeviceActionExecutor
+import com.example.automation.ExecutionResult
+import com.example.automation.LaunchableAppInfo
 import com.example.data.api.ElevenLabsClient
 import com.example.data.api.GeminiClient
+import com.example.data.api.ParsedCommand
 import com.example.data.pref.SecurePreferences
+import com.example.service.ContinuousVoiceService
 import com.example.service.MyraaOverlayService
 import com.example.service.RealScreenCaptureService
+import com.example.ui.components.ActionConfirmationDialog
+import com.example.ui.components.AgentStatusGrid
+import com.example.ui.components.AnimatedAiOrb
 import com.example.ui.components.AuroraWaveGlow
+import com.example.ui.components.InstalledAppsDialog
+import com.example.ui.components.PendingConfirmationAction
 import com.example.ui.components.VideoAvatarPlayer
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.AuroraPink
@@ -112,6 +132,7 @@ import kotlinx.coroutines.launch
 fun MainAssistantScreen(
     onNavigateToLogs: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToAgentFleet: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -121,12 +142,17 @@ fun MainAssistantScreen(
     val geminiClient = remember { GeminiClient() }
     val elevenLabsClient = remember { ElevenLabsClient(context) }
     val actionExecutor = remember { DeviceActionExecutor(context) }
+    val fleetManager = remember { AgentFleetManager.getInstance(context, prefs) }
+
+    val agentReports by fleetManager.agentReports.collectAsState()
+    val fleetOverallStatus by fleetManager.fleetOverallStatus.collectAsState()
 
     val projectionManager = remember {
         context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
     }
 
     val isRealScreenSharing by RealScreenCaptureService.isSharingActive.collectAsState()
+    val servicePaused by ContinuousVoiceService.isPaused.collectAsState()
 
     val screenShareLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -137,17 +163,246 @@ fun MainAssistantScreen(
     }
 
     var isSessionActive by remember { mutableStateOf(false) }
+    var isListeningPaused by remember { mutableStateOf(false) }
     var textInput by remember { mutableStateOf("") }
     var currentSpeechTranscript by remember { mutableStateOf("") }
     var currentAiReply by remember {
-        mutableStateOf("Namaste Master! Main Myraa hoon, aapki sweet anime AI companion. Aap mujhse Hindi ya English me baat kar sakte hain ya phone control karne ko keh sakte hain!")
+        mutableStateOf("Namaste! Main MYRAA AI hoon. Start AI dabakar mujhse Hindi, Hinglish ya English me baat karein ya phone actions bolein.")
     }
     var lastExecutedAction by remember { mutableStateOf<String?>(null) }
-    var selectedLanguageMode by remember { mutableStateOf("auto") } // "auto", "hi-IN", "en-US"
+    var lastActionSuccess by remember { mutableStateOf(true) }
+    var selectedLanguageMode by remember { mutableStateOf(prefs.getPreferredLanguage()) }
+
+    var showAppsDialog by remember { mutableStateOf(false) }
+    var launchableApps by remember { mutableStateOf<List<LaunchableAppInfo>>(emptyList()) }
+    var pendingConfirmation by remember { mutableStateOf<PendingConfirmationAction?>(null) }
 
     lateinit var voiceManagerRef: VoiceRecognitionManager
 
-    // Fallback system speech dialog launcher (guarantees voice input works on all devices and emulators)
+    fun speakMahiResponse(text: String) {
+        coroutineScope.launch {
+            voiceManagerRef.setCompanionState(CompanionState.TALKING)
+            elevenLabsClient.speakText(
+                text = text,
+                apiKey = prefs.getVoiceApiKey(),
+                voiceId = prefs.getSelectedVoiceId(),
+                modelId = prefs.getSelectedVoiceModel(),
+                allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
+                speechSpeed = prefs.getSpeechSpeed(),
+                onPlaybackStarted = {
+                    voiceManagerRef.setCompanionState(CompanionState.TALKING)
+                },
+                onPlaybackCompleted = {
+                    if (isSessionActive && !isListeningPaused) {
+                        voiceManagerRef.resumeListeningAfterSpeech()
+                    } else {
+                        voiceManagerRef.setCompanionState(CompanionState.IDLE)
+                    }
+                },
+                onError = { err ->
+                    fleetManager.recordAgentError("mahi_voice_output", err)
+                    if (isSessionActive && !isListeningPaused) {
+                        voiceManagerRef.resumeListeningAfterSpeech()
+                    } else {
+                        voiceManagerRef.setCompanionState(CompanionState.IDLE)
+                    }
+                }
+            )
+        }
+    }
+
+    fun startMyraaSession() {
+        isSessionActive = true
+        isListeningPaused = false
+        coroutineScope.launch {
+            val summary = fleetManager.initializeAndStartEligibleAgents()
+            voiceManagerRef.startContinuousListening()
+            ContinuousVoiceService.start(context)
+            if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(context)) {
+                MyraaOverlayService.start(context)
+            }
+
+            val greeting = if (summary.unavailableAgents.isEmpty()) {
+                "Namaste! MYRAA AI ke sabhi ${summary.totalAgents} agents active hain. Boliye main aapki kya madad karu?"
+            } else {
+                "MYRAA AI active hai (${summary.activeAgents.size}/${summary.totalAgents} agents). Boliye main aapki kya madad kar sakti hoon?"
+            }
+            currentAiReply = if (summary.unavailableAgents.isEmpty()) {
+                greeting
+            } else {
+                "$greeting\n(${summary.buildConciseSummary()})"
+            }
+            speakMahiResponse(greeting)
+        }
+    }
+
+    fun stopMyraaSession() {
+        isSessionActive = false
+        isListeningPaused = false
+        voiceManagerRef.stopContinuousListening()
+        elevenLabsClient.stopSpeaking()
+        ContinuousVoiceService.stop(context)
+        MyraaOverlayService.stop(context)
+        coroutineScope.launch {
+            fleetManager.stopAllAgents()
+        }
+    }
+
+    fun pauseListeningSession() {
+        if (!isSessionActive) return
+        isListeningPaused = true
+        voiceManagerRef.pauseListening()
+        ContinuousVoiceService.pause(context)
+    }
+
+    fun resumeListeningSession() {
+        if (!isSessionActive) {
+            startMyraaSession()
+            return
+        }
+        isListeningPaused = false
+        voiceManagerRef.resumeListening()
+        ContinuousVoiceService.resume(context)
+    }
+
+    LaunchedEffect(servicePaused, isSessionActive) {
+        if (isSessionActive && servicePaused != isListeningPaused) {
+            isListeningPaused = servicePaused
+            if (servicePaused) voiceManagerRef.pauseListening() else voiceManagerRef.resumeListening()
+        }
+    }
+
+    // Steps 9–11 of Pipeline: Execute validated action, speak actual result via Mahi, log locally
+    fun executeValidatedAndRespond(parsed: ParsedCommand) {
+        coroutineScope.launch {
+            when (parsed.actionType.uppercase()) {
+                "PAUSE_LISTENING" -> {
+                    val res = actionExecutor.executeCommand(parsed)
+                    lastExecutedAction = res.actionType
+                    lastActionSuccess = res.success
+                    currentAiReply = parsed.spokenResponse
+                    pauseListeningSession()
+                    speakMahiResponse(parsed.spokenResponse)
+                    return@launch
+                }
+                "RESUME_LISTENING" -> {
+                    val res = actionExecutor.executeCommand(parsed)
+                    lastExecutedAction = res.actionType
+                    lastActionSuccess = res.success
+                    currentAiReply = parsed.spokenResponse
+                    resumeListeningSession()
+                    speakMahiResponse(parsed.spokenResponse)
+                    return@launch
+                }
+                "STOP_AI" -> {
+                    actionExecutor.executeCommand(parsed)
+                    lastExecutedAction = "STOP_AI"
+                    lastActionSuccess = true
+                    currentAiReply = parsed.spokenResponse
+                    voiceManagerRef.setCompanionState(CompanionState.TALKING)
+                    elevenLabsClient.speakText(
+                        text = parsed.spokenResponse,
+                        apiKey = prefs.getVoiceApiKey(),
+                        voiceId = prefs.getSelectedVoiceId(),
+                        modelId = prefs.getSelectedVoiceModel(),
+                        allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
+                        speechSpeed = prefs.getSpeechSpeed(),
+                        onPlaybackCompleted = { stopMyraaSession() }
+                    )
+                    return@launch
+                }
+                "LIST_APPS" -> {
+                    val res = actionExecutor.executeCommand(parsed)
+                    launchableApps = actionExecutor.getInstalledLaunchableApps()
+                    showAppsDialog = true
+                    lastExecutedAction = res.actionType
+                    lastActionSuccess = res.success
+                    currentAiReply = parsed.spokenResponse
+                    speakMahiResponse(parsed.spokenResponse)
+                    return@launch
+                }
+                "SHOW_HISTORY" -> {
+                    actionExecutor.executeCommand(parsed)
+                    lastExecutedAction = "SHOW_HISTORY"
+                    lastActionSuccess = true
+                    onNavigateToLogs()
+                    return@launch
+                }
+            }
+
+            // Standard Device / App / Settings / Accessibility / Chat execution
+            val result: ExecutionResult = actionExecutor.executeCommand(parsed)
+            lastExecutedAction = result.actionType
+            lastActionSuccess = result.success
+
+            val finalSpeech = when {
+                !result.success -> result.spokenFeedback ?: result.details
+                !result.spokenFeedback.isNullOrBlank() && parsed.actionType != "CHAT" -> result.spokenFeedback
+                else -> parsed.spokenResponse
+            }
+            currentAiReply = finalSpeech
+            if (!result.success) {
+                voiceManagerRef.setCompanionState(CompanionState.ERROR)
+            }
+            speakMahiResponse(finalSpeech)
+        }
+    }
+
+    // Full 11-Step Intelligent Action Pipeline
+    fun processCommand(commandText: String) {
+        val trimmed = commandText.trim()
+        if (trimmed.isBlank()) return
+        currentSpeechTranscript = trimmed
+
+        coroutineScope.launch {
+            try {
+                // Step 3 & 4: Gemini Structured JSON Parsing
+                voiceManagerRef.setCompanionState(CompanionState.THINKING)
+                val apiKey = prefs.getGeminiApiKey()
+                val model = prefs.getSelectedGeminiModel()
+                val parsed = geminiClient.interpretCommand(trimmed, apiKey, model)
+
+                // Step 5, 6 & 7: Allowlist & Risk Validation
+                val validation = ActionSecurityPolicy.validate(parsed)
+                if (!validation.allowed) {
+                    val rejectMsg = validation.rejectionReason ?: "Security policy blocked this action."
+                    actionExecutor.logPipelineOutcome(
+                        rawPrompt = trimmed,
+                        actionType = "BLOCKED",
+                        target = parsed.target,
+                        status = "BLOCKED",
+                        spokenResponse = rejectMsg,
+                        details = rejectMsg
+                    )
+                    lastExecutedAction = "BLOCKED"
+                    lastActionSuccess = false
+                    currentAiReply = rejectMsg
+                    voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                    speakMahiResponse("Suraksha kaaran se yeh action block kiya gaya hai.")
+                    return@launch
+                }
+
+                // Step 8: Ask explicit confirmation for sensitive / HIGH-risk actions
+                if (validation.requiresConfirmation) {
+                    pendingConfirmation = PendingConfirmationAction(parsed, validation)
+                    voiceManagerRef.setCompanionState(CompanionState.IDLE)
+                    return@launch
+                }
+
+                // Steps 9–11: Execute, speak actual outcome, and persist locally
+                executeValidatedAndRespond(parsed)
+            } catch (e: Exception) {
+                Log.e("MainAssistantScreen", "Error in 11-step command pipeline", e)
+                fleetManager.recordAgentError("gemini_intelligence", e.localizedMessage ?: "Pipeline error")
+                voiceManagerRef.setCompanionState(CompanionState.ERROR)
+                currentAiReply = "Command process karne me error aaya: ${e.localizedMessage}"
+                if (isSessionActive && !isListeningPaused) {
+                    voiceManagerRef.resumeListeningAfterSpeech()
+                }
+            }
+        }
+    }
+
     val systemVoiceLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -155,42 +410,7 @@ fun MainAssistantScreen(
             val matches = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
             val recognizedText = matches?.firstOrNull()?.trim()
             if (!recognizedText.isNullOrBlank()) {
-                currentSpeechTranscript = recognizedText
-                // Trigger command processing
-                voiceManagerRef.setCompanionState(CompanionState.THINKING)
-                coroutineScope.launch {
-                    try {
-                        val apiKey = prefs.getGeminiApiKey()
-                        val parsed = geminiClient.interpretCommand(recognizedText, apiKey)
-                        currentAiReply = parsed.spokenResponse
-                        lastExecutedAction = parsed.actionType
-
-                        actionExecutor.executeCommand(parsed)
-
-                        voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                        elevenLabsClient.speakText(
-                            text = parsed.spokenResponse,
-                            apiKey = prefs.getVoiceApiKey(),
-                            voiceId = prefs.getSelectedVoiceId(),
-                            modelId = prefs.getSelectedVoiceModel(),
-                            allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
-                            speechSpeed = prefs.getSpeechSpeed(),
-                            onPlaybackStarted = {
-                                voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                            },
-                            onPlaybackCompleted = {
-                                if (isSessionActive) {
-                                    voiceManagerRef.resumeListeningAfterSpeech()
-                                } else {
-                                    voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                                }
-                            }
-                        )
-                    } catch (e: Exception) {
-                        Log.e("MainAssistantScreen", "Error in fallback speech processing", e)
-                        voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                    }
-                }
+                processCommand(recognizedText)
             }
         }
     }
@@ -199,7 +419,7 @@ fun MainAssistantScreen(
         try {
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PROMPT, "Boliye Master! Speak now in Hindi or English...")
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak in Hindi, Hinglish, or English...")
                 when (selectedLanguageMode) {
                     "hi-IN" -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
                     "en-US" -> putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
@@ -215,63 +435,11 @@ fun MainAssistantScreen(
         }
     }
 
-    fun processCommand(commandText: String) {
-        val trimmed = commandText.trim()
-        if (trimmed.isBlank()) return
-        currentSpeechTranscript = trimmed
-
-        coroutineScope.launch {
-            try {
-                voiceManagerRef.setCompanionState(CompanionState.THINKING)
-                val apiKey = prefs.getGeminiApiKey()
-                val parsed = geminiClient.interpretCommand(trimmed, apiKey)
-                currentAiReply = parsed.spokenResponse
-                lastExecutedAction = parsed.actionType
-
-                // Execute device action or screen action
-                actionExecutor.executeCommand(parsed)
-
-                // Speak response via configured Mahi voice
-                voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                elevenLabsClient.speakText(
-                    text = parsed.spokenResponse,
-                    apiKey = prefs.getVoiceApiKey(),
-                    voiceId = prefs.getSelectedVoiceId(),
-                    modelId = prefs.getSelectedVoiceModel(),
-                    allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
-                    speechSpeed = prefs.getSpeechSpeed(),
-                    onPlaybackStarted = {
-                        voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                    },
-                    onPlaybackCompleted = {
-                        // Resilient continuous loop: immediately resume listening after speech!
-                        if (isSessionActive) {
-                            voiceManagerRef.resumeListeningAfterSpeech()
-                        } else {
-                            voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                        }
-                    }
-                )
-            } catch (e: Exception) {
-                Log.e("MainAssistantScreen", "Error during command processing", e)
-                if (isSessionActive) {
-                    voiceManagerRef.resumeListeningAfterSpeech()
-                } else {
-                    voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                }
-            }
-        }
-    }
-
     val voiceManager = remember {
         VoiceRecognitionManager(
             context = context,
-            onFallbackIntentNeeded = {
-                launchSystemVoiceDialog()
-            },
-            onCommandReceived = { recognizedText ->
-                processCommand(recognizedText)
-            }
+            onFallbackIntentNeeded = { launchSystemVoiceDialog() },
+            onCommandReceived = { recognizedText -> processCommand(recognizedText) }
         ).also {
             voiceManagerRef = it
             it.languageMode = selectedLanguageMode
@@ -286,25 +454,10 @@ fun MainAssistantScreen(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            isSessionActive = true
-            voiceManager.startContinuousListening()
-            if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(context)) {
-                MyraaOverlayService.start(context)
-            }
-            coroutineScope.launch {
-                voiceManager.setCompanionState(CompanionState.TALKING)
-                elevenLabsClient.speakText(
-                    text = "Namaste Master! Myraa active hai aur poore dhyan se aapki baat sun rahi hai. Boliye main aapki kya madad karu?",
-                    apiKey = prefs.getVoiceApiKey(),
-                    voiceId = prefs.getSelectedVoiceId(),
-                    modelId = prefs.getSelectedVoiceModel(),
-                    allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
-                    speechSpeed = prefs.getSpeechSpeed(),
-                    onPlaybackCompleted = {
-                        if (isSessionActive) voiceManager.resumeListeningAfterSpeech()
-                    }
-                )
-            }
+            startMyraaSession()
+        } else {
+            fleetManager.refreshFleetStatus()
+            currentAiReply = "Voice control ke liye Microphone permission zaroori hai. Permission Center me jakar enable karein."
         }
     }
 
@@ -312,9 +465,58 @@ fun MainAssistantScreen(
         onDispose {
             voiceManager.destroy()
             elevenLabsClient.shutdown()
-            com.example.service.ContinuousVoiceService.stop(context)
+            ContinuousVoiceService.stop(context)
             RealScreenCaptureService.stop(context)
         }
+    }
+
+    // Confirmation modal for HIGH-risk / sensitive actions
+    pendingConfirmation?.let { pending ->
+        ActionConfirmationDialog(
+            pending = pending,
+            onConfirm = {
+                pendingConfirmation = null
+                executeValidatedAndRespond(pending.command)
+            },
+            onCancel = {
+                pendingConfirmation = null
+                coroutineScope.launch {
+                    actionExecutor.logPipelineOutcome(
+                        rawPrompt = pending.command.rawPrompt,
+                        actionType = pending.command.actionType,
+                        target = pending.command.target,
+                        status = "CANCELLED",
+                        spokenResponse = "Action cancelled by user.",
+                        details = "User declined confirmation for ${pending.command.actionType}"
+                    )
+                }
+                val cancelMsg = "Theek hai, yeh action cancel kar diya hai."
+                currentAiReply = cancelMsg
+                speakMahiResponse(cancelMsg)
+            }
+        )
+    }
+
+    // Installed Apps Launcher Drawer/Dialog
+    if (showAppsDialog) {
+        InstalledAppsDialog(
+            apps = launchableApps,
+            onLaunchApp = { app ->
+                showAppsDialog = false
+                coroutineScope.launch {
+                    val result = actionExecutor.launchSpecificPackage(app.packageName, app.label)
+                    lastExecutedAction = result.actionType
+                    lastActionSuccess = result.success
+                    currentAiReply = result.spokenFeedback ?: result.details
+                    speakMahiResponse(currentAiReply)
+                }
+            },
+            onToggleSelectApp = { app ->
+                prefs.toggleSelectedApp(app.packageName)
+                launchableApps = actionExecutor.getInstalledLaunchableApps()
+            },
+            onDismiss = { showAppsDialog = false }
+        )
     }
 
     Scaffold(
@@ -327,33 +529,61 @@ fun MainAssistantScreen(
                             modifier = Modifier
                                 .size(10.dp)
                                 .clip(CircleShape)
-                                .background(if (isSessionActive) AuroraEmerald else CyanPrimary)
+                                .background(
+                                    when {
+                                        isSessionActive && !isListeningPaused -> AuroraEmerald
+                                        isSessionActive && isListeningPaused -> AuroraPink
+                                        else -> CyanPrimary
+                                    }
+                                )
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Myraa AI",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = TextPrimary
-                        )
+                        Column {
+                            Text(
+                                text = "MYRAA AI",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = when {
+                                    isSessionActive && isListeningPaused -> "Listening Paused"
+                                    isSessionActive -> "Active • Mahi Voice"
+                                    else -> "Standby Ready"
+                                },
+                                fontSize = 10.sp,
+                                color = TextSecondary
+                            )
+                        }
                     }
                 },
                 actions = {
-                    // Real MediaProjection Screen Share Button
+                    IconButton(
+                        onClick = {
+                            launchableApps = actionExecutor.getInstalledLaunchableApps()
+                            showAppsDialog = true
+                        },
+                        modifier = Modifier.testTag("open_apps_browser_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Apps,
+                            contentDescription = "Installed Apps",
+                            tint = CyanPrimary
+                        )
+                    }
                     IconButton(
                         onClick = {
                             if (isRealScreenSharing) {
                                 RealScreenCaptureService.stop(context)
-                            } else {
-                                if (!Settings.canDrawOverlays(context)) {
-                                    val intent = Intent(
+                            } else if (!Settings.canDrawOverlays(context)) {
+                                context.startActivity(
+                                    Intent(
                                         Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                        android.net.Uri.parse("package:${context.packageName}")
+                                        Uri.parse("package:${context.packageName}")
                                     )
-                                    context.startActivity(intent)
-                                } else {
-                                    screenShareLauncher.launch(projectionManager.createScreenCaptureIntent())
-                                }
+                                )
+                            } else {
+                                screenShareLauncher.launch(projectionManager.createScreenCaptureIntent())
                             }
                         },
                         modifier = Modifier.testTag("screen_share_toggle_button")
@@ -364,29 +594,17 @@ fun MainAssistantScreen(
                             tint = if (isRealScreenSharing) AuroraPink else CyanPrimary
                         )
                     }
-
-                    // Logs Navigation
                     IconButton(
                         onClick = onNavigateToLogs,
                         modifier = Modifier.testTag("nav_to_logs_button")
                     ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ListAlt,
-                            contentDescription = "Logs",
-                            tint = TextSecondary
-                        )
+                        Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = "Activity History", tint = TextSecondary)
                     }
-
-                    // Settings Navigation
                     IconButton(
                         onClick = onNavigateToSettings,
                         modifier = Modifier.testTag("nav_to_settings_button")
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Settings,
-                            contentDescription = "Settings",
-                            tint = TextSecondary
-                        )
+                        Icon(Icons.Default.Settings, contentDescription = "Settings", tint = TextSecondary)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = DarkBackground)
@@ -394,7 +612,7 @@ fun MainAssistantScreen(
         },
         bottomBar = {
             AuroraWaveGlow(
-                isActive = isSessionActive,
+                isActive = isSessionActive && !isListeningPaused,
                 rmsLevel = rmsLevel,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -417,7 +635,6 @@ fun MainAssistantScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                // Language Selection Chips
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -429,8 +646,9 @@ fun MainAssistantScreen(
                         onClick = {
                             selectedLanguageMode = "auto"
                             voiceManager.languageMode = "auto"
+                            prefs.setPreferredLanguage("auto")
                         },
-                        label = { Text("🌐 Auto (Hinglish)", fontSize = 11.sp) },
+                        label = { Text("Auto (Hinglish)", fontSize = 11.sp) },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = CyanPrimary.copy(alpha = 0.25f),
                             selectedLabelColor = CyanPrimary
@@ -442,8 +660,9 @@ fun MainAssistantScreen(
                         onClick = {
                             selectedLanguageMode = "hi-IN"
                             voiceManager.languageMode = "hi-IN"
+                            prefs.setPreferredLanguage("hi-IN")
                         },
-                        label = { Text("🇮🇳 Hindi", fontSize = 11.sp) },
+                        label = { Text("Hindi", fontSize = 11.sp) },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = AuroraEmerald.copy(alpha = 0.25f),
                             selectedLabelColor = AuroraEmerald
@@ -455,8 +674,9 @@ fun MainAssistantScreen(
                         onClick = {
                             selectedLanguageMode = "en-US"
                             voiceManager.languageMode = "en-US"
+                            prefs.setPreferredLanguage("en-US")
                         },
-                        label = { Text("🇺🇸 English", fontSize = 11.sp) },
+                        label = { Text("English", fontSize = 11.sp) },
                         colors = FilterChipDefaults.filterChipColors(
                             selectedContainerColor = VioletSecondary.copy(alpha = 0.25f),
                             selectedLabelColor = VioletSecondary
@@ -464,7 +684,6 @@ fun MainAssistantScreen(
                     )
                 }
 
-                // Real Screen Share Active Banner
                 if (isRealScreenSharing) {
                     Box(
                         modifier = Modifier
@@ -478,15 +697,10 @@ fun MainAssistantScreen(
                             horizontalArrangement = Arrangement.Center,
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Mouse,
-                                contentDescription = null,
-                                tint = AuroraPink,
-                                modifier = Modifier.size(16.dp)
-                            )
+                            Icon(Icons.Default.Mouse, contentDescription = null, tint = AuroraPink, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "REAL SCREEN SHARE ACTIVE • AI CONTROLLING PHONE",
+                                text = "SCREEN SHARE ACTIVE",
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
@@ -496,9 +710,7 @@ fun MainAssistantScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                 }
 
-                // Animated Avatar / Orb Display Toggle
-                var displayModeOrb by remember { mutableStateOf(false) }
-
+                var displayModeOrb by remember { mutableStateOf(true) }
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -511,9 +723,10 @@ fun MainAssistantScreen(
                             .background(DarkSurfaceElevated)
                             .clickable { displayModeOrb = !displayModeOrb }
                             .padding(horizontal = 10.dp, vertical = 4.dp)
+                            .testTag("toggle_orb_avatar_button")
                     ) {
                         Text(
-                            text = if (displayModeOrb) "Switch to Anime Character" else "Switch to AI Orb",
+                            text = if (displayModeOrb) "Switch to Avatar" else "Switch to AI Orb",
                             color = CyanPrimary,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
@@ -525,17 +738,16 @@ fun MainAssistantScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(280.dp),
+                            .height(250.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        com.example.ui.components.AnimatedAiOrb(
+                        AnimatedAiOrb(
                             companionState = companionState,
                             rmsLevel = rmsLevel,
-                            size = 240.dp
+                            size = 220.dp
                         )
                     }
                 } else {
-                    // BIG ANIMATION CHARACTER DISPLAY WITH NO BORDER
                     VideoAvatarPlayer(
                         companionState = companionState,
                         isScreenShareActive = isRealScreenSharing,
@@ -545,7 +757,6 @@ fun MainAssistantScreen(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Dialogue Transcript Card
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = DarkSurface),
@@ -557,21 +768,10 @@ fun MainAssistantScreen(
                             currentSpeechTranscript.isNotBlank() -> currentSpeechTranscript
                             else -> null
                         }
-
                         if (displayPrompt != null) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = "You: ",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = CyanPrimary,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = "\"$displayPrompt\"",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = TextPrimary,
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                Text("You: ", style = MaterialTheme.typography.bodyMedium, color = CyanPrimary, fontWeight = FontWeight.Bold)
+                                Text("\"$displayPrompt\"", style = MaterialTheme.typography.bodyMedium, color = TextPrimary, fontWeight = FontWeight.SemiBold)
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                         }
@@ -583,7 +783,7 @@ fun MainAssistantScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "Myraa (Mahi Voice):",
+                                    text = "MYRAA (Mahi Voice):",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = AuroraPink,
                                     fontWeight = FontWeight.Bold
@@ -596,27 +796,11 @@ fun MainAssistantScreen(
                                     fontWeight = FontWeight.Medium
                                 )
                             }
-
-                            // Replay audio button
                             IconButton(
-                                onClick = {
-                                    coroutineScope.launch {
-                                        voiceManagerRef.setCompanionState(CompanionState.TALKING)
-                                        elevenLabsClient.speakText(
-                                            text = currentAiReply,
-                                            apiKey = prefs.getVoiceApiKey(),
-                                            voiceId = prefs.getSelectedVoiceId(),
-                                            modelId = prefs.getSelectedVoiceModel(),
-                                            allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
-                                            speechSpeed = prefs.getSpeechSpeed(),
-                                            onPlaybackCompleted = {
-                                                if (isSessionActive) voiceManagerRef.resumeListeningAfterSpeech()
-                                                else voiceManagerRef.setCompanionState(CompanionState.IDLE)
-                                            }
-                                        )
-                                    }
-                                },
-                                modifier = Modifier.size(36.dp)
+                                onClick = { coroutineScope.launch { speakMahiResponse(currentAiReply) } },
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .testTag("replay_voice_button")
                             ) {
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.VolumeUp,
@@ -629,15 +813,16 @@ fun MainAssistantScreen(
 
                         if (!lastExecutedAction.isNullOrBlank() && lastExecutedAction != "CHAT") {
                             Spacer(modifier = Modifier.height(6.dp))
+                            val badgeColor = if (lastActionSuccess) AuroraEmerald else DangerRed
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(8.dp))
-                                    .background(AuroraEmerald.copy(alpha = 0.2f))
+                                    .background(badgeColor.copy(alpha = 0.2f))
                                     .padding(horizontal = 8.dp, vertical = 4.dp)
                             ) {
                                 Text(
-                                    text = "⚡ Action Executed: $lastExecutedAction",
-                                    color = AuroraEmerald,
+                                    text = if (lastActionSuccess) "Executed: $lastExecutedAction" else "Action Blocked/Failed: $lastExecutedAction",
+                                    color = badgeColor,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold
                                 )
@@ -648,7 +833,6 @@ fun MainAssistantScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Quick Prompt Suggestion Chips for Fast Testing
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -656,16 +840,15 @@ fun MainAssistantScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     val quickPrompts = listOf(
-                        "👋 Namaste Myraa!" to "Namaste Myraa, kaise ho aap?",
-                        "😂 Chutkula sunao" to "Mujhe ek funny chutkula sunao",
-                        "❤️ I love you" to "I love you Myraa, kya tum meri girlfriend banogi?",
-                        "🔦 Torch jalao" to "Torch jalao",
-                        "📱 YouTube open karo" to "Open YouTube",
-                        "🎵 Gaana gao" to "Koi pyara sa gaana gao",
-                        "🖱️ Screen share" to "Screen share chalao",
-                        "🔊 Awaaz badhao" to "Awaaz badhao"
+                        "Open YouTube" to "Hey Myraa, open YouTube",
+                        "Open Calculator" to "Myraa, open calculator",
+                        "Bluetooth Settings" to "Open Bluetooth settings",
+                        "Launch Camera" to "Launch camera",
+                        "Open Clock" to "Open clock",
+                        "Apps List" to "Show apps",
+                        "Torch ON" to "Torch jalao",
+                        "Volume UP" to "Awaaz badhao"
                     )
-
                     quickPrompts.forEach { (label, command) ->
                         Box(
                             modifier = Modifier
@@ -674,54 +857,42 @@ fun MainAssistantScreen(
                                 .clickable { processCommand(command) }
                                 .padding(horizontal = 12.dp, vertical = 6.dp)
                         ) {
-                            Text(
-                                text = label,
-                                color = CyanPrimary,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
+                            Text(text = label, color = CyanPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Active Sub-Agent Fleet Status
-                com.example.ui.components.AgentStatusGrid(
-                    isAccessibilityGranted = com.example.service.MyraaAccessibilityService.isRunning(),
-                    hasGeminiKey = prefs.getGeminiApiKey().isNotBlank(),
-                    isVoiceSessionActive = isSessionActive,
+                AgentStatusGrid(
+                    agentReports = agentReports,
+                    overallStatus = fleetOverallStatus,
+                    onOpenFleet = onNavigateToAgentFleet,
                     modifier = Modifier.fillMaxWidth()
                 )
             }
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Bottom Section: Keyboard Input, Mic Button, and Glowing START/STOP Button
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(bottom = 10.dp)
             ) {
-                // Keyboard Text Input Field with Mic Button & Send Button
                 OutlinedTextField(
                     value = textInput,
                     onValueChange = { textInput = it },
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("command_keyboard_input"),
-                    placeholder = { Text("Hindi ya English me likhiye ya boliye...", fontSize = 13.sp) },
+                    placeholder = { Text("Hindi, Hinglish ya English me command likhein...", fontSize = 13.sp) },
                     leadingIcon = {
                         IconButton(
                             onClick = { launchSystemVoiceDialog() },
                             modifier = Modifier.testTag("quick_mic_button")
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Mic,
-                                contentDescription = "Voice Input",
-                                tint = AuroraEmerald
-                            )
+                            Icon(Icons.Default.Mic, contentDescription = "Voice Input", tint = AuroraEmerald)
                         }
                     },
                     trailingIcon = {
@@ -736,11 +907,7 @@ fun MainAssistantScreen(
                             },
                             modifier = Modifier.testTag("send_command_button")
                         ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "Send",
-                                tint = CyanPrimary
-                            )
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = CyanPrimary)
                         }
                     },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
@@ -768,87 +935,103 @@ fun MainAssistantScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Giant Glowing Cyberpunk START / STOP Button
-                val pulseTransition = rememberInfiniteTransition(label = "pulse_button")
-                val pulseScale by pulseTransition.animateFloat(
-                    initialValue = 1f,
-                    targetValue = if (isSessionActive) 1.07f else 1f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(1200, easing = FastOutSlowInEasing),
-                        repeatMode = RepeatMode.Reverse
-                    ),
-                    label = "pulse_scale"
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    val pulseTransition = rememberInfiniteTransition(label = "pulse_button")
+                    val pulseScale by pulseTransition.animateFloat(
+                        initialValue = 1f,
+                        targetValue = if (isSessionActive && !isListeningPaused) 1.07f else 1f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(1200, easing = FastOutSlowInEasing),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "pulse_scale"
+                    )
 
-                Box(
-                    modifier = Modifier
-                        .scale(pulseScale)
-                        .size(76.dp)
-                        .clip(CircleShape)
-                        .background(
-                            Brush.radialGradient(
-                                colors = if (isSessionActive) {
-                                    listOf(DangerRed, DangerRed.copy(alpha = 0.6f))
-                                } else {
-                                    listOf(CyanPrimary, VioletSecondary)
-                                }
+                    Box(
+                        modifier = Modifier
+                            .scale(pulseScale)
+                            .size(72.dp)
+                            .clip(CircleShape)
+                            .background(
+                                Brush.radialGradient(
+                                    colors = if (isSessionActive) {
+                                        listOf(DangerRed, DangerRed.copy(alpha = 0.6f))
+                                    } else {
+                                        listOf(CyanPrimary, VioletSecondary)
+                                    }
+                                )
                             )
-                        )
-                        .clickable {
-                            if (isSessionActive) {
-                                isSessionActive = false
-                                voiceManager.stopContinuousListening()
-                                elevenLabsClient.stopSpeaking()
-                                com.example.service.ContinuousVoiceService.stop(context)
-                                MyraaOverlayService.stop(context)
-                            } else {
-                                val hasMic = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                                        android.content.pm.PackageManager.PERMISSION_GRANTED
-                                if (hasMic) {
-                                    isSessionActive = true
-                                    voiceManager.startContinuousListening()
-                                    com.example.service.ContinuousVoiceService.start(context)
-                                    if (prefs.isOverlayEnabled() && Settings.canDrawOverlays(context)) {
-                                        MyraaOverlayService.start(context)
-                                    }
-                                    coroutineScope.launch {
-                                        voiceManager.setCompanionState(CompanionState.TALKING)
-                                        elevenLabsClient.speakText(
-                                            text = "Namaste Master! Myraa active hai aur sun rahi hai. Boliye kya hukum hai?",
-                                            apiKey = prefs.getVoiceApiKey(),
-                                            voiceId = prefs.getSelectedVoiceId(),
-                                            modelId = prefs.getSelectedVoiceModel(),
-                                            allowNativeFallback = prefs.isNativeTtsFallbackEnabled(),
-                                            speechSpeed = prefs.getSpeechSpeed(),
-                                            onPlaybackCompleted = {
-                                                if (isSessionActive) voiceManager.resumeListeningAfterSpeech()
-                                            }
-                                        )
-                                    }
+                            .clickable {
+                                if (isSessionActive) {
+                                    stopMyraaSession()
                                 } else {
-                                    micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    val hasMic = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                                        PackageManager.PERMISSION_GRANTED
+                                    if (hasMic) {
+                                        startMyraaSession()
+                                    } else {
+                                        micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
                                 }
                             }
+                            .testTag("main_start_stop_button"),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isSessionActive) Icons.Default.PowerSettingsNew else Icons.Default.Mic,
+                            contentDescription = if (isSessionActive) "Stop AI" else "Start AI",
+                            tint = Color.White,
+                            modifier = Modifier.size(34.dp)
+                        )
+                    }
+
+                    if (isSessionActive) {
+                        OutlinedButton(
+                            onClick = {
+                                if (isListeningPaused) resumeListeningSession() else pauseListeningSession()
+                            },
+                            border = BorderStroke(1.dp, if (isListeningPaused) AuroraEmerald else AuroraPink),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = DarkSurfaceElevated
+                            ),
+                            modifier = Modifier.testTag("pause_resume_listening_button")
+                        ) {
+                            Icon(
+                                imageVector = if (isListeningPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                contentDescription = if (isListeningPaused) "Resume Listening" else "Pause Listening",
+                                tint = if (isListeningPaused) AuroraEmerald else AuroraPink,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isListeningPaused) "RESUME LISTENING" else "PAUSE LISTENING",
+                                color = if (isListeningPaused) AuroraEmerald else AuroraPink,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
-                        .testTag("main_start_stop_button"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = if (isSessionActive) Icons.Default.PowerSettingsNew else Icons.Default.Mic,
-                        contentDescription = if (isSessionActive) "Stop" else "Start",
-                        tint = Color.White,
-                        modifier = Modifier.size(36.dp)
-                    )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(6.dp))
 
                 Text(
-                    text = if (isSessionActive) "LISTENING CONTINUOUSLY • TAP TO STOP" else "TAP TO START MYRAA (CONTINUOUS VOICE)",
+                    text = when {
+                        isSessionActive && isListeningPaused -> "LISTENING PAUSED • TAP RESUME OR STOP AI"
+                        isSessionActive -> "AI ACTIVE & LISTENING • TAP RED BUTTON TO STOP AI"
+                        else -> "TAP TO START AI (INITIALIZE AGENTS & VOICE)"
+                    },
                     style = MaterialTheme.typography.labelSmall,
-                    color = if (isSessionActive) DangerRed else CyanPrimary,
+                    color = when {
+                        isSessionActive && isListeningPaused -> AuroraPink
+                        isSessionActive -> DangerRed
+                        else -> CyanPrimary
+                    },
                     fontWeight = FontWeight.ExtraBold,
-                    letterSpacing = 0.8.sp,
+                    letterSpacing = 0.7.sp,
                     textAlign = TextAlign.Center
                 )
             }

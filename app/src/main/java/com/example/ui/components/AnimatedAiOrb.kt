@@ -274,6 +274,45 @@ fun AnimatedAiOrb(
                         style = Stroke(width = 2.5.dp.toPx())
                     )
                 }
+
+                CompanionState.ERROR -> {
+                    val currentRadius = baseRadius * (0.95f + 0.08f * ringPhase)
+
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                DangerRed.copy(alpha = 0.45f),
+                                AuroraPink.copy(alpha = 0.15f),
+                                Color.Transparent
+                            ),
+                            center = center,
+                            radius = currentRadius * 1.55f
+                        ),
+                        radius = currentRadius * 1.55f,
+                        center = center
+                    )
+
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = 0.85f),
+                                DangerRed,
+                                Color(0xFF7F1D1D)
+                            ),
+                            center = center,
+                            radius = currentRadius
+                        ),
+                        radius = currentRadius,
+                        center = center
+                    )
+
+                    drawCircle(
+                        color = DangerRed.copy(alpha = 0.8f),
+                        radius = currentRadius * 1.12f,
+                        center = center,
+                        style = Stroke(width = 2.5.dp.toPx())
+                    )
+                }
             }
         }
     }

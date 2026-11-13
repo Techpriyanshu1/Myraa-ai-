@@ -16,10 +16,13 @@ import java.util.concurrent.TimeUnit
 
 data class ParsedCommand(
     val spokenResponse: String,
-    val actionType: String, // "SCREEN_CLICK", "SCREEN_TYPE", "OPEN_APP", "FLASHLIGHT", "VOLUME", "ACCESSIBILITY", "CHAT"
+    val actionType: String, // Allowlisted action e.g. OPEN_APP, OPEN_SETTINGS, OPEN_CAMERA, OPEN_CALCULATOR, OPEN_CLOCK, CHAT
     val target: String,
     val extraData: String = "",
-    val rawPrompt: String
+    val rawPrompt: String,
+    val intent: String = "conversation",
+    val riskLevel: String = "LOW",
+    val requiresConfirmation: Boolean = false
 )
 
 sealed class ConnectionTestResult {
@@ -30,8 +33,8 @@ sealed class ConnectionTestResult {
 class GeminiClient {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(9, TimeUnit.SECONDS)
+        .connectTimeout(7, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
         .build()
 
     companion object {
@@ -51,7 +54,7 @@ class GeminiClient {
         }
 
         val targetModel = if (selectedModel.isNotBlank()) selectedModel.trim() else "gemini-flash-latest"
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$targetModel:generateContent?key=$cleanKey"
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$targetModel:generateContent"
 
         try {
             val testPayload = JSONObject().apply {
@@ -59,7 +62,7 @@ class GeminiClient {
                     put(JSONObject().apply {
                         put("role", "user")
                         put("parts", JSONArray().apply {
-                            put(JSONObject().put("text", "Hello, reply with only the word OK."))
+                            put(JSONObject().put("text", "Reply with only OK."))
                         })
                     })
                 })
@@ -111,40 +114,45 @@ class GeminiClient {
                 spokenResponse = "Main sun rahi hoon! Boliye, main aapki kya madad kar sakti hoon?",
                 actionType = "CHAT",
                 target = "",
-                rawPrompt = prompt
+                rawPrompt = prompt,
+                intent = "greeting"
             )
         }
 
-        // 1. Direct device actions reflex (flashlight, volume, navigation, apps)
-        val deviceAction = parseDeviceHardwareReflex(trimmed)
-        if (deviceAction != null) {
-            return@withContext deviceAction
-        }
+        // Normalize wake-words: "Hey Myraa, open YouTube" -> "open YouTube"
+        val normalized = stripWakeWords(trimmed)
+
+        // 1. Direct deterministic reflexes (voice controls, settings, hardware, camera, calculator, clock, apps)
+        parseDeviceHardwareReflex(normalized, trimmed)?.let { return@withContext it }
 
         // 2. Direct screen actions reflex (digital mouse clicks, virtual typing)
-        val screenAction = parseScreenActionReflex(trimmed)
-        if (screenAction != null) {
-            return@withContext screenAction
-        }
+        parseScreenActionReflex(normalized, trimmed)?.let { return@withContext it }
 
-        // 3. True Conversational AI via Gemini with Mahi Persona
+        // 3. Structured JSON Intelligence via Gemini with Mahi Persona
         val cleanKey = apiKey.trim()
         if (cleanKey.isNotBlank()) {
             val candidateModels = listOf(preferredModel) + AVAILABLE_MODELS.filter { it != preferredModel }
 
             for (model in candidateModels.distinct()) {
                 try {
-                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$cleanKey"
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
 
                     val systemPrompt = """
-                        You are Myraa, an intelligent, respectful, friendly, and calm personal AI assistant speaking with the warm voice of Mahi.
-                        You have a natural Indian conversational style.
-                        IMPORTANT PERSONALITY & LANGUAGE INSTRUCTIONS:
-                        - If the user speaks in Hindi or Hinglish, reply warmly and naturally in conversational Hindi/Hinglish (e.g., 'Ji, main bilkul theek hoon! Aap bataiye aaj main aapki kya madad kar sakti hoon?').
-                        - If the user speaks in English, reply in friendly, pleasant, and natural Indian English.
-                        - Be helpful, respectful, and calm. Address the user politely.
-                        - Keep responses concise (1 to 2 short sentences, under 30 words) so they sound natural and delightful when spoken through Mahi's voice.
-                        - Do NOT include markdown asterisks, hashtags, bullet points, or emojis.
+                        You are MYRAA AI, a warm, respectful Indian AI smartphone assistant speaking in Mahi's voice.
+                        Respond ONLY with a valid single JSON object (no markdown fences, no prose outside JSON) using this exact schema:
+                        {
+                          "intent": "open_app|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
+                          "actionType": "OPEN_APP|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
+                          "target": "target app, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), or parameter",
+                          "extraData": "optional text to type or extra info",
+                          "riskLevel": "LOW|MEDIUM|HIGH",
+                          "requiresConfirmation": false,
+                          "spokenResponse": "Natural 1-2 sentence reply in Hindi, Hinglish, or English matching user language, max 30 words, no markdown or emojis"
+                        }
+                        STRICT RULES:
+                        - Never output executable code or shell commands.
+                        - For OPEN_SETTINGS, NEVER claim the setting was toggled ON/OFF; say the settings screen is being opened so the user can change it.
+                        - Set requiresConfirmation=true and riskLevel="HIGH" for irreversible or sensitive actions (like locking screen, deleting, uninstalling, sending/paying).
                     """.trimIndent()
 
                     val requestJson = JSONObject().apply {
@@ -152,13 +160,14 @@ class GeminiClient {
                             put(JSONObject().apply {
                                 put("role", "user")
                                 put("parts", JSONArray().apply {
-                                    put(JSONObject().put("text", "$systemPrompt\n\nUser: $trimmed"))
+                                    put(JSONObject().put("text", "$systemPrompt\n\nUser command: $trimmed"))
                                 })
                             })
                         })
                         put("generationConfig", JSONObject().apply {
-                            put("temperature", 0.7)
-                            put("maxOutputTokens", 80)
+                            put("temperature", 0.35)
+                            put("maxOutputTokens", 180)
+                            put("responseMimeType", "application/json")
                         })
                     }
 
@@ -180,21 +189,11 @@ class GeminiClient {
                             val contentObj = candidates.getJSONObject(0).optJSONObject("content")
                             val parts = contentObj?.optJSONArray("parts")
                             if (parts != null && parts.length() > 0) {
-                                val replyText = parts.getJSONObject(0).optString("text")
-                                    .replace("*", "")
-                                    .replace("#", "")
-                                    .replace("`", "")
-                                    .replace("\n", " ")
-                                    .trim()
-
-                                if (replyText.isNotBlank()) {
-                                    Log.i("GeminiClient", "Gemini answered via $model: $replyText")
-                                    return@withContext ParsedCommand(
-                                        spokenResponse = replyText,
-                                        actionType = "CHAT",
-                                        target = trimmed,
-                                        rawPrompt = trimmed
-                                    )
+                                val rawText = parts.getJSONObject(0).optString("text").trim()
+                                val structured = extractStructuredJson(rawText, trimmed)
+                                if (structured != null) {
+                                    Log.i("GeminiClient", "Structured JSON parsed via $model -> ${structured.actionType}")
+                                    return@withContext structured
                                 }
                             }
                         }
@@ -208,8 +207,84 @@ class GeminiClient {
             }
         }
 
-        // 4. Fallback to extensive intelligent bilingual conversation engine (Mahi persona)
+        // 4. Fallback bilingual conversation engine (Mahi persona)
         return@withContext intelligentConversationalEngine(trimmed)
+    }
+
+    private fun extractStructuredJson(rawText: String, rawPrompt: String): ParsedCommand? {
+        if (rawText.isBlank()) return null
+        val cleaned = rawText
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+
+        val startIdx = cleaned.indexOf('{')
+        val endIdx = cleaned.lastIndexOf('}')
+        if (startIdx >= 0 && endIdx > startIdx) {
+            try {
+                val obj = JSONObject(cleaned.substring(startIdx, endIdx + 1))
+                val actionType = obj.optString("actionType", "CHAT").trim().uppercase()
+                val intent = obj.optString("intent", actionType.lowercase()).trim()
+                val target = obj.optString("target", "").trim()
+                val extraData = obj.optString("extraData", "").trim()
+                val riskLevel = obj.optString("riskLevel", "LOW").trim().uppercase()
+                val requiresConfirm = obj.optBoolean("requiresConfirmation", false)
+                val spoken = cleanSpeechText(obj.optString("spokenResponse", ""))
+
+                if (spoken.isNotBlank() || actionType != "CHAT") {
+                    return ParsedCommand(
+                        spokenResponse = spoken.ifBlank { "Ji, command process kar rahi hoon." },
+                        actionType = actionType,
+                        target = target,
+                        extraData = extraData,
+                        rawPrompt = rawPrompt,
+                        intent = intent,
+                        riskLevel = riskLevel,
+                        requiresConfirmation = requiresConfirm
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w("GeminiClient", "Failed to parse JSON block, falling back to plain text", e)
+            }
+        }
+
+        val fallbackText = cleanSpeechText(cleaned)
+        return if (fallbackText.isNotBlank()) {
+            ParsedCommand(
+                spokenResponse = fallbackText,
+                actionType = "CHAT",
+                target = rawPrompt,
+                rawPrompt = rawPrompt,
+                intent = "conversation"
+            )
+        } else null
+    }
+
+    private fun cleanSpeechText(text: String): String {
+        return text
+            .replace("*", "")
+            .replace("#", "")
+            .replace("`", "")
+            .replace("\n", " ")
+            .trim()
+    }
+
+    private fun stripWakeWords(text: String): String {
+        var result = text.trim().trimEnd('.', '!', '?').trim()
+        val prefixes = listOf(
+            "hey myraa,", "hey myraa", "hey myra,", "hey myra",
+            "ok myraa,", "ok myraa", "hi myraa,", "hi myraa",
+            "myraa,", "myraa", "myra,", "myra", "suno myraa,", "suno myraa"
+        )
+        val lower = result.lowercase()
+        for (prefix in prefixes) {
+            if (lower.startsWith(prefix)) {
+                result = result.substring(prefix.length).trim().trimStart(',', ' ').trim()
+                break
+            }
+        }
+        return result
     }
 
     private fun parseErrorMessage(jsonStr: String): String {
@@ -222,118 +297,278 @@ class GeminiClient {
         }
     }
 
-    private fun parseScreenActionReflex(text: String): ParsedCommand? {
-        val lower = text.lowercase().trim()
+    private fun parseScreenActionReflex(normalized: String, rawPrompt: String): ParsedCommand? {
+        val lower = normalized.lowercase().trim()
 
         if (lower.startsWith("type ") || lower.startsWith("write ") || lower.startsWith("likho ") || lower.startsWith("type karo ")) {
-            val toType = lower.removePrefix("type karo ").removePrefix("type ").removePrefix("write ").removePrefix("likho ").trim()
-            return ParsedCommand(
-                spokenResponse = "Screen par \"$toType\" type kar rahi hoon.",
-                actionType = "SCREEN_TYPE",
-                target = toType,
-                extraData = toType,
-                rawPrompt = text
-            )
+            val toType = normalized
+                .replace(Regex("^(type karo|type|write|likho)\\s+", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (toType.isNotBlank()) {
+                return ParsedCommand(
+                    spokenResponse = "Screen par \"$toType\" type kar rahi hoon.",
+                    actionType = "SCREEN_TYPE",
+                    target = toType,
+                    extraData = toType,
+                    rawPrompt = rawPrompt,
+                    intent = "screen_type",
+                    riskLevel = "MEDIUM"
+                )
+            }
         }
 
         if (lower.startsWith("click ") || lower.startsWith("tap ") || lower.startsWith("touch ") || lower.startsWith("daba do ") || lower.startsWith("click karo ")) {
-            val target = lower.removePrefix("click karo ").removePrefix("click ").removePrefix("tap ").removePrefix("touch ").removePrefix("daba do ").trim()
-            return ParsedCommand(
-                spokenResponse = "$target par click kar rahi hoon.",
-                actionType = "SCREEN_CLICK",
-                target = target,
-                rawPrompt = text
-            )
+            val target = normalized
+                .replace(Regex("^(click karo|click|tap|touch|daba do)\\s+", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (target.isNotBlank()) {
+                return ParsedCommand(
+                    spokenResponse = "$target par tap kar rahi hoon.",
+                    actionType = "SCREEN_CLICK",
+                    target = target,
+                    rawPrompt = rawPrompt,
+                    intent = "screen_click",
+                    riskLevel = "MEDIUM"
+                )
+            }
         }
 
         return null
     }
 
-    private fun parseDeviceHardwareReflex(text: String): ParsedCommand? {
-        val lower = text.lowercase().trim()
+    private fun parseDeviceHardwareReflex(normalized: String, rawPrompt: String): ParsedCommand? {
+        val lower = normalized.lowercase().trim()
+
+        // Session & Voice Control Commands
+        if (lower in listOf("pause listening", "pause", "listening pause karo", "stop listening", "chup raho")) {
+            return ParsedCommand(
+                spokenResponse = "Listening pause kar rahi hoon. Jab zarurat ho resume button dabaiye.",
+                actionType = "PAUSE_LISTENING",
+                target = "pause",
+                rawPrompt = rawPrompt,
+                intent = "pause_listening"
+            )
+        }
+        if (lower in listOf("resume listening", "resume", "listening chalu karo", "start listening again")) {
+            return ParsedCommand(
+                spokenResponse = "Ji, main dobara sun rahi hoon. Boliye!",
+                actionType = "RESUME_LISTENING",
+                target = "resume",
+                rawPrompt = rawPrompt,
+                intent = "resume_listening"
+            )
+        }
+        if (lower in listOf("stop ai", "stop myraa", "stop session", "ai band karo", "myraa band karo")) {
+            return ParsedCommand(
+                spokenResponse = "MYRAA AI session band kar rahi hoon. Alvida!",
+                actionType = "STOP_AI",
+                target = "stop",
+                rawPrompt = rawPrompt,
+                intent = "stop_ai"
+            )
+        }
+
+        // App list & History
+        if (lower in listOf("list apps", "show apps", "available apps", "installed apps", "apps dikhao")) {
+            return ParsedCommand(
+                spokenResponse = "Installed applications ki list dikha rahi hoon.",
+                actionType = "LIST_APPS",
+                target = "apps",
+                rawPrompt = rawPrompt,
+                intent = "list_apps"
+            )
+        }
+        if (lower in listOf("show history", "activity history", "open logs", "history dikhao")) {
+            return ParsedCommand(
+                spokenResponse = "Aapki activity history khol rahi hoon.",
+                actionType = "SHOW_HISTORY",
+                target = "history",
+                rawPrompt = rawPrompt,
+                intent = "show_history"
+            )
+        }
 
         // Flashlight
-        if (lower == "torch on" || lower == "flashlight on" || lower == "torch jalao" || lower == "turn on flashlight" || lower == "turn on torch" || lower == "light on") {
+        if (lower in listOf("torch on", "flashlight on", "torch jalao", "turn on flashlight", "turn on torch", "light on")) {
             return ParsedCommand(
-                spokenResponse = "Ji, flashlight on kar di hai.",
+                spokenResponse = "Flashlight on kar rahi hoon.",
                 actionType = "FLASHLIGHT",
                 target = "on",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "flashlight_on"
             )
         }
-        if (lower == "torch off" || lower == "flashlight off" || lower == "torch band karo" || lower == "turn off flashlight" || lower == "turn off torch" || lower == "light off") {
+        if (lower in listOf("torch off", "flashlight off", "torch band karo", "turn off flashlight", "turn off torch", "light off")) {
             return ParsedCommand(
-                spokenResponse = "Flashlight band kar di hai.",
+                spokenResponse = "Flashlight band kar rahi hoon.",
                 actionType = "FLASHLIGHT",
                 target = "off",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "flashlight_off"
             )
         }
 
-        // Navigation
-        if (lower == "go home" || lower == "home screen" || lower == "ghar chalo" || lower == "home jao" || lower == "home") {
+        // Device Settings Intents (NEVER claim setting changed, only opened settings screen)
+        val settingsMap = listOf(
+            listOf("wifi setting", "wi-fi setting", "wifi", "wi-fi") to ("wifi" to "Wi-Fi"),
+            listOf("bluetooth setting", "bluetooth") to ("bluetooth" to "Bluetooth"),
+            listOf("display setting", "brightness setting", "screen setting", "display") to ("display" to "Display"),
+            listOf("sound setting", "audio setting", "ringtone setting", "sound") to ("sound" to "Sound"),
+            listOf("location setting", "gps setting", "location") to ("location" to "Location"),
+            listOf("notification setting", "notifications setting", "notification") to ("notifications" to "Notification"),
+            listOf("app setting", "apps setting", "application setting") to ("apps" to "App")
+        )
+        if (lower.contains("setting")) {
+            for ((keywords, pair) in settingsMap) {
+                if (keywords.any { lower.contains(it) }) {
+                    val (targetKey, label) = pair
+                    return ParsedCommand(
+                        spokenResponse = "$label settings open kar rahi hoon, aap wahan se switch kar sakte hain.",
+                        actionType = "OPEN_SETTINGS",
+                        target = targetKey,
+                        rawPrompt = rawPrompt,
+                        intent = "open_settings"
+                    )
+                }
+            }
+            return ParsedCommand(
+                spokenResponse = "Device settings open kar rahi hoon.",
+                actionType = "OPEN_SETTINGS",
+                target = "settings",
+                rawPrompt = rawPrompt,
+                intent = "open_settings"
+            )
+        }
+
+        // Built-in Device Utilities: Camera, Calculator, Clock
+        if (lower in listOf("launch camera", "open camera", "camera", "camera kholo", "camera chalao")) {
+            return ParsedCommand(
+                spokenResponse = "Camera launch kar rahi hoon.",
+                actionType = "OPEN_CAMERA",
+                target = "camera",
+                rawPrompt = rawPrompt,
+                intent = "open_camera"
+            )
+        }
+        if (lower in listOf("open calculator", "launch calculator", "calculator", "calculator kholo", "calc")) {
+            return ParsedCommand(
+                spokenResponse = "Calculator open kar rahi hoon.",
+                actionType = "OPEN_CALCULATOR",
+                target = "calculator",
+                rawPrompt = rawPrompt,
+                intent = "open_calculator"
+            )
+        }
+        if (lower in listOf("open clock", "launch clock", "clock", "alarm", "alarms", "clock kholo")) {
+            return ParsedCommand(
+                spokenResponse = "Clock open kar rahi hoon.",
+                actionType = "OPEN_CLOCK",
+                target = "clock",
+                rawPrompt = rawPrompt,
+                intent = "open_clock"
+            )
+        }
+
+        // Navigation / Accessibility Actions
+        if (lower in listOf("go home", "home screen", "ghar chalo", "home jao", "home")) {
             return ParsedCommand(
                 spokenResponse = "Home screen par le ja rahi hoon.",
                 actionType = "ACCESSIBILITY",
                 target = "home",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "accessibility_home",
+                riskLevel = "MEDIUM"
             )
         }
-        if (lower == "go back" || lower == "back" || lower == "peeche jao" || lower == "wapas jao") {
+        if (lower in listOf("go back", "back", "peeche jao", "wapas jao")) {
             return ParsedCommand(
                 spokenResponse = "Peeche ja rahi hoon.",
                 actionType = "ACCESSIBILITY",
                 target = "back",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "accessibility_back",
+                riskLevel = "MEDIUM"
             )
         }
-        if (lower == "scroll down" || lower == "neeche scroll" || lower == "neeche karo") {
+        if (lower in listOf("lock screen", "phone lock karo", "lock phone")) {
+            return ParsedCommand(
+                spokenResponse = "Screen lock karne ke liye confirmation chahiye.",
+                actionType = "ACCESSIBILITY",
+                target = "lock",
+                rawPrompt = rawPrompt,
+                intent = "accessibility_lock",
+                riskLevel = "HIGH",
+                requiresConfirmation = true
+            )
+        }
+        if (lower in listOf("scroll down", "neeche scroll", "neeche karo")) {
             return ParsedCommand(
                 spokenResponse = "Screen neeche scroll kar rahi hoon.",
                 actionType = "ACCESSIBILITY",
                 target = "scroll_down",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "accessibility_scroll",
+                riskLevel = "MEDIUM"
             )
         }
-        if (lower == "scroll up" || lower == "upar scroll" || lower == "upar karo") {
+        if (lower in listOf("scroll up", "upar scroll", "upar karo")) {
             return ParsedCommand(
                 spokenResponse = "Screen upar scroll kar rahi hoon.",
                 actionType = "ACCESSIBILITY",
                 target = "scroll_up",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "accessibility_scroll",
+                riskLevel = "MEDIUM"
             )
         }
 
         // Volume
-        if (lower == "volume up" || lower == "sound up" || lower == "awaaz badhao" || lower == "sound badhao") {
+        if (lower in listOf("volume up", "sound up", "awaaz badhao", "sound badhao")) {
             return ParsedCommand(
-                spokenResponse = "Awaaz badha di hai.",
+                spokenResponse = "Awaaz badha rahi hoon.",
                 actionType = "VOLUME",
                 target = "up",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "volume_up"
             )
         }
-        if (lower == "volume down" || lower == "sound down" || lower == "awaaz kam karo" || lower == "sound kam karo") {
+        if (lower in listOf("volume down", "sound down", "awaaz kam karo", "sound kam karo")) {
             return ParsedCommand(
-                spokenResponse = "Awaaz kam kar di hai.",
+                spokenResponse = "Awaaz kam kar rahi hoon.",
                 actionType = "VOLUME",
                 target = "down",
-                rawPrompt = text
+                rawPrompt = rawPrompt,
+                intent = "volume_down"
             )
         }
 
-        // Explicit App Launch
-        val appPrefixes = listOf("open app ", "open ", "launch ", "chalao ", "kholo ")
-        for (prefix in appPrefixes) {
-            if (lower.startsWith(prefix) && lower.length < 28) {
-                val app = lower.removePrefix(prefix).trim()
-                val known = listOf("youtube", "whatsapp", "camera", "chrome", "maps", "spotify", "settings", "calculator", "clock", "gallery", "gmail", "instagram")
-                if (known.contains(app) || lower.startsWith("open app ")) {
+        // Generic App Launch ("open youtube", "launch spotify", "whatsapp kholo")
+        val openPrefixes = listOf("open app ", "open ", "launch ", "start ", "chalao ", "kholo ")
+        for (prefix in openPrefixes) {
+            if (lower.startsWith(prefix)) {
+                val app = normalized.substring(prefix.length).trim()
+                if (app.isNotBlank() && app.length <= 40) {
                     return ParsedCommand(
-                        spokenResponse = "$app open kar rahi hoon.",
+                        spokenResponse = "$app open karne ki koshish kar rahi hoon.",
                         actionType = "OPEN_APP",
                         target = app,
-                        rawPrompt = text
+                        rawPrompt = rawPrompt,
+                        intent = "open_app"
+                    )
+                }
+            }
+        }
+        val openSuffixes = listOf(" kholo", " chalao", " open karo", " launch karo")
+        for (suffix in openSuffixes) {
+            if (lower.endsWith(suffix)) {
+                val app = normalized.substring(0, normalized.length - suffix.length).trim()
+                if (app.isNotBlank() && app.length <= 40) {
+                    return ParsedCommand(
+                        spokenResponse = "$app open karne ki koshish kar rahi hoon.",
+                        actionType = "OPEN_APP",
+                        target = app,
+                        rawPrompt = rawPrompt,
+                        intent = "open_app"
                     )
                 }
             }
@@ -347,24 +582,21 @@ class GeminiClient {
 
         val answer = when {
             lower.contains("who are you") || lower.contains("tum kaun ho") || lower.contains("aap kaun ho") ||
-            lower.contains("your name") || lower.contains("tera naam") || lower.contains("apna naam batao") ->
-                "Namaste! Main Myraa hoon, aapki personal AI assistant. Main aapse baat karne aur aapka phone control karne ke liye taiyyar hoon."
+                lower.contains("your name") || lower.contains("tera naam") || lower.contains("apna naam batao") ->
+                "Namaste! Main Myraa hoon, aapki personal AI assistant. Main Hindi, Hinglish aur English me baat aur smartphone automation me madad karti hoon."
 
             lower.contains("how are you") || lower.contains("kaise ho") || lower.contains("kya haal") ||
-            lower.contains("kaisi ho") || lower.contains("kaisa chal raha") ->
-                "Main bilkul theek aur khush hoon! Aapke saath baat karke bahut achha laga. Aap bataiye, aap kaise hain?"
+                lower.contains("kaisi ho") || lower.contains("kaisa chal raha") ->
+                "Main bilkul theek hoon! Aap bataiye, aaj main aapki kya madad kar sakti hoon?"
 
             lower.contains("kya kar sakti ho") || lower.contains("what can you do") || lower.contains("features") || lower.contains("madad") ->
-                "Main aapse natural Hindi, Hinglish aur English me baat kar sakti hoon, apps launch kar sakti hoon, torch aur volume control kar sakti hoon, aur aapki screen share me madad kar sakti hoon."
+                "Main apps launch kar sakti hoon, device settings, camera, calculator aur clock open kar sakti hoon, aur Gemini AI ke saath natural baat kar sakti hoon."
 
             lower.contains("namaste") || lower.contains("hello") || lower.contains("hi") || lower.contains("hey") || lower.contains("suno") ->
-                "Namaste! Main active hoon aur sun rahi hoon. Boliye main aapki kya seva kar sakti hoon?"
-
-            lower.contains("joke") || lower.contains("chutkula") || lower.contains("hasao") ->
-                "Teacher ne pucha: Phone aur kitaab me kya farak hai? Bachha bola: Kitaab me sochte hain kab band karein, aur phone me sochte hain thoda aur chala lein! Kaisa laga?"
+                "Namaste! Main active hoon aur sun rahi hoon. Boliye kya kaam hai?"
 
             lower.contains("thank") || lower.contains("dhanyawad") || lower.contains("shukriya") ->
-                "Aapka swagat hai! Aapki madad karna mere liye khushi ki baat hai."
+                "Aapka swagat hai! Hamesha madad ke liye taiyyar hoon."
 
             lower.contains("time") || lower.contains("samay") || lower.contains("kitne baje") -> {
                 val timeStr = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
@@ -378,9 +610,9 @@ class GeminiClient {
 
             else -> {
                 if (text.any { it in '\u0900'..'\u097F' } || listOf("kya", "hai", "ho", "kaise", "mera", "meri", "aap", "tum", "karo", "nahi", "haan").any { lower.contains(it) }) {
-                    "Ji, maine suna aapne kaha \"$text\". Main sun rahi hoon, bataiye aur kya madad chahiye?"
+                    "Main aapki baat samajh gayi. Gemini cloud reasoning ke liye API Settings me valid Gemini key configure karein ya mujhe koi app ya setting open karne ko kahein."
                 } else {
-                    "I heard you say \"$text\". I am right here listening, ready to talk or assist with your phone."
+                    "I heard \"$text\". Configure your Gemini API key in Settings for full conversational answers, or ask me to open an app or device setting."
                 }
             }
         }
@@ -389,7 +621,8 @@ class GeminiClient {
             spokenResponse = answer,
             actionType = "CHAT",
             target = text,
-            rawPrompt = text
+            rawPrompt = text,
+            intent = "conversation"
         )
     }
 }

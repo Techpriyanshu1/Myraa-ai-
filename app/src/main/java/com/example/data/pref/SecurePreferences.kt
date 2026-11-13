@@ -133,4 +133,24 @@ class SecurePreferences(private val context: Context) {
     fun setPreferredLanguage(lang: String) {
         prefs.edit().putString("preferred_language", lang).apply()
     }
+
+    // --- USER-SELECTED APPS FOR LAUNCHER AGENT ---
+    fun getSelectedApps(): Set<String> {
+        return prefs.getStringSet("user_selected_apps", emptySet())?.toSet() ?: emptySet()
+    }
+
+    fun setSelectedApps(packageNames: Set<String>) {
+        prefs.edit().putStringSet("user_selected_apps", packageNames).apply()
+    }
+
+    fun toggleSelectedApp(packageName: String): Set<String> {
+        val updated = getSelectedApps().toMutableSet()
+        if (updated.contains(packageName)) {
+            updated.remove(packageName)
+        } else {
+            updated.add(packageName)
+        }
+        setSelectedApps(updated)
+        return updated
+    }
 }

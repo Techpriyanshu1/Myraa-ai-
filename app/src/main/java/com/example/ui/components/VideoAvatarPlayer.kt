@@ -54,7 +54,7 @@ fun VideoAvatarPlayer(
     val targetAsset = when (companionState) {
         CompanionState.TALKING -> "talking.mp4"
         CompanionState.THINKING -> "thinking.mp4"
-        CompanionState.IDLE, CompanionState.LISTENING -> "idle.mp4"
+        CompanionState.IDLE, CompanionState.LISTENING, CompanionState.ERROR -> "idle.mp4"
     }
 
     // Holder for the single active MediaPlayer instance
@@ -191,6 +191,7 @@ fun VideoAvatarPlayer(
                                         CompanionState.THINKING -> CyanPrimary
                                         CompanionState.LISTENING -> AuroraEmerald
                                         CompanionState.IDLE -> Color(0xFF6B7280)
+                                        CompanionState.ERROR -> Color(0xFFEF4444)
                                     }
                                 )
                         )
@@ -201,6 +202,7 @@ fun VideoAvatarPlayer(
                                 CompanionState.THINKING -> "MYRAA • THINKING"
                                 CompanionState.TALKING -> "MYRAA • SPEAKING"
                                 CompanionState.IDLE -> "MYRAA • READY"
+                                CompanionState.ERROR -> "MYRAA • ATTENTION"
                             },
                             color = Color.White,
                             fontSize = 11.sp,

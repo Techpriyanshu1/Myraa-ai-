@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
                     color = DarkBackground
                 ) {
                     var currentScreen by remember { mutableStateOf(AppScreen.SPLASH) }
+                    var agentFleetReturnScreen by remember { mutableStateOf(AppScreen.SETTINGS) }
 
                     Crossfade(targetState = currentScreen, label = "screen_crossfade") { screen ->
                         when (screen) {
@@ -87,7 +88,11 @@ class MainActivity : ComponentActivity() {
                             AppScreen.MAIN -> {
                                 MainAssistantScreen(
                                     onNavigateToLogs = { currentScreen = AppScreen.AUDIT_LOGS },
-                                    onNavigateToSettings = { currentScreen = AppScreen.SETTINGS }
+                                    onNavigateToSettings = { currentScreen = AppScreen.SETTINGS },
+                                    onNavigateToAgentFleet = {
+                                        agentFleetReturnScreen = AppScreen.MAIN
+                                        currentScreen = AppScreen.AGENT_FLEET
+                                    }
                                 )
                             }
                             AppScreen.AUDIT_LOGS -> {
@@ -101,7 +106,10 @@ class MainActivity : ComponentActivity() {
                                 SettingsScreen(
                                     onNavigateBack = { currentScreen = AppScreen.MAIN },
                                     onNavigateToPermissions = { currentScreen = AppScreen.PERMISSION_CENTER },
-                                    onNavigateToAgentFleet = { currentScreen = AppScreen.AGENT_FLEET },
+                                    onNavigateToAgentFleet = {
+                                        agentFleetReturnScreen = AppScreen.SETTINGS
+                                        currentScreen = AppScreen.AGENT_FLEET
+                                    },
                                     onNavigateToSecurity = { currentScreen = AppScreen.SECURITY_PRIVACY },
                                     onNavigateToAbout = { currentScreen = AppScreen.ABOUT },
                                     onRerunSetup = { currentScreen = AppScreen.SETUP }
@@ -114,9 +122,9 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                             AppScreen.AGENT_FLEET -> {
-                                BackHandler { currentScreen = AppScreen.SETTINGS }
+                                BackHandler { currentScreen = agentFleetReturnScreen }
                                 AgentFleetScreen(
-                                    onNavigateBack = { currentScreen = AppScreen.SETTINGS }
+                                    onNavigateBack = { currentScreen = agentFleetReturnScreen }
                                 )
                             }
                             AppScreen.SECURITY_PRIVACY -> {
