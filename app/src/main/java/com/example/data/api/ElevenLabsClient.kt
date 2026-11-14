@@ -9,8 +9,11 @@ import android.media.AudioTrack
 import android.media.MediaPlayer
 import android.media.PlaybackParams
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Base64
 import android.util.Log
 import com.example.core.NetworkRetryHelper
@@ -39,8 +42,11 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 
 sealed class VoiceTestResult {
     data class Success(val message: String, val audioBytes: Int) : VoiceTestResult()
@@ -71,6 +77,11 @@ class ElevenLabsClient(private val context: Context) {
     @Volatile
     private var activeNetworkCall: Call? = null
     private val ttsSynthesisMutex = Mutex()
+    private val localTtsInitLock = Any()
+    @Volatile
+    private var localBackupTts: TextToSpeech? = null
+    @Volatile
+    private var localBackupTtsReady: Boolean = false
     private var activeAudioTrack: AudioTrack? = null
     private var activeSpeechJob: Job? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -89,7 +100,7 @@ class ElevenLabsClient(private val context: Context) {
         private const val GEMINI_VOICE_MAHI = "Aoede"
         private const val MAX_DISK_CACHE_FILES = 150
         private const val MAX_CACHE_PHRASE_CHARS = 280
-        private const val RATE_LIMIT_COOLDOWN_MS = 2_500L
+        private const val RATE_LIMIT_COOLDOWN_MS = 12_000L
         private const val ZERO_QUOTA_COOLDOWN_MS = 300_000L
         private val DEFAULT_GEMINI_TTS_MODELS = listOf(
             "gemini-2.5-flash-preview-tts",
@@ -102,6 +113,18 @@ class ElevenLabsClient(private val context: Context) {
         private val zeroQuotaModels = ConcurrentHashMap.newKeySet<String>()
         @Volatile
         private var elevenLabsCooldownUntilMs = 0L
+
+        /**
+         * Strips markdown markers, links, and unpronounceable symbols so Gemini TTS never
+         * drops candidates and identical replies maximize local PCM cache hits.
+         */
+        fun sanitizeTextForSpeech(raw: String): String {
+            return raw
+                .replace(Regex("https?://\\S+"), "link")
+                .replace(Regex("[*_`#~|]+"), " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+        }
 
         /**
          * Returns true ONLY for hard credential/config failures that require user action in Settings.
@@ -386,7 +409,7 @@ class ElevenLabsClient(private val context: Context) {
         onPlaybackCompleted: () -> Unit = {},
         onError: ((String) -> Unit)? = null
     ) = withContext(Dispatchers.IO) {
-        val cleanText = text.trim()
+        val cleanText = sanitizeTextForSpeech(text).ifBlank { text.trim() }
         if (cleanText.isBlank()) {
             withContext(Dispatchers.Main) { onPlaybackCompleted() }
             return@withContext
@@ -401,8 +424,36 @@ class ElevenLabsClient(private val context: Context) {
         } catch (_: Exception) {
             ""
         }
+        val unlimitedBackupEnabled = try {
+            securePrefs.isNativeTtsFallbackEnabled()
+        } catch (_: Exception) {
+            true
+        }
 
         if (cleanElevenKey.isBlank() && geminiKey.isBlank()) {
+            if (unlimitedBackupEnabled) {
+                requestSpeechAudioFocus()
+                try {
+                    val spokeBackup = speakWithUnlimitedLocalVoice(
+                        text = cleanText,
+                        genId = myGenId,
+                        speechSpeed = speechSpeed,
+                        onStart = {
+                            mainHandler.post {
+                                if (myGenId == speechGenerationId) onPlaybackStarted()
+                            }
+                        }
+                    )
+                    if (spokeBackup) {
+                        return@withContext
+                    }
+                } finally {
+                    abandonSpeechAudioFocus()
+                    withContext(Dispatchers.Main) {
+                        if (myGenId == speechGenerationId) onPlaybackCompleted()
+                    }
+                }
+            }
             withContext(Dispatchers.Main) {
                 if (onError != null) {
                     onError.invoke("AI Voice ke liye Settings me Gemini API key add karein.")
@@ -470,7 +521,7 @@ class ElevenLabsClient(private val context: Context) {
                         geminiKey = geminiKey,
                         genId = myGenId,
                         speechSpeed = speechSpeed,
-                        allowRateLimitRetry = cleanElevenKey.isBlank(),
+                        allowRateLimitRetry = cleanElevenKey.isBlank() && !unlimitedBackupEnabled,
                         onStarted = { notifyStartOnce() }
                     )
                     else -> "Unsupported voice engine"
@@ -485,8 +536,22 @@ class ElevenLabsClient(private val context: Context) {
                 }
             }
 
+            // Tier-2 Zero-Limit Permanent Failover: Whenever cloud TTS hits 429/409/limit/network,
+            // speak immediately with tuned Google Indian Voice so user gets EVERY answer spoken aloud!
+            if (!spokeSuccessfully && myGenId == speechGenerationId && unlimitedBackupEnabled) {
+                val backupSpoke = speakWithUnlimitedLocalVoice(
+                    text = cleanText,
+                    genId = myGenId,
+                    speechSpeed = speechSpeed,
+                    onStart = { notifyStartOnce() }
+                )
+                if (backupSpoke) {
+                    spokeSuccessfully = true
+                }
+            }
+
             if (!spokeSuccessfully && myGenId == speechGenerationId && lastFailure != null) {
-                // Always play gentle acoustic ack cue so response arrival isn't completely silent
+                // Fallback acoustic cue when all voice outputs are unavailable
                 try { playQuickAckCue() } catch (_: Exception) {}
                 didInvokeError = true
                 withContext(Dispatchers.Main) {
@@ -785,19 +850,19 @@ class ElevenLabsClient(private val context: Context) {
                 queue.add(DEFAULT_GEMINI_TTS_MODELS.first())
             }
 
-            var didDiscovery = !discoveredTtsModelsCache[cleanKey].isNullOrEmpty()
+            var didDiscovery = false
             var lastError = "Gemini AI Voice temporarily busy."
             var sawTransientBusy = false
             val spokenDirectiveText = text.trim()
 
             while (queue.isNotEmpty()) {
-                val model = queue.removeFirst()
+                val model = queue.removeFirst().trim().removePrefix("models/")
                 if (!attempted.add(model)) continue
 
                 val cooldownUntil = modelCooldownUntilMs[model] ?: 0L
                 val remainingCooldown = cooldownUntil - System.currentTimeMillis()
                 if (remainingCooldown > 0L) {
-                    if (remainingCooldown <= 2_600L && queue.isEmpty()) {
+                    if (allowRateLimitRetry && remainingCooldown <= 2_600L && queue.isEmpty()) {
                         delay(remainingCooldown.coerceAtMost(2_200L))
                     } else {
                         sawTransientBusy = true
@@ -900,6 +965,9 @@ class ElevenLabsClient(private val context: Context) {
                         }
                     } else {
                         lastError = "HTTP $code"
+                        if (code == 404 && verifiedTtsModelByKey[cleanKey] == model) {
+                            verifiedTtsModelByKey.remove(cleanKey)
+                        }
                         if (code == 401 || code == 403) {
                             return@withLock GeminiTtsOutcome.Failure("Gemini API key unauthorized ($code).")
                         }
@@ -1397,11 +1465,191 @@ class ElevenLabsClient(private val context: Context) {
             Log.e("ElevenLabsClient", "Error stopping AudioTrack", e)
         }
         activeAudioTrack = null
+        try {
+            localBackupTts?.stop()
+        } catch (_: Exception) {}
         abandonSpeechAudioFocus()
+    }
+
+    /**
+     * Zero-Limit Unlimited Backup Voice Engine:
+     * Used ONLY as instant automatic failover when Gemini Cloud TTS hits 429/409/quota limits
+     * so MYRAA ALWAYS speaks every AI answer aloud with zero error banner and zero latency stall.
+     */
+    private suspend fun ensureLocalBackupTts(): TextToSpeech? {
+        localBackupTts?.let { existing ->
+            if (localBackupTtsReady) return existing
+        }
+
+        val initDeferred = CompletableDeferred<Boolean>()
+        mainHandler.post {
+            synchronized(localTtsInitLock) {
+                val already = localBackupTts
+                if (already != null && localBackupTtsReady) {
+                    initDeferred.complete(true)
+                    return@synchronized
+                }
+                try {
+                    val listener = TextToSpeech.OnInitListener { status ->
+                        val ok = status == TextToSpeech.SUCCESS
+                        localBackupTtsReady = ok
+                        if (!initDeferred.isCompleted) {
+                            initDeferred.complete(ok)
+                        }
+                    }
+                    // Prefer Google Speech Services HD engine cleanly; fall back to system default
+                    val created = try {
+                        TextToSpeech(context.applicationContext, listener, "com.google.android.tts")
+                    } catch (_: Exception) {
+                        TextToSpeech(context.applicationContext, listener)
+                    }
+                    localBackupTts = created
+                } catch (e: Exception) {
+                    Log.w("ElevenLabsClient", "Local backup TTS unavailable", e)
+                    localBackupTtsReady = false
+                    if (!initDeferred.isCompleted) initDeferred.complete(false)
+                }
+            }
+        }
+
+        val ok = withTimeoutOrNull(1_800L) { initDeferred.await() } ?: false
+        return if (ok) localBackupTts else null
+    }
+
+    private fun configureWarmIndianFemaleVoice(tts: TextToSpeech, speechSpeed: Float) {
+        try {
+            val hiLocale = Locale.forLanguageTag("hi-IN")
+            val enInLocale = Locale.forLanguageTag("en-IN")
+            val hiSupport = tts.isLanguageAvailable(hiLocale)
+            val targetLocale = if (hiSupport >= TextToSpeech.LANG_AVAILABLE) hiLocale else enInLocale
+            tts.language = targetLocale
+
+            val availableVoices = try { tts.voices?.toList().orEmpty() } catch (_: Exception) { emptyList() }
+            val preferredFemaleVoice = availableVoices
+                .filter { v ->
+                    val tag = v.locale.toLanguageTag().lowercase()
+                    tag.startsWith("hi-in") || tag.startsWith("en-in") || tag.startsWith("hi")
+                }
+                .sortedWith(
+                    compareBy<android.speech.tts.Voice>(
+                        // Prefer Hindi Indian voices first for natural Hinglish pronunciation
+                        { if (it.locale.toLanguageTag().lowercase().startsWith("hi-in")) 0 else 1 },
+                        // Prefer offline-ready installed HD female signatures (hia/hid/hie/ena)
+                        {
+                            val n = it.name.lowercase()
+                            when {
+                                n.contains("hia") || n.contains("hid") || n.contains("hie") || n.contains("ena") || n.contains("female") -> 0
+                                else -> 1
+                            }
+                        },
+                        { if (!it.isNetworkConnectionRequired) 0 else 1 },
+                        { -it.quality }
+                    )
+                )
+                .firstOrNull()
+
+            if (preferredFemaleVoice != null) {
+                tts.voice = preferredFemaleVoice
+            }
+            tts.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            tts.setPitch(1.06f)
+            tts.setSpeechRate((speechSpeed * 1.04f).coerceIn(0.85f, 1.45f))
+        } catch (e: Exception) {
+            Log.w("ElevenLabsClient", "Voice profile tuning warning", e)
+        }
+    }
+
+    private suspend fun speakWithUnlimitedLocalVoice(
+        text: String,
+        genId: Long,
+        speechSpeed: Float,
+        onStart: () -> Unit
+    ): Boolean {
+        if (genId != speechGenerationId || text.isBlank()) return false
+        val tts = ensureLocalBackupTts() ?: return false
+        if (genId != speechGenerationId) return false
+
+        configureWarmIndianFemaleVoice(tts, speechSpeed)
+
+        val utteranceId = "myraa_local_${genId}_${System.currentTimeMillis()}"
+        val estimatedTimeoutMs = (text.length * 130L + 2_500L).coerceIn(3_500L, 18_000L)
+
+        return withTimeoutOrNull(estimatedTimeoutMs) {
+            suspendCancellableCoroutine { cont ->
+                val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+                fun finishOnce(success: Boolean) {
+                    if (finished.compareAndSet(false, true)) {
+                        try {
+                            tts.setOnUtteranceProgressListener(null)
+                        } catch (_: Exception) {}
+                        if (cont.isActive) cont.resume(success)
+                    }
+                }
+
+                cont.invokeOnCancellation {
+                    try {
+                        tts.setOnUtteranceProgressListener(null)
+                        tts.stop()
+                    } catch (_: Exception) {}
+                }
+
+                tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(id: String?) {
+                        if (id == utteranceId && genId == speechGenerationId) {
+                            onStart()
+                        }
+                    }
+
+                    override fun onDone(id: String?) {
+                        if (id == utteranceId) {
+                            finishOnce(true)
+                        }
+                    }
+
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(id: String?) {
+                        if (id == utteranceId) {
+                            finishOnce(false)
+                        }
+                    }
+
+                    override fun onError(id: String?, errorCode: Int) {
+                        if (id == utteranceId) {
+                            finishOnce(false)
+                        }
+                    }
+
+                    override fun onStop(id: String?, interrupted: Boolean) {
+                        if (id == utteranceId) {
+                            finishOnce(!interrupted)
+                        }
+                    }
+                })
+
+                val params = Bundle().apply {
+                    putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                }
+                val speakStatus = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+                if (speakStatus != TextToSpeech.SUCCESS) {
+                    finishOnce(false)
+                }
+            }
+        } ?: false
     }
 
     fun shutdown() {
         stopSpeaking()
+        try {
+            localBackupTts?.stop()
+            localBackupTts?.shutdown()
+        } catch (_: Exception) {}
+        localBackupTts = null
+        localBackupTtsReady = false
         clientScope.cancel()
     }
 }

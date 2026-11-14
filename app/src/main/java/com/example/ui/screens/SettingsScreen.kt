@@ -130,6 +130,7 @@ fun SettingsScreen(
     var firstVoiceProvider by remember { mutableStateOf(prefs.getFirstConfiguredVoiceProvider()) }
     var isTestingVoice by remember { mutableStateOf(false) }
     var voiceTestResult by remember { mutableStateOf<VoiceTestResult?>(null) }
+    var isUnlimitedBackupVoice by remember { mutableStateOf(prefs.isNativeTtsFallbackEnabled()) }
 
     var isOverlayEnabled by remember { mutableStateOf(prefs.isOverlayEnabled()) }
     var isContinuousListening by remember { mutableStateOf(prefs.isContinuousListeningEnabled()) }
@@ -558,6 +559,40 @@ fun SettingsScreen(
                         style = MaterialTheme.typography.bodySmall,
                         color = colors.onSurfaceVariant
                     )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(MaterialTheme.shapes.small)
+                            .background(colors.surfaceContainerHigh)
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                text = "Unlimited Zero-Error Backup Voice",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = colors.onSurface
+                            )
+                            Text(
+                                text = "Gemini free limit (429/409) aane par bina ruke turant Indian HD Voice me answer bolegi.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = colors.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = isUnlimitedBackupVoice,
+                            onCheckedChange = { enabled ->
+                                isUnlimitedBackupVoice = enabled
+                                prefs.setNativeTtsFallbackEnabled(enabled)
+                            },
+                            modifier = Modifier.testTag("settings_unlimited_backup_voice_switch")
+                        )
+                    }
 
                     Spacer(modifier = Modifier.height(10.dp))
 

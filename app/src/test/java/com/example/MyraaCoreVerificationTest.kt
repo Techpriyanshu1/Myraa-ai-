@@ -710,5 +710,46 @@ class MyraaCoreVerificationTest {
         assertFalse(ElevenLabsClient.isHardVoiceConfigError("ElevenLabs temporary server error (HTTP 503)"))
         assertTrue(ElevenLabsClient.isHardVoiceConfigError("Gemini API key unauthorized (401)."))
         assertTrue(ElevenLabsClient.isHardVoiceConfigError("Gemini API key missing."))
+
+        val sanitized = ElevenLabsClient.sanitizeTextForSpeech("**Namaste!** Visit https://example.com #MYRAA")
+        assertEquals("Namaste! Visit link MYRAA", sanitized)
+        assertTrue(prefs.isNativeTtsFallbackEnabled())
+        prefs.setNativeTtsFallbackEnabled(false)
+        assertFalse(prefs.isNativeTtsFallbackEnabled())
+        prefs.setNativeTtsFallbackEnabled(true)
+    }
+
+    @Test
+    fun `Real-device adaptive mic VAD, low-gain PCM normalization, and model prefix normalization work reliably`() {
+        // 1. Quiet physical OEM mic vs noisy ceiling-fan room thresholds
+        val (quietStart, quietCont) = com.example.voice.VoiceRecognitionManager.computeAdaptiveThresholds(0.001)
+        assertTrue("Quiet phone mic threshold should catch normal voice (<0.012)", quietStart in 0.006..0.010)
+        assertTrue(quietCont < quietStart)
+
+        val (noisyStart, _) = com.example.voice.VoiceRecognitionManager.computeAdaptiveThresholds(0.018)
+        assertTrue("Noisy fan environment must raise threshold (>0.035) so fan noise isn't sent to AI", noisyStart > 0.035)
+
+        // 2. Low-gain physical mic PCM normalization boosts quiet speech cleanly toward -5dBFS
+        val samples = 400
+        val quietPcm = ByteArray(samples * 2)
+        for (i in 0 until samples) {
+            val val16 = (kotlin.math.sin(2.0 * Math.PI * 220.0 * i / 16000.0) * 1800.0).toInt()
+            quietPcm[i * 2] = (val16 and 0xFF).toByte()
+            quietPcm[i * 2 + 1] = ((val16 shr 8) and 0xFF).toByte()
+        }
+        val normalizedPcm = com.example.voice.VoiceRecognitionManager.normalizeLowGainPcmIfSpeech(quietPcm)
+        var peakAfter = 0
+        for (i in 0 until samples) {
+            val lo = normalizedPcm[i * 2].toInt() and 0xFF
+            val hi = normalizedPcm[i * 2 + 1].toInt()
+            val s = kotlin.math.abs((hi shl 8) or lo)
+            if (s > peakAfter) peakAfter = s
+        }
+        assertTrue("Quiet voice peak (~1800) should boost cleanly above 7000, was $peakAfter", peakAfter > 7000)
+
+        // 3. Model prefix sanitization prevents malformed /v1beta/models/models/... 404 URLs
+        val gemini = GeminiClient()
+        assertEquals("gemini-2.5-flash", gemini.sanitizePreferredModel("models/gemini-2.5-flash"))
+        assertEquals("gemini-2.5-flash", gemini.sanitizePreferredModel("gemini-2.0-flash"))
     }
 }

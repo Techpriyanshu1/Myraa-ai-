@@ -198,7 +198,6 @@ fun SetupWizardScreen(
         prefs.setVoiceApiKey(voiceKey.trim())
         prefs.setSelectedVoiceId(mahiVoiceId)
         prefs.setSelectedVoiceModel(voiceModel)
-        prefs.setNativeTtsFallbackEnabled(false)
         prefs.setSetupCompleted(true)
         MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
         fleetManager.refreshFleetStatus(clearErrors = true)

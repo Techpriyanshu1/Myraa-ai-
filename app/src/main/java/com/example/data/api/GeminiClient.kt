@@ -126,8 +126,8 @@ class GeminiClient {
         }
     }
 
-    private fun sanitizePreferredModel(model: String): String {
-        val trimmed = model.trim()
+    internal fun sanitizePreferredModel(model: String): String {
+        val trimmed = model.trim().removePrefix("models/")
         return if (trimmed.isBlank() || trimmed in RETIRED_MODELS) {
             AVAILABLE_MODELS.first()
         } else {
@@ -166,9 +166,13 @@ class GeminiClient {
         cleanKey: String,
         payloadBuilder: (includeThinking: Boolean) -> JSONObject
     ): Triple<Int, String, Long?> {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
-        fun send(includeThinking: Boolean): Triple<Int, String, Long?> {
+        val cleanModel = model.trim().removePrefix("models/")
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent"
+        fun send(includeThinking: Boolean, stripJsonMimeType: Boolean = false): Triple<Int, String, Long?> {
             val payload = payloadBuilder(includeThinking)
+            if (stripJsonMimeType) {
+                payload.optJSONObject("generationConfig")?.remove("responseMimeType")
+            }
             val body = payload.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder()
                 .url(url)
@@ -182,21 +186,25 @@ class GeminiClient {
             }
         }
 
-        var first = send(true)
-        // Auto-retry without thinkingConfig if a model variant returns HTTP 400 rejecting thinkingConfig
-        if (first.first == 400 && buildThinkingConfig(model) != null) {
+        var first = send(includeThinking = true, stripJsonMimeType = false)
+        // Auto-retry without thinkingConfig or strict responseMimeType if a model rejects either (HTTP 400)
+        if (first.first == 400) {
             val err = parseErrorMessage(first.second)
             if (!err.contains("API key", ignoreCase = true)) {
-                val second = send(false)
+                val second = send(includeThinking = false, stripJsonMimeType = false)
                 if (second.first in 200..299 || second.first != 400) {
                     return second
+                }
+                val third = send(includeThinking = false, stripJsonMimeType = true)
+                if (third.first in 200..299 || third.first != 400) {
+                    return third
                 }
             }
         }
         // Single fast retry on transient 409 Conflict / 503 Unavailable
         if (first.first == 409 || first.first == 503) {
             try { Thread.sleep(400L) } catch (_: InterruptedException) {}
-            first = send(true)
+            first = send(includeThinking = true, stripJsonMimeType = false)
         }
         return first
     }
@@ -382,7 +390,7 @@ class GeminiClient {
             initialDiscovered.forEach { if (!queue.contains(it)) queue.add(it) }
             AVAILABLE_MODELS.forEach { if (!queue.contains(it)) queue.add(it) }
 
-            var didLiveDiscovery = initialDiscovered.isNotEmpty()
+            var didLiveDiscovery = false
             val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
             val systemPrompt = buildGeminiSystemPrompt(effectiveMemory, screenContextSummary)
 
@@ -423,7 +431,7 @@ class GeminiClient {
                                 })
                                 put("generationConfig", JSONObject().apply {
                                     put("temperature", 0.3)
-                                    put("maxOutputTokens", 384)
+                                    put("maxOutputTokens", 1024)
                                     put("responseMimeType", "application/json")
                                     if (includeThinking) {
                                         buildThinkingConfig(model)?.let { put("thinkingConfig", it) }
@@ -476,6 +484,9 @@ class GeminiClient {
                             lastApiError = formattedErr
                         }
                         Log.w("GeminiClient", "Gemini $model HTTP $code: $errMsg")
+                        if (code == 404 && verifiedModelByKey[cleanKey] == model) {
+                            verifiedModelByKey.remove(cleanKey)
+                        }
                         if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
                             break
                         }
@@ -557,7 +568,7 @@ class GeminiClient {
         initialDiscovered.forEach { if (!queue.contains(it)) queue.add(it) }
         AVAILABLE_MODELS.forEach { if (!queue.contains(it)) queue.add(it) }
 
-        var didLiveDiscovery = initialDiscovered.isNotEmpty()
+        var didLiveDiscovery = false
         var lastApiError: String? = null
         var firstActionableError: String? = null
 
@@ -607,7 +618,7 @@ class GeminiClient {
                             })
                             put("generationConfig", JSONObject().apply {
                                 put("temperature", 0.3)
-                                put("maxOutputTokens", 384)
+                                put("maxOutputTokens", 1024)
                                 put("responseMimeType", "application/json")
                                 if (includeThinking) {
                                     buildThinkingConfig(model)?.let { put("thinkingConfig", it) }
@@ -667,6 +678,9 @@ class GeminiClient {
                         lastApiError = formattedErr
                     }
                     Log.w("GeminiClient", "Gemini Audio $model HTTP $code: $errMsg")
+                    if (code == 404 && verifiedModelByKey[cleanKey] == model) {
+                        verifiedModelByKey.remove(cleanKey)
+                    }
                     if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
                         break
                     }
@@ -783,7 +797,12 @@ class GeminiClient {
             }
         }
 
-        val fallbackText = cleanSpeechText(cleaned)
+        val fallbackText = if (cleaned.startsWith("{")) {
+            val spokenMatch = Regex("\"spokenResponse\"\\s*:\\s*\"([^\"]+)").find(cleaned)?.groupValues?.get(1)
+            cleanSpeechText(spokenMatch ?: "")
+        } else {
+            cleanSpeechText(cleaned)
+        }
         return if (fallbackText.isNotBlank()) {
             ParsedCommand(
                 spokenResponse = fallbackText,

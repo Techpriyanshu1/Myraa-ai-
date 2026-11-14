@@ -70,14 +70,59 @@ class VoiceRecognitionManager(
         private const val CHANNELS = 1
         private const val BITS_PER_SAMPLE = 16
         private const val CHUNK_SHORTS = 800 // 50ms per chunk at 16kHz for snappy VAD
-        private const val PRE_ROLL_CHUNKS = 6 // ~300ms pre-roll before speech trigger
-        private const val SPEECH_RMS_THRESHOLD = 0.018
-        private const val SILENCE_END_MS = 380L
-        private const val MIN_SPEECH_MS = 200L
+        private const val PRE_ROLL_CHUNKS = 7 // ~350ms pre-roll so first syllable is never clipped
+        private const val WARMUP_CHUNKS = 4 // ~200ms ambient noise-floor calibration
+        private const val ZERO_MIC_FALLBACK_CHUNKS = 24 // ~1.2s dead digital-zero detector
+        private const val SILENCE_END_MS = 450L
+        private const val MIN_SPEECH_MS = 220L
         private const val MAX_UTTERANCE_MS = 12000L
         private const val IDLE_WINDOW_MS = 20000L
         private const val MIN_FORCED_BYTES = 4800 // ~150ms
-        private const val TAIL_SILENCE_KEEP_BYTES = 640 * 2 // ~40ms tail
+        private const val TAIL_SILENCE_KEEP_BYTES = 800 * 2 // ~50ms tail
+
+        /**
+         * Computes dynamic speech-start and speech-continue RMS thresholds from ambient room noise.
+         * Allows quiet OEM phone mics (0.006+) to trigger cleanly while ignoring ceiling fans (0.02+).
+         */
+        fun computeAdaptiveThresholds(noiseFloorRms: Double): Pair<Double, Double> {
+            val clampedNoise = noiseFloorRms.coerceIn(0.0008, 0.032)
+            val startThreshold = maxOf(0.006, minOf(0.048, clampedNoise * 2.5 + 0.0035))
+            val continueThreshold = maxOf(0.0042, startThreshold * 0.65)
+            return startThreshold to continueThreshold
+        }
+
+        /**
+         * Boosts quiet physical-phone speech PCM cleanly toward -5 dBFS (max 5.5x) so low-gain
+         * hardware microphones sound crisp to Gemini Multimodal AI without clipping.
+         */
+        fun normalizeLowGainPcmIfSpeech(pcmData: ByteArray): ByteArray {
+            if (pcmData.size < 4) return pcmData
+            val sampleCount = pcmData.size / 2
+            var maxAbs = 0
+            var sumSq = 0.0
+            for (i in 0 until sampleCount) {
+                val lo = pcmData[i * 2].toInt() and 0xFF
+                val hi = pcmData[i * 2 + 1].toInt()
+                val s = (hi shl 8) or lo
+                val absVal = kotlin.math.abs(s)
+                if (absVal > maxAbs) maxAbs = absVal
+                sumSq += s.toDouble() * s.toDouble()
+            }
+            val rmsNorm = sqrt(sumSq / sampleCount) / 32768.0
+            if (maxAbs !in 450..11500 || rmsNorm < 0.004) return pcmData
+
+            val gain = (18500.0 / maxAbs.toDouble()).coerceIn(1.0, 5.5)
+            val boosted = ByteArray(pcmData.size)
+            for (i in 0 until sampleCount) {
+                val lo = pcmData[i * 2].toInt() and 0xFF
+                val hi = pcmData[i * 2 + 1].toInt()
+                val s = (hi shl 8) or lo
+                val scaled = (s * gain).toInt().coerceIn(-32767, 32767)
+                boosted[i * 2] = (scaled and 0xFF).toByte()
+                boosted[i * 2 + 1] = ((scaled shr 8) and 0xFF).toByte()
+            }
+            return boosted
+        }
     }
 
     fun prepareSessionForGreeting() {
@@ -190,12 +235,12 @@ class VoiceRecognitionManager(
         }
     }
 
-    private fun launchCaptureLoop() {
+    private fun launchCaptureLoop(preferStandardMicSource: Boolean = false) {
         stopCaptureLoop()
         if (!isSessionActive || isPaused) return
 
         captureJob = managerScope.launch {
-            recordSingleUtteranceOrContinue()
+            recordSingleUtteranceOrContinue(preferStandardMicSource)
         }
     }
 
@@ -207,7 +252,7 @@ class VoiceRecognitionManager(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun recordSingleUtteranceOrContinue() {
+    private suspend fun recordSingleUtteranceOrContinue(preferStandardMicSource: Boolean = false) {
         if (!isSessionActive || isPaused || !hasMicPermission()) {
             if (!hasMicPermission() && isSessionActive) handlePermissionRevoked()
             return
@@ -229,17 +274,24 @@ class VoiceRecognitionManager(
         }
 
         val bufferBytes = maxOf(minBuf, CHUNK_SHORTS * 2 * 2)
+        var usedVoiceRecognitionSource = !preferStandardMicSource
         var recorder: AudioRecord? = null
         try {
+            val primarySource = if (preferStandardMicSource) {
+                MediaRecorder.AudioSource.MIC
+            } else {
+                MediaRecorder.AudioSource.VOICE_RECOGNITION
+            }
             recorder = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                primarySource,
                 SAMPLE_RATE_HZ,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
                 bufferBytes
             )
-            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+            if (recorder.state != AudioRecord.STATE_INITIALIZED && !preferStandardMicSource) {
                 releaseAudioRecordSafely(recorder)
+                usedVoiceRecognitionSource = false
                 recorder = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
                     SAMPLE_RATE_HZ,
@@ -272,13 +324,22 @@ class VoiceRecognitionManager(
             var hasSpeechStarted = false
             var capturedWav: ByteArray? = null
 
+            var chunkCounter = 0
+            var consecutiveVoicedChunks = 0
+            var noiseFloorRms = 0.004
+            var maxSeenRmsInWindow = 0.0
+            var peakSpeechRms = 0.0
+            var switchToStandardMic = false
+
             while (managerScope.isActive && isSessionActive && !isPaused) {
                 val readCount = recorder.read(shortBuf, 0, shortBuf.size)
                 if (readCount <= 0) continue
 
                 val chunkBytes = shortsToLittleEndianBytes(shortBuf, readCount)
                 val rms = calculateNormalizedRms(shortBuf, readCount)
-                _rmsLevel.value = (rms * 8.0).toFloat().coerceIn(0f, 1f)
+                chunkCounter++
+                if (rms > maxSeenRmsInWindow) maxSeenRmsInWindow = rms
+                _rmsLevel.value = (rms * 10.0).toFloat().coerceIn(0f, 1f)
 
                 val now = System.currentTimeMillis()
 
@@ -286,10 +347,37 @@ class VoiceRecognitionManager(
                     if (preRoll.size >= PRE_ROLL_CHUNKS) preRoll.removeFirst()
                     preRoll.addLast(chunkBytes)
 
-                    if (rms >= SPEECH_RMS_THRESHOLD) {
+                    if (usedVoiceRecognitionSource &&
+                        chunkCounter == ZERO_MIC_FALLBACK_CHUNKS &&
+                        maxSeenRmsInWindow < 0.00004 &&
+                        !forceFinishUtterance
+                    ) {
+                        // Some OEM phones deliver pure digital zeros on VOICE_RECOGNITION; switch to AudioSource.MIC
+                        Log.w("VoiceRecognition", "VOICE_RECOGNITION returned digital silence; switching to AudioSource.MIC")
+                        switchToStandardMic = true
+                        break
+                    }
+
+                    if (chunkCounter <= WARMUP_CHUNKS) {
+                        noiseFloorRms = if (chunkCounter == 1) rms else (noiseFloorRms * 0.65 + rms * 0.35)
+                        if (!forceFinishUtterance) continue
+                    }
+
+                    val (startThreshold, _) = computeAdaptiveThresholds(noiseFloorRms)
+                    val isAboveStart = rms >= startThreshold
+                    if (isAboveStart) {
+                        consecutiveVoicedChunks++
+                    } else {
+                        consecutiveVoicedChunks = 0
+                        noiseFloorRms = (noiseFloorRms * 0.88 + rms * 0.12).coerceIn(0.0008, 0.032)
+                    }
+
+                    val confirmedOnset = consecutiveVoicedChunks >= 2 || (isAboveStart && rms >= startThreshold * 1.45)
+                    if (confirmedOnset) {
                         hasSpeechStarted = true
                         speechStartedAt = now
                         lastVoiceActivityAt = now
+                        peakSpeechRms = rms
                         _lastRecognizedText.value = "Hearing your voice..."
                         while (preRoll.isNotEmpty()) {
                             speechStream.write(preRoll.removeFirst())
@@ -298,17 +386,19 @@ class VoiceRecognitionManager(
                     } else if (forceFinishUtterance) {
                         preRoll.forEach { speechStream.write(it) }
                         if (speechStream.size() >= MIN_FORCED_BYTES) {
-                            capturedWav = wrapPcm16AsWav(speechStream.toByteArray())
+                            val normalizedPcm = normalizeLowGainPcmIfSpeech(speechStream.toByteArray())
+                            capturedWav = wrapPcm16AsWav(normalizedPcm)
                         }
                         forceFinishUtterance = false
                         break
                     } else if (now - windowStartedAt >= IDLE_WINDOW_MS) {
-                        // Silence timeout: restart clean listening window silently
                         break
                     }
                 } else {
                     speechStream.write(chunkBytes)
-                    if (rms >= SPEECH_RMS_THRESHOLD * 0.8) {
+                    if (rms > peakSpeechRms) peakSpeechRms = rms
+                    val (_, continueThreshold) = computeAdaptiveThresholds(noiseFloorRms)
+                    if (rms >= continueThreshold) {
                         lastVoiceActivityAt = now
                         lastVoicedByteIndex = speechStream.size()
                     }
@@ -320,18 +410,21 @@ class VoiceRecognitionManager(
                         (forceFinishUtterance && speechStream.size() >= MIN_FORCED_BYTES)
 
                     if (shouldFinish) {
-                        val rawPcm = speechStream.toByteArray()
-                        val trimmedLen = if (lastVoicedByteIndex > 0) {
-                            minOf(rawPcm.size, lastVoicedByteIndex + TAIL_SILENCE_KEEP_BYTES) and -2
-                        } else {
-                            rawPcm.size
+                        if (peakSpeechRms >= 0.0045 || forceFinishUtterance) {
+                            val rawPcm = speechStream.toByteArray()
+                            val trimmedLen = if (lastVoicedByteIndex > 0) {
+                                minOf(rawPcm.size, lastVoicedByteIndex + TAIL_SILENCE_KEEP_BYTES) and -2
+                            } else {
+                                rawPcm.size
+                            }
+                            val slicedPcm = if (trimmedLen in MIN_FORCED_BYTES until rawPcm.size) {
+                                rawPcm.copyOf(trimmedLen)
+                            } else {
+                                rawPcm
+                            }
+                            val normalizedPcm = normalizeLowGainPcmIfSpeech(slicedPcm)
+                            capturedWav = wrapPcm16AsWav(normalizedPcm)
                         }
-                        val payloadPcm = if (trimmedLen in MIN_FORCED_BYTES until rawPcm.size) {
-                            rawPcm.copyOf(trimmedLen)
-                        } else {
-                            rawPcm
-                        }
-                        capturedWav = wrapPcm16AsWav(payloadPcm)
                         break
                     }
                 }
@@ -342,7 +435,9 @@ class VoiceRecognitionManager(
             if (activeAudioRecord == recorder) activeAudioRecord = null
 
             val wavReady = capturedWav
-            if (wavReady != null && isSessionActive && !isPaused) {
+            if (switchToStandardMic && isSessionActive && !isPaused) {
+                launchCaptureLoop(preferStandardMicSource = true)
+            } else if (wavReady != null && isSessionActive && !isPaused) {
                 _rmsLevel.value = 0f
                 _companionState.value = CompanionState.THINKING
                 _lastRecognizedText.value = "Sending voice directly to MYRAA..."
@@ -350,9 +445,8 @@ class VoiceRecognitionManager(
                     onAudioCaptured(wavReady)
                 }
             } else if (isSessionActive && !isPaused && _companionState.value == CompanionState.LISTENING) {
-                // Silent window expired without speech — seamlessly start next listening window
                 _rmsLevel.value = 0f
-                launchCaptureLoop()
+                launchCaptureLoop(preferStandardMicSource)
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             releaseAudioRecordSafely(recorder)
