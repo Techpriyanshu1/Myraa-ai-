@@ -347,15 +347,14 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                     }
                 },
                 onError = { err ->
-                    val isRateLimit = err.contains("429") ||
-                        err.contains("busy", ignoreCase = true) ||
-                        err.contains("rate limit", ignoreCase = true)
-                    if (isRateLimit && !prefs.hasStoredVoiceKey()) {
-                        _voiceOutputError.value = "Voice busy (rate limit) — auto-recovering"
-                        fleetManager.clearAgentError("mahi_voice_output")
-                    } else {
+                    if (ElevenLabsClient.isHardVoiceConfigError(err)) {
                         _voiceOutputError.value = err
                         fleetManager.recordAgentError("mahi_voice_output", err)
+                    } else {
+                        // Transient 409/429/5xx: ack cue already sounded and reply text is visible;
+                        // never flash a scary red error banner or stall listening.
+                        _voiceOutputError.value = null
+                        fleetManager.clearAgentError("mahi_voice_output")
                     }
                     if (_isSessionActive.value && !_isListeningPaused.value) {
                         voiceManager.resumeListeningAfterSpeech()
@@ -569,6 +568,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
 
         coordinatorScope.launch {
             try {
+                _voiceOutputError.value = null
                 activeSpeakJob?.cancel()
                 elevenLabsClient.stopSpeaking()
                 voiceManager.suspendListeningForProcessing(CompanionState.THINKING)
@@ -636,6 +636,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
 
         coordinatorScope.launch {
             try {
+                _voiceOutputError.value = null
                 activeSpeakJob?.cancel()
                 elevenLabsClient.stopSpeaking()
                 voiceManager.suspendListeningForProcessing(CompanionState.THINKING)

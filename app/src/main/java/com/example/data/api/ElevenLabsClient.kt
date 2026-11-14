@@ -26,7 +26,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -65,6 +68,9 @@ class ElevenLabsClient(private val context: Context) {
     private var activeMediaPlayer: MediaPlayer? = null
     @Volatile
     private var isMediaPlayerPrepared: Boolean = false
+    @Volatile
+    private var activeNetworkCall: Call? = null
+    private val ttsSynthesisMutex = Mutex()
     private var activeAudioTrack: AudioTrack? = null
     private var activeSpeechJob: Job? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -96,6 +102,26 @@ class ElevenLabsClient(private val context: Context) {
         private val zeroQuotaModels = ConcurrentHashMap.newKeySet<String>()
         @Volatile
         private var elevenLabsCooldownUntilMs = 0L
+
+        /**
+         * Returns true ONLY for hard credential/config failures that require user action in Settings.
+         * Transient 409 conflict, 429 rate-limit, 5xx, and busy states auto-recover without red UI banners.
+         */
+        fun isHardVoiceConfigError(error: String?): Boolean {
+            if (error.isNullOrBlank()) return false
+            val lower = error.lowercase()
+            if (lower.contains("409") || lower.contains("429") || lower.contains("busy") ||
+                lower.contains("rate limit") || lower.contains("timeout") || lower.contains("500") ||
+                lower.contains("502") || lower.contains("503") || lower.contains("504")
+            ) {
+                return false
+            }
+            return lower.contains("401") ||
+                lower.contains("403") ||
+                lower.contains("unauthorized") ||
+                lower.contains("missing") ||
+                lower.contains("api key")
+        }
     }
 
     /**
@@ -545,25 +571,48 @@ class ElevenLabsClient(private val context: Context) {
 
             var httpError: String? = null
             var hitRateLimit = false
-            val audioBytes = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
-                client.newCall(request).execute().use { response ->
-                    if (response.isSuccessful && response.body != null) {
-                        response.body!!.bytes()
-                    } else {
-                        val code = response.code
-                        if (code == 429) {
+            val audioBytes = ttsSynthesisMutex.withLock {
+                var resultBytes: ByteArray? = null
+                for (attempt in 1..2) {
+                    val call = client.newCall(request)
+                    activeNetworkCall = call
+                    try {
+                        val (code, bytes) = call.execute().use { response ->
+                            if (response.isSuccessful && response.body != null) {
+                                response.code to response.body!!.bytes()
+                            } else {
+                                response.code to null
+                            }
+                        }
+                        if (bytes != null) {
+                            resultBytes = bytes
+                            break
+                        }
+                        if (code == 429 || code == 409) {
                             hitRateLimit = true
                             elevenLabsCooldownUntilMs = System.currentTimeMillis() + RATE_LIMIT_COOLDOWN_MS
-                            httpError = "ElevenLabs rate limit (HTTP 429) — thoda ruk kar bolein ya Gemini Voice chunein."
-                            null
+                            httpError = "ElevenLabs temporarily busy (HTTP $code)."
+                            if (attempt == 1) {
+                                delay(650L)
+                                continue
+                            }
+                            break
                         } else if (code >= 500) {
-                            throw java.io.IOException("Transient ElevenLabs HTTP $code")
+                            httpError = "ElevenLabs temporary server error (HTTP $code)"
+                            if (attempt == 1) {
+                                delay(500L)
+                                continue
+                            }
+                            break
                         } else {
                             httpError = "ElevenLabs error (HTTP $code)"
-                            null
+                            break
                         }
+                    } finally {
+                        if (activeNetworkCall === call) activeNetworkCall = null
                     }
                 }
+                resultBytes
             }
 
             if (audioBytes != null && audioBytes.size > 200 && genId == speechGenerationId) {
@@ -655,7 +704,10 @@ class ElevenLabsClient(private val context: Context) {
                 is GeminiTtsOutcome.Failure -> {
                     lastErrorReason = outcome.reason
                     Log.w("ElevenLabsClient", "Gemini TTS chunk $i failed: ${outcome.reason}")
-                    if (outcome.reason.contains("429") || outcome.reason.contains("busy", ignoreCase = true)) break
+                    if (outcome.reason.contains("429") ||
+                        outcome.reason.contains("409") ||
+                        outcome.reason.contains("busy", ignoreCase = true)
+                    ) break
                 }
             }
         }
@@ -719,146 +771,161 @@ class ElevenLabsClient(private val context: Context) {
             return@withContext GeminiTtsOutcome.Failure("Gemini API key is missing.")
         }
 
-        val now = System.currentTimeMillis()
-        val queue = ArrayDeque<String>()
-        val attempted = mutableSetOf<String>()
-        verifiedTtsModelByKey[cleanKey]?.let { if (!zeroQuotaModels.contains(it)) queue.add(it) }
-        discoveredTtsModelsCache[cleanKey]?.forEach {
-            if (!zeroQuotaModels.contains(it) && !queue.contains(it)) queue.add(it)
-        }
-        DEFAULT_GEMINI_TTS_MODELS.forEach {
-            if (!zeroQuotaModels.contains(it) && !queue.contains(it)) queue.add(it)
-        }
-        if (queue.isEmpty()) {
-            // Re-seed primary flash TTS model if cooldown cache emptied everything
-            queue.add(DEFAULT_GEMINI_TTS_MODELS.first())
-        }
-
-        var didDiscovery = !discoveredTtsModelsCache[cleanKey].isNullOrEmpty()
-        var lastError = "Gemini AI Voice temporarily busy."
-        var sawRateLimit = false
-        val spokenDirectiveText = text.trim()
-
-        while (queue.isNotEmpty()) {
-            val model = queue.removeFirst()
-            if (!attempted.add(model)) continue
-
-            val cooldownUntil = modelCooldownUntilMs[model] ?: 0L
-            val remainingCooldown = cooldownUntil - System.currentTimeMillis()
-            if (remainingCooldown > 0L) {
-                if (remainingCooldown <= 2_600L && queue.isEmpty()) {
-                    // Brief wait for primary flash TTS cooldown instead of silently aborting
-                    delay(remainingCooldown.coerceAtMost(2_200L))
-                } else {
-                    sawRateLimit = true
-                    continue
-                }
+        ttsSynthesisMutex.withLock {
+            val queue = ArrayDeque<String>()
+            val attempted = mutableSetOf<String>()
+            verifiedTtsModelByKey[cleanKey]?.let { if (!zeroQuotaModels.contains(it)) queue.add(it) }
+            discoveredTtsModelsCache[cleanKey]?.forEach {
+                if (!zeroQuotaModels.contains(it) && !queue.contains(it)) queue.add(it)
+            }
+            DEFAULT_GEMINI_TTS_MODELS.forEach {
+                if (!zeroQuotaModels.contains(it) && !queue.contains(it)) queue.add(it)
+            }
+            if (queue.isEmpty()) {
+                queue.add(DEFAULT_GEMINI_TTS_MODELS.first())
             }
 
-            try {
-                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
-                val payload = JSONObject().apply {
-                    put("contents", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("role", "user")
-                            put("parts", JSONArray().apply {
-                                put(JSONObject().put("text", spokenDirectiveText))
-                            })
-                        })
-                    })
-                    put("generationConfig", JSONObject().apply {
-                        put("responseModalities", JSONArray().put("AUDIO"))
-                        put("speechConfig", JSONObject().apply {
-                            put("voiceConfig", JSONObject().apply {
-                                put("prebuiltVoiceConfig", JSONObject().apply {
-                                    put("voiceName", GEMINI_VOICE_MAHI)
+            var didDiscovery = !discoveredTtsModelsCache[cleanKey].isNullOrEmpty()
+            var lastError = "Gemini AI Voice temporarily busy."
+            var sawTransientBusy = false
+            val spokenDirectiveText = text.trim()
+
+            while (queue.isNotEmpty()) {
+                val model = queue.removeFirst()
+                if (!attempted.add(model)) continue
+
+                val cooldownUntil = modelCooldownUntilMs[model] ?: 0L
+                val remainingCooldown = cooldownUntil - System.currentTimeMillis()
+                if (remainingCooldown > 0L) {
+                    if (remainingCooldown <= 2_600L && queue.isEmpty()) {
+                        delay(remainingCooldown.coerceAtMost(2_200L))
+                    } else {
+                        sawTransientBusy = true
+                        continue
+                    }
+                }
+
+                try {
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
+                    val payload = JSONObject().apply {
+                        put("contents", JSONArray().apply {
+                            put(JSONObject().apply {
+                                put("parts", JSONArray().apply {
+                                    put(JSONObject().put("text", spokenDirectiveText))
                                 })
                             })
                         })
-                    })
-                }
+                        put("generationConfig", JSONObject().apply {
+                            put("responseModalities", JSONArray().put("AUDIO"))
+                            put("speechConfig", JSONObject().apply {
+                                put("voiceConfig", JSONObject().apply {
+                                    put("prebuiltVoiceConfig", JSONObject().apply {
+                                        put("voiceName", GEMINI_VOICE_MAHI)
+                                    })
+                                })
+                            })
+                        })
+                    }
 
-                val body = payload.toString().toRequestBody("application/json".toMediaType())
-                val request = Request.Builder()
-                    .url(url)
-                    .addHeader("x-goog-api-key", cleanKey)
-                    .addHeader("Content-Type", "application/json")
-                    .post(body)
-                    .build()
+                    val body = payload.toString().toRequestBody("application/json".toMediaType())
+                    val request = Request.Builder()
+                        .url(url)
+                        .addHeader("x-goog-api-key", cleanKey)
+                        .addHeader("Content-Type", "application/json")
+                        .post(body)
+                        .build()
 
-                var code = 0
-                var respBody = ""
-                var retryAfterMs = 1400L
-                val maxCalls = if (allowRateLimitRetry) 2 else 1
+                    var code = 0
+                    var respBody = ""
+                    var retryAfterMs = 1100L
+                    val maxCalls = if (allowRateLimitRetry) 2 else 1
 
-                for (callAttempt in 1..maxCalls) {
-                    val outcome = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
-                        client.newCall(request).execute().use { resp ->
-                            val ra = resp.header("Retry-After")?.toLongOrNull()?.times(1000L)
-                            Triple(resp.code, resp.body?.string() ?: "", ra)
+                    for (callAttempt in 1..maxCalls) {
+                        val outcome = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
+                            val call = client.newCall(request)
+                            activeNetworkCall = call
+                            try {
+                                call.execute().use { resp ->
+                                    val ra = resp.header("Retry-After")?.toLongOrNull()?.times(1000L)
+                                    Triple(resp.code, resp.body?.string() ?: "", ra)
+                                }
+                            } finally {
+                                if (activeNetworkCall === call) activeNetworkCall = null
+                            }
                         }
+                        code = outcome.first
+                        respBody = outcome.second
+                        val lowerErr = respBody.lowercase()
+                        val isZeroQuota = lowerErr.contains("limit: 0") || lowerErr.contains("limit:0")
+                        val bodyRetryMs = Regex("retry in\\s+([0-9]+(?:\\.[0-9]+)?)s", RegexOption.IGNORE_CASE)
+                            .find(respBody)?.groupValues?.get(1)?.toDoubleOrNull()?.times(1000.0)?.toLong()
+                        val resolvedDelay = bodyRetryMs ?: outcome.third
+                        if (resolvedDelay != null) {
+                            retryAfterMs = resolvedDelay.coerceIn(550L, 2200L)
+                        } else if (code == 409) {
+                            retryAfterMs = 550L
+                        }
+                        if (isZeroQuota) {
+                            zeroQuotaModels.add(model)
+                        }
+                        val isRetryableStatus = code == 429 || code == 409 || code in 500..599
+                        if (!isRetryableStatus || isZeroQuota || callAttempt == maxCalls) break
+                        delay(retryAfterMs)
                     }
-                    code = outcome.first
-                    respBody = outcome.second
-                    val lowerErr = respBody.lowercase()
-                    val isZeroQuota = lowerErr.contains("limit: 0") || lowerErr.contains("limit:0")
-                    val bodyRetryMs = Regex("retry in\\s+([0-9]+(?:\\.[0-9]+)?)s", RegexOption.IGNORE_CASE)
-                        .find(respBody)?.groupValues?.get(1)?.toDoubleOrNull()?.times(1000.0)?.toLong()
-                    val resolvedDelay = bodyRetryMs ?: outcome.third
-                    if (resolvedDelay != null) {
-                        retryAfterMs = resolvedDelay.coerceIn(700L, 2400L)
-                    }
-                    if (isZeroQuota) {
-                        zeroQuotaModels.add(model)
-                    }
-                    // On primary Flash TTS transient 429, recover smoothly once before falling through
-                    if (code != 429 || isZeroQuota || callAttempt == maxCalls) break
-                    delay(retryAfterMs)
-                }
 
-                if (code in 200..299 && respBody.isNotBlank()) {
-                    val extracted = extractAudioFromGeminiResponse(respBody)
-                    if (extracted != null) {
-                        verifiedTtsModelByKey[cleanKey] = model
-                        modelCooldownUntilMs.remove(model)
-                        zeroQuotaModels.remove(model)
-                        return@withContext extracted.copy(modelUsed = model)
+                    if (code in 200..299 && respBody.isNotBlank()) {
+                        val extracted = extractAudioFromGeminiResponse(respBody)
+                        if (extracted != null) {
+                            verifiedTtsModelByKey[cleanKey] = model
+                            modelCooldownUntilMs.remove(model)
+                            zeroQuotaModels.remove(model)
+                            return@withLock extracted.copy(modelUsed = model)
+                        } else {
+                            lastError = "Gemini TTS ($model) returned no audio bytes."
+                        }
+                    } else if (code == 429 || code == 409 || code in 500..599) {
+                        sawTransientBusy = true
+                        val isZeroQuota = code == 429 && respBody.lowercase().let { it.contains("limit: 0") || it.contains("limit:0") }
+                        val cooldownDuration = if (isZeroQuota) ZERO_QUOTA_COOLDOWN_MS else RATE_LIMIT_COOLDOWN_MS
+                        modelCooldownUntilMs[model] = System.currentTimeMillis() + cooldownDuration
+                        lastError = "Gemini Voice abhi busy hai (HTTP $code)."
+                        if (!didDiscovery && code == 409) {
+                            didDiscovery = true
+                            val liveTts = discoverGeminiTtsModels(cleanKey)
+                            liveTts.asReversed().forEach { m ->
+                                if (!attempted.contains(m) && !queue.contains(m)) {
+                                    queue.addFirst(m)
+                                }
+                            }
+                        }
                     } else {
-                        lastError = "Gemini TTS ($model) returned no audio bytes."
-                    }
-                } else if (code == 429) {
-                    sawRateLimit = true
-                    val isZeroQuota = respBody.lowercase().let { it.contains("limit: 0") || it.contains("limit:0") }
-                    val cooldownDuration = if (isZeroQuota) ZERO_QUOTA_COOLDOWN_MS else RATE_LIMIT_COOLDOWN_MS
-                    modelCooldownUntilMs[model] = System.currentTimeMillis() + cooldownDuration
-                    lastError = "Gemini Voice abhi busy hai (rate limit) — 2 second baad dobara bolein."
-                } else {
-                    lastError = "HTTP $code"
-                    if (code == 401 || code == 403) {
-                        return@withContext GeminiTtsOutcome.Failure("Gemini API key unauthorized ($code).")
-                    }
-                    if (!didDiscovery && (code == 404 || code == 400)) {
-                        didDiscovery = true
-                        val liveTts = discoverGeminiTtsModels(cleanKey)
-                        liveTts.asReversed().forEach { m ->
-                            if (!attempted.contains(m) && !queue.contains(m)) {
-                                queue.addFirst(m)
+                        lastError = "HTTP $code"
+                        if (code == 401 || code == 403) {
+                            return@withLock GeminiTtsOutcome.Failure("Gemini API key unauthorized ($code).")
+                        }
+                        if (!didDiscovery && (code == 404 || code == 400)) {
+                            didDiscovery = true
+                            val liveTts = discoverGeminiTtsModels(cleanKey)
+                            liveTts.asReversed().forEach { m ->
+                                if (!attempted.contains(m) && !queue.contains(m)) {
+                                    queue.addFirst(m)
+                                }
                             }
                         }
                     }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (e: Exception) {
+                    lastError = e.localizedMessage ?: "Network error"
+                    Log.w("ElevenLabsClient", "Gemini TTS error with $model", e)
                 }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                lastError = e.localizedMessage ?: "Network error"
-                Log.w("ElevenLabsClient", "Gemini TTS error with $model", e)
             }
-        }
 
-        if (sawRateLimit) {
-            GeminiTtsOutcome.Failure("Gemini Voice abhi busy hai (429) — 2-3 second baad phir try karein.")
-        } else {
-            GeminiTtsOutcome.Failure(lastError)
+            if (sawTransientBusy) {
+                GeminiTtsOutcome.Failure(lastError)
+            } else {
+                GeminiTtsOutcome.Failure(lastError)
+            }
         }
     }
 
@@ -1311,6 +1378,10 @@ class ElevenLabsClient(private val context: Context) {
         speechGenerationId++
         activeSpeechJob?.cancel()
         activeSpeechJob = null
+        try {
+            activeNetworkCall?.cancel()
+        } catch (_: Exception) {}
+        activeNetworkCall = null
         mainHandler.removeCallbacksAndMessages(null)
         releaseMediaPlayerOnly()
         try {

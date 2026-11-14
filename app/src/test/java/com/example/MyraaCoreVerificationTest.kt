@@ -702,5 +702,13 @@ class MyraaCoreVerificationTest {
         assertEquals("CHAT", dateCmd.actionType)
         assertEquals("date_query", dateCmd.intent)
         assertTrue(dateCmd.spokenResponse.contains("Aaj", ignoreCase = true))
+
+        // Transient HTTP 409 / 429 / 503 should silently auto-recover without flashing red banners
+        assertFalse(ElevenLabsClient.isHardVoiceConfigError("HTTP 409"))
+        assertFalse(ElevenLabsClient.isHardVoiceConfigError("Gemini Voice abhi busy hai (HTTP 409)."))
+        assertFalse(ElevenLabsClient.isHardVoiceConfigError("Gemini Voice abhi busy hai (429)"))
+        assertFalse(ElevenLabsClient.isHardVoiceConfigError("ElevenLabs temporary server error (HTTP 503)"))
+        assertTrue(ElevenLabsClient.isHardVoiceConfigError("Gemini API key unauthorized (401)."))
+        assertTrue(ElevenLabsClient.isHardVoiceConfigError("Gemini API key missing."))
     }
 }

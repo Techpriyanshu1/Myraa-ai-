@@ -182,7 +182,7 @@ class GeminiClient {
             }
         }
 
-        val first = send(true)
+        var first = send(true)
         // Auto-retry without thinkingConfig if a model variant returns HTTP 400 rejecting thinkingConfig
         if (first.first == 400 && buildThinkingConfig(model) != null) {
             val err = parseErrorMessage(first.second)
@@ -192,6 +192,11 @@ class GeminiClient {
                     return second
                 }
             }
+        }
+        // Single fast retry on transient 409 Conflict / 503 Unavailable
+        if (first.first == 409 || first.first == 503) {
+            try { Thread.sleep(400L) } catch (_: InterruptedException) {}
+            first = send(true)
         }
         return first
     }
@@ -461,7 +466,7 @@ class GeminiClient {
                     } else {
                         val errMsg = parseErrorMessage(rawBody)
                         val formattedErr = "HTTP $code: $errMsg"
-                        if (code == 429) {
+                        if (code == 429 || code == 409 || code in 500..599) {
                             recordRateLimitCooldown(model, rawBody, retryAfterSec)
                             if (firstActionableError == null) firstActionableError = formattedErr
                         } else if (code != 404 && firstActionableError == null) {
@@ -474,7 +479,7 @@ class GeminiClient {
                         if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
                             break
                         }
-                        if (code == 429) {
+                        if (code == 429 || code == 409 || code in 500..599) {
                             continue
                         }
                         if (!didLiveDiscovery && (code == 404 || code == 400)) {
@@ -652,7 +657,7 @@ class GeminiClient {
                 } else {
                     val errMsg = parseErrorMessage(rawBody)
                     val formattedErr = "HTTP $code: $errMsg"
-                    if (code == 429) {
+                    if (code == 429 || code == 409 || code in 500..599) {
                         recordRateLimitCooldown(model, rawBody, retryAfterSec)
                         if (firstActionableError == null) firstActionableError = formattedErr
                     } else if (code != 404 && firstActionableError == null) {
@@ -665,7 +670,7 @@ class GeminiClient {
                     if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
                         break
                     }
-                    if (code == 429) {
+                    if (code == 429 || code == 409 || code in 500..599) {
                         continue
                     }
                     if (!didLiveDiscovery && (code == 404 || code == 400)) {
