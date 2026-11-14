@@ -69,14 +69,15 @@ class VoiceRecognitionManager(
         private const val SAMPLE_RATE_HZ = 16000
         private const val CHANNELS = 1
         private const val BITS_PER_SAMPLE = 16
-        private const val CHUNK_SHORTS = 1600 // 100ms per chunk at 16kHz
-        private const val PRE_ROLL_CHUNKS = 7 // ~700ms pre-roll before speech trigger
-        private const val SPEECH_RMS_THRESHOLD = 0.025
-        private const val SILENCE_END_MS = 1350L
-        private const val MIN_SPEECH_MS = 350L
-        private const val MAX_UTTERANCE_MS = 14000L
+        private const val CHUNK_SHORTS = 800 // 50ms per chunk at 16kHz for snappy VAD
+        private const val PRE_ROLL_CHUNKS = 8 // ~400ms pre-roll before speech trigger
+        private const val SPEECH_RMS_THRESHOLD = 0.018
+        private const val SILENCE_END_MS = 650L
+        private const val MIN_SPEECH_MS = 250L
+        private const val MAX_UTTERANCE_MS = 12000L
         private const val IDLE_WINDOW_MS = 20000L
-        private const val MIN_FORCED_BYTES = 6400 // ~200ms
+        private const val MIN_FORCED_BYTES = 4800 // ~150ms
+        private const val TAIL_SILENCE_KEEP_BYTES = 800 * 2 * 4 // ~200ms tail
     }
 
     fun prepareSessionForGreeting() {
@@ -267,6 +268,7 @@ class VoiceRecognitionManager(
             val windowStartedAt = System.currentTimeMillis()
             var speechStartedAt = 0L
             var lastVoiceActivityAt = 0L
+            var lastVoicedByteIndex = 0
             var hasSpeechStarted = false
             var capturedWav: ByteArray? = null
 
@@ -276,7 +278,7 @@ class VoiceRecognitionManager(
 
                 val chunkBytes = shortsToLittleEndianBytes(shortBuf, readCount)
                 val rms = calculateNormalizedRms(shortBuf, readCount)
-                _rmsLevel.value = (rms * 7.5).toFloat().coerceIn(0f, 1f)
+                _rmsLevel.value = (rms * 8.0).toFloat().coerceIn(0f, 1f)
 
                 val now = System.currentTimeMillis()
 
@@ -292,9 +294,7 @@ class VoiceRecognitionManager(
                         while (preRoll.isNotEmpty()) {
                             speechStream.write(preRoll.removeFirst())
                         }
-                    } else if (forceFinishUtterance && speechStream.size() >= MIN_FORCED_BYTES) {
-                        capturedWav = wrapPcm16AsWav(speechStream.toByteArray())
-                        break
+                        lastVoicedByteIndex = speechStream.size()
                     } else if (forceFinishUtterance) {
                         preRoll.forEach { speechStream.write(it) }
                         if (speechStream.size() >= MIN_FORCED_BYTES) {
@@ -308,8 +308,9 @@ class VoiceRecognitionManager(
                     }
                 } else {
                     speechStream.write(chunkBytes)
-                    if (rms >= SPEECH_RMS_THRESHOLD * 0.85) {
+                    if (rms >= SPEECH_RMS_THRESHOLD * 0.8) {
                         lastVoiceActivityAt = now
+                        lastVoicedByteIndex = speechStream.size()
                     }
 
                     val speechElapsed = now - speechStartedAt
@@ -319,7 +320,18 @@ class VoiceRecognitionManager(
                         (forceFinishUtterance && speechStream.size() >= MIN_FORCED_BYTES)
 
                     if (shouldFinish) {
-                        capturedWav = wrapPcm16AsWav(speechStream.toByteArray())
+                        val rawPcm = speechStream.toByteArray()
+                        val trimmedLen = if (lastVoicedByteIndex > 0) {
+                            minOf(rawPcm.size, lastVoicedByteIndex + TAIL_SILENCE_KEEP_BYTES) and -2
+                        } else {
+                            rawPcm.size
+                        }
+                        val payloadPcm = if (trimmedLen in MIN_FORCED_BYTES until rawPcm.size) {
+                            rawPcm.copyOf(trimmedLen)
+                        } else {
+                            rawPcm
+                        }
+                        capturedWav = wrapPcm16AsWav(payloadPcm)
                         break
                     }
                 }

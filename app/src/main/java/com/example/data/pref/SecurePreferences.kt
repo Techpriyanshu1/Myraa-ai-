@@ -57,7 +57,11 @@ class SecurePreferences(private val context: Context) {
 
     fun getSelectedGeminiModel(): String {
         val saved = prefs.getString("selected_gemini_model", DEFAULT_GEMINI_MODEL)?.trim().orEmpty()
-        if (saved.isBlank() || saved == "gemini-3.8-flash") {
+        if (saved.isBlank() ||
+            saved == "gemini-3.8-flash" ||
+            saved == "gemini-2.5-pro" ||
+            saved == "gemini-2.0-flash"
+        ) {
             return DEFAULT_GEMINI_MODEL
         }
         return saved

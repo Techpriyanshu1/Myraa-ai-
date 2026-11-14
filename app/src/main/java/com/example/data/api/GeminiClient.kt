@@ -42,13 +42,18 @@ class GeminiClient {
             "gemini-flash-latest",
             "gemini-3.1-pro-preview",
             "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-            "gemini-2.5-pro"
+            "gemini-2.5-flash-lite"
+        )
+
+        private val RETIRED_MODELS = setOf(
+            "gemini-3.8-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash"
         )
 
         private val discoveredModelsCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
         private val verifiedModelByKey = java.util.concurrent.ConcurrentHashMap<String, String>()
+        private val modelCooldownUntilMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
         /**
          * Parses Google's `/v1beta/models` response JSON and returns sorted `generateContent`-capable
@@ -121,8 +126,74 @@ class GeminiClient {
         }
     }
 
-    private fun supportsZeroThinkingBudget(model: String): Boolean {
-        return model == "gemini-2.5-flash" || model == "gemini-2.5-flash-lite"
+    private fun sanitizePreferredModel(model: String): String {
+        val trimmed = model.trim()
+        return if (trimmed.isBlank() || trimmed in RETIRED_MODELS) {
+            AVAILABLE_MODELS.first()
+        } else {
+            trimmed
+        }
+    }
+
+    private fun buildThinkingConfig(model: String): JSONObject? {
+        val lower = model.lowercase()
+        return when {
+            lower.startsWith("gemini-2.5-flash") && !lower.contains("lite") -> JSONObject().put("thinkingBudget", 0)
+            lower.startsWith("gemini-3") && lower.contains("flash") -> JSONObject().put("thinkingLevel", "minimal")
+            lower.startsWith("gemini-3") && lower.contains("pro") -> JSONObject().put("thinkingLevel", "low")
+            else -> null
+        }
+    }
+
+    private fun recordRateLimitCooldown(model: String, errBody: String, retryHeaderSec: Long?): Long {
+        val lower = errBody.lowercase()
+        val isZeroQuota = lower.contains("limit: 0") || lower.contains("limit:0")
+        val retryMsFromBody = Regex("retry in\\s+([0-9]+(?:\\.[0-9]+)?)s", RegexOption.IGNORE_CASE)
+            .find(errBody)?.groupValues?.get(1)?.toDoubleOrNull()?.times(1000.0)?.toLong()
+        val headerMs = retryHeaderSec?.times(1000L)
+        val cooldownMs = when {
+            isZeroQuota -> 120_000L
+            retryMsFromBody != null -> retryMsFromBody.coerceIn(2_000L, 60_000L)
+            headerMs != null -> headerMs.coerceIn(2_000L, 60_000L)
+            else -> 20_000L
+        }
+        modelCooldownUntilMs[model] = System.currentTimeMillis() + cooldownMs
+        return cooldownMs
+    }
+
+    private fun executeGenerateRequest(
+        model: String,
+        cleanKey: String,
+        payloadBuilder: (includeThinking: Boolean) -> JSONObject
+    ): Triple<Int, String, Long?> {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
+        fun send(includeThinking: Boolean): Triple<Int, String, Long?> {
+            val payload = payloadBuilder(includeThinking)
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("x-goog-api-key", cleanKey)
+                .addHeader("Content-Type", "application/json")
+                .post(body)
+                .build()
+            return client.newCall(request).execute().use { response ->
+                val retryAfterSec = response.header("Retry-After")?.toLongOrNull()
+                Triple(response.code, response.body?.string() ?: "", retryAfterSec)
+            }
+        }
+
+        val first = send(true)
+        // Auto-retry without thinkingConfig if a model variant returns HTTP 400 rejecting thinkingConfig
+        if (first.first == 400 && buildThinkingConfig(model) != null) {
+            val err = parseErrorMessage(first.second)
+            if (!err.contains("API key", ignoreCase = true)) {
+                val second = send(false)
+                if (second.first in 200..299 || second.first != 400) {
+                    return second
+                }
+            }
+        }
+        return first
     }
 
     /**
@@ -174,12 +245,11 @@ class GeminiClient {
             return@withContext ConnectionTestResult.Failure("API key is empty. Please enter your Gemini API key.")
         }
 
-        val safePreferred = selectedModel.trim().takeIf {
-            it.isNotBlank() && it != "gemini-3.8-flash"
-        } ?: AVAILABLE_MODELS.first()
+        val safePreferred = sanitizePreferredModel(selectedModel)
 
-        // Discover live enabled models for this key so retired 2.x keys automatically resolve to 3.x / latest
+        // Discover live enabled models for this key so retired keys automatically resolve to 3.x / latest
         val discovered = discoverAvailableModels(cleanKey, forceRefresh = true)
+            .filterNot { it in RETIRED_MODELS }
         val candidateModels = if (discovered.isNotEmpty()) {
             buildList {
                 if (safePreferred in discovered) add(safePreferred)
@@ -190,47 +260,37 @@ class GeminiClient {
             (listOf(safePreferred) + AVAILABLE_MODELS).distinct()
         }
 
-        var lastFailure = ConnectionTestResult.Failure("Gemini connection failed.")
+        var lastFailure: ConnectionTestResult.Failure? = null
+        var firstRateLimitFailure: ConnectionTestResult.Failure? = null
 
         for (targetModel in candidateModels) {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/$targetModel:generateContent"
             try {
-                val testPayload = JSONObject().apply {
-                    put("contents", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("role", "user")
-                            put("parts", JSONArray().apply {
-                                put(JSONObject().put("text", "Reply with only OK."))
-                            })
-                        })
-                    })
-                    put("generationConfig", JSONObject().apply {
-                        put("maxOutputTokens", 256)
-                        if (supportsZeroThinkingBudget(targetModel)) {
-                            put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
-                        }
-                    })
-                }
-
-                val body = testPayload.toString().toRequestBody("application/json".toMediaType())
-                val request = Request.Builder()
-                    .url(url)
-                    .addHeader("x-goog-api-key", cleanKey)
-                    .addHeader("Content-Type", "application/json")
-                    .post(body)
-                    .build()
-
-                val (code, errBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                val (code, errBody, retryAfterSec) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
                     maxAttempts = 2
                 ) {
-                    client.newCall(request).execute().use { response ->
-                        val responseBodyStr = response.body?.string() ?: ""
-                        Triple(response.code, responseBodyStr, response.isSuccessful)
+                    executeGenerateRequest(targetModel, cleanKey) { includeThinking ->
+                        JSONObject().apply {
+                            put("contents", JSONArray().apply {
+                                put(JSONObject().apply {
+                                    put("role", "user")
+                                    put("parts", JSONArray().apply {
+                                        put(JSONObject().put("text", "Reply with only OK."))
+                                    })
+                                })
+                            })
+                            put("generationConfig", JSONObject().apply {
+                                put("maxOutputTokens", 128)
+                                if (includeThinking) {
+                                    buildThinkingConfig(targetModel)?.let { put("thinkingConfig", it) }
+                                }
+                            })
+                        }
                     }
                 }
 
-                if (isOk) {
+                if (code in 200..299) {
                     verifiedModelByKey[cleanKey] = targetModel
+                    modelCooldownUntilMs.remove(targetModel)
                     return@withContext ConnectionTestResult.Success(
                         message = "Connection successful with $targetModel!",
                         modelUsed = targetModel
@@ -238,6 +298,9 @@ class GeminiClient {
                 }
 
                 val parsedErr = parseErrorMessage(errBody)
+                if (code == 429) {
+                    recordRateLimitCooldown(targetModel, errBody, retryAfterSec)
+                }
                 val humanMsg = when (code) {
                     400 -> "API key or request invalid: $parsedErr"
                     401, 403 -> "Invalid Gemini API key or access denied: $parsedErr"
@@ -245,11 +308,17 @@ class GeminiClient {
                     429 -> "Rate limit / quota reached ($targetModel): $parsedErr"
                     else -> "Connection failed (HTTP $code): $parsedErr"
                 }
-                lastFailure = ConnectionTestResult.Failure(humanMsg, code)
+                val failure = ConnectionTestResult.Failure(humanMsg, code)
+                if (code == 429 && firstRateLimitFailure == null) {
+                    firstRateLimitFailure = failure
+                }
+                if (lastFailure == null || code != 404) {
+                    lastFailure = failure
+                }
 
                 // Invalid API key won't pass on other models — fail fast with clear error
                 if (code == 401 || code == 403 || (code == 400 && parsedErr.contains("API key", ignoreCase = true))) {
-                    return@withContext lastFailure
+                    return@withContext failure
                 }
             } catch (ce: kotlinx.coroutines.CancellationException) {
                 throw ce
@@ -259,7 +328,7 @@ class GeminiClient {
             }
         }
 
-        return@withContext lastFailure
+        return@withContext firstRateLimitFailure ?: lastFailure ?: ConnectionTestResult.Failure("Gemini connection failed.")
     }
 
     suspend fun interpretCommand(
@@ -294,13 +363,12 @@ class GeminiClient {
         // 3. Structured JSON Intelligence via Gemini with Mahi Persona + Multimodal Screen Vision
         val cleanKey = apiKey.trim()
         var lastApiError: String? = null
+        var firstActionableError: String? = null
         if (cleanKey.isNotBlank()) {
-            val safePreferred = preferredModel.trim().takeIf {
-                it.isNotBlank() && it != "gemini-3.8-flash"
-            } ?: AVAILABLE_MODELS.first()
+            val safePreferred = sanitizePreferredModel(preferredModel)
 
-            val cachedVerified = verifiedModelByKey[cleanKey]
-            val initialDiscovered = discoveredModelsCache[cleanKey].orEmpty()
+            val cachedVerified = verifiedModelByKey[cleanKey]?.takeIf { it !in RETIRED_MODELS }
+            val initialDiscovered = discoveredModelsCache[cleanKey].orEmpty().filterNot { it in RETIRED_MODELS }
             val queue = ArrayDeque<String>()
             val attempted = mutableSetOf<String>()
 
@@ -310,17 +378,21 @@ class GeminiClient {
             AVAILABLE_MODELS.forEach { if (!queue.contains(it)) queue.add(it) }
 
             var didLiveDiscovery = initialDiscovered.isNotEmpty()
+            val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
+            val systemPrompt = buildGeminiSystemPrompt(effectiveMemory, screenContextSummary)
 
             while (queue.isNotEmpty()) {
                 val model = queue.removeFirst()
                 if (!attempted.add(model)) continue
+                val cooldownUntil = modelCooldownUntilMs[model] ?: 0L
+                if (cooldownUntil > System.currentTimeMillis() && queue.isNotEmpty()) {
+                    if (firstActionableError == null) {
+                        firstActionableError = "HTTP 429: Rate limit cooldown active for $model"
+                    }
+                    continue
+                }
 
                 try {
-                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
-
-                    val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
-                    val systemPrompt = buildGeminiSystemPrompt(effectiveMemory, screenContextSummary)
-
                     val userParts = JSONArray().apply {
                         put(JSONObject().put("text", "$systemPrompt\n\nUser command: $trimmed"))
                         if (!screenImageBase64.isNullOrBlank()) {
@@ -333,42 +405,31 @@ class GeminiClient {
                         }
                     }
 
-                    val genConfig = JSONObject().apply {
-                        put("temperature", 0.35)
-                        put("maxOutputTokens", 2048)
-                        put("responseMimeType", "application/json")
-                        if (supportsZeroThinkingBudget(model)) {
-                            put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
-                        }
-                    }
-
-                    val requestJson = JSONObject().apply {
-                        put("contents", JSONArray().apply {
-                            put(JSONObject().apply {
-                                put("role", "user")
-                                put("parts", userParts)
-                            })
-                        })
-                        put("generationConfig", genConfig)
-                    }
-
-                    val body = requestJson.toString().toRequestBody("application/json".toMediaType())
-                    val request = Request.Builder()
-                        .url(url)
-                        .addHeader("x-goog-api-key", cleanKey)
-                        .addHeader("Content-Type", "application/json")
-                        .post(body)
-                        .build()
-
-                    val (code, rawBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                    val (code, rawBody, retryAfterSec) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
                         maxAttempts = 2
                     ) {
-                        client.newCall(request).execute().use { response ->
-                            Triple(response.code, response.body?.string() ?: "", response.isSuccessful)
+                        executeGenerateRequest(model, cleanKey) { includeThinking ->
+                            JSONObject().apply {
+                                put("contents", JSONArray().apply {
+                                    put(JSONObject().apply {
+                                        put("role", "user")
+                                        put("parts", userParts)
+                                    })
+                                })
+                                put("generationConfig", JSONObject().apply {
+                                    put("temperature", 0.3)
+                                    put("maxOutputTokens", 384)
+                                    put("responseMimeType", "application/json")
+                                    if (includeThinking) {
+                                        buildThinkingConfig(model)?.let { put("thinkingConfig", it) }
+                                    }
+                                })
+                            }
                         }
                     }
 
-                    if (isOk && rawBody.isNotBlank()) {
+                    if (code in 200..299 && rawBody.isNotBlank()) {
+                        modelCooldownUntilMs.remove(model)
                         val root = JSONObject(rawBody)
                         val candidates = root.optJSONArray("candidates")
                         if (candidates != null && candidates.length() > 0) {
@@ -399,18 +460,28 @@ class GeminiClient {
                         }
                     } else {
                         val errMsg = parseErrorMessage(rawBody)
-                        lastApiError = "HTTP $code: $errMsg"
+                        val formattedErr = "HTTP $code: $errMsg"
+                        if (code == 429) {
+                            recordRateLimitCooldown(model, rawBody, retryAfterSec)
+                            if (firstActionableError == null) firstActionableError = formattedErr
+                        } else if (code != 404 && firstActionableError == null) {
+                            firstActionableError = formattedErr
+                        }
+                        if (lastApiError == null || code != 404) {
+                            lastApiError = formattedErr
+                        }
                         Log.w("GeminiClient", "Gemini $model HTTP $code: $errMsg")
                         if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
-                            // Invalid key/permission won't succeed on fallback models
                             break
                         }
-                        // On 404 / deprecated model, dynamically discover live models enabled for this key
+                        if (code == 429) {
+                            continue
+                        }
                         if (!didLiveDiscovery && (code == 404 || code == 400)) {
                             didLiveDiscovery = true
                             val liveModels = discoverAvailableModels(cleanKey, forceRefresh = true)
+                                .filterNot { it in RETIRED_MODELS }
                             if (liveModels.isNotEmpty()) {
-                                // Prepend discovered active models right at the front of the queue
                                 liveModels.asReversed().forEach { discoveredModel ->
                                     if (!attempted.contains(discoveredModel) && !queue.contains(discoveredModel)) {
                                         queue.addFirst(discoveredModel)
@@ -426,6 +497,7 @@ class GeminiClient {
                     Log.w("GeminiClient", "Error querying Gemini $model", e)
                 }
             }
+            lastApiError = firstActionableError ?: lastApiError
         }
 
         // 4. Fallback bilingual conversation engine (or report real Gemini error if key is present)
@@ -468,12 +540,10 @@ class GeminiClient {
         }
 
         val audioBase64 = Base64.encodeToString(audioWavBytes, Base64.NO_WRAP)
-        val safePreferred = preferredModel.trim().takeIf {
-            it.isNotBlank() && it != "gemini-3.8-flash"
-        } ?: AVAILABLE_MODELS.first()
+        val safePreferred = sanitizePreferredModel(preferredModel)
 
-        val cachedVerified = verifiedModelByKey[cleanKey]
-        val initialDiscovered = discoveredModelsCache[cleanKey].orEmpty()
+        val cachedVerified = verifiedModelByKey[cleanKey]?.takeIf { it !in RETIRED_MODELS }
+        val initialDiscovered = discoveredModelsCache[cleanKey].orEmpty().filterNot { it in RETIRED_MODELS }
         val queue = ArrayDeque<String>()
         val attempted = mutableSetOf<String>()
 
@@ -484,6 +554,7 @@ class GeminiClient {
 
         var didLiveDiscovery = initialDiscovered.isNotEmpty()
         var lastApiError: String? = null
+        var firstActionableError: String? = null
 
         val effectiveMemory = buildAuthoritativeMemoryBlock(memoryContext)
         val systemPrompt = buildGeminiSystemPrompt(effectiveMemory, screenContextSummary) + "\n- Listen directly to the attached user voice audio, understand intent, put a concise summary of what they said in \"heardSummary\", and respond warmly."
@@ -491,9 +562,15 @@ class GeminiClient {
         while (queue.isNotEmpty()) {
             val model = queue.removeFirst()
             if (!attempted.add(model)) continue
+            val cooldownUntil = modelCooldownUntilMs[model] ?: 0L
+            if (cooldownUntil > System.currentTimeMillis() && queue.isNotEmpty()) {
+                if (firstActionableError == null) {
+                    firstActionableError = "HTTP 429: Rate limit cooldown active for $model"
+                }
+                continue
+            }
 
             try {
-                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
                 val userParts = JSONArray().apply {
                     put(JSONObject().put("text", "$systemPrompt\n\nListen to the user's voice message in the attached audio and return the JSON object."))
                     put(JSONObject().apply {
@@ -512,42 +589,31 @@ class GeminiClient {
                     }
                 }
 
-                val genConfig = JSONObject().apply {
-                    put("temperature", 0.35)
-                    put("maxOutputTokens", 2048)
-                    put("responseMimeType", "application/json")
-                    if (supportsZeroThinkingBudget(model)) {
-                        put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
-                    }
-                }
-
-                val requestJson = JSONObject().apply {
-                    put("contents", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("role", "user")
-                            put("parts", userParts)
-                        })
-                    })
-                    put("generationConfig", genConfig)
-                }
-
-                val body = requestJson.toString().toRequestBody("application/json".toMediaType())
-                val request = Request.Builder()
-                    .url(url)
-                    .addHeader("x-goog-api-key", cleanKey)
-                    .addHeader("Content-Type", "application/json")
-                    .post(body)
-                    .build()
-
-                val (code, rawBody, isOk) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
+                val (code, rawBody, retryAfterSec) = com.example.core.NetworkRetryHelper.withExponentialBackoff(
                     maxAttempts = 2
                 ) {
-                    client.newCall(request).execute().use { response ->
-                        Triple(response.code, response.body?.string() ?: "", response.isSuccessful)
+                    executeGenerateRequest(model, cleanKey) { includeThinking ->
+                        JSONObject().apply {
+                            put("contents", JSONArray().apply {
+                                put(JSONObject().apply {
+                                    put("role", "user")
+                                    put("parts", userParts)
+                                })
+                            })
+                            put("generationConfig", JSONObject().apply {
+                                put("temperature", 0.3)
+                                put("maxOutputTokens", 384)
+                                put("responseMimeType", "application/json")
+                                if (includeThinking) {
+                                    buildThinkingConfig(model)?.let { put("thinkingConfig", it) }
+                                }
+                            })
+                        }
                     }
                 }
 
-                if (isOk && rawBody.isNotBlank()) {
+                if (code in 200..299 && rawBody.isNotBlank()) {
+                    modelCooldownUntilMs.remove(model)
                     val root = JSONObject(rawBody)
                     val candidates = root.optJSONArray("candidates")
                     if (candidates != null && candidates.length() > 0) {
@@ -570,8 +636,6 @@ class GeminiClient {
                                     onModelAutoUpdated?.invoke(model)
                                 }
                                 val heard = structured.heardSummary.ifBlank { "Voice command" }
-                                val commandText = if (structured.actionType == "CHAT") heard else structured.target
-                                // Run deterministic reflex if Gemini emitted plain CHAT for a hardware phrase
                                 val refined = if (structured.actionType == "CHAT" && heard != "Voice command") {
                                     val stripped = stripWakeWords(heard)
                                     parseDeviceHardwareReflex(stripped, heard) ?: parseScreenActionReflex(stripped, heard) ?: structured.copy(rawPrompt = heard)
@@ -587,14 +651,27 @@ class GeminiClient {
                     }
                 } else {
                     val errMsg = parseErrorMessage(rawBody)
-                    lastApiError = "HTTP $code: $errMsg"
+                    val formattedErr = "HTTP $code: $errMsg"
+                    if (code == 429) {
+                        recordRateLimitCooldown(model, rawBody, retryAfterSec)
+                        if (firstActionableError == null) firstActionableError = formattedErr
+                    } else if (code != 404 && firstActionableError == null) {
+                        firstActionableError = formattedErr
+                    }
+                    if (lastApiError == null || code != 404) {
+                        lastApiError = formattedErr
+                    }
                     Log.w("GeminiClient", "Gemini Audio $model HTTP $code: $errMsg")
                     if (code == 401 || code == 403 || (code == 400 && errMsg.contains("API key", ignoreCase = true))) {
                         break
                     }
+                    if (code == 429) {
+                        continue
+                    }
                     if (!didLiveDiscovery && (code == 404 || code == 400)) {
                         didLiveDiscovery = true
                         val liveModels = discoverAvailableModels(cleanKey, forceRefresh = true)
+                            .filterNot { it in RETIRED_MODELS }
                         if (liveModels.isNotEmpty()) {
                             liveModels.asReversed().forEach { discoveredModel ->
                                 if (!attempted.contains(discoveredModel) && !queue.contains(discoveredModel)) {
@@ -612,8 +689,9 @@ class GeminiClient {
             }
         }
 
+        val finalError = firstActionableError ?: lastApiError ?: "Network error"
         return@withContext ParsedCommand(
-            spokenResponse = "Gemini voice se connect nahi ho paaya (${lastApiError ?: "Network error"}). Kripya internet ya Gemini key check karein.",
+            spokenResponse = "Gemini voice se connect nahi ho paaya ($finalError). Kripya internet ya Gemini key check karein.",
             actionType = "CHAT",
             target = "",
             rawPrompt = "Voice command",
@@ -652,18 +730,16 @@ class GeminiClient {
               "extraData": "optional text to type or extra info",
               "riskLevel": "LOW|MEDIUM|HIGH",
               "requiresConfirmation": false,
-              "spokenResponse": "Crisp 1-sentence reply in Hindi, Hinglish, or English matching user language, max 18 words so voice plays super fast, no markdown or emojis"
+              "spokenResponse": "Crisp 1-sentence reply in Hindi, Hinglish, or English matching user language, max 14 words for instant AI voice, no markdown or emojis"
             }
             STRICT RULES:
-            - ALWAYS remember and honor the Permanent Core Memory and User Personal Preferences above. Never contradict, ignore, or forget them.
-            - Use YOUTUBE_SEARCH when the user asks to search, find, or play any song or video on YouTube, putting ONLY the clean song/video query in "target".
-            - Use ACCESSIBILITY with target="scroll_down" when the user asks to scroll down, swipe up, scroll shorts/reels, or go to the next short/video; use target="scroll_up" for previous short/scroll up.
-            - Use SCREEN_CLICK (with exact visible UI label in "target") or SCREEN_TYPE (with text in "extraData") to interact with buttons/fields currently visible on screen.
-            - Never output executable code or shell commands.
-            - For OPEN_SETTINGS, NEVER claim the setting was toggled ON/OFF; say the settings screen is being opened so the user can change it.
-            - Set requiresConfirmation=true and riskLevel="HIGH" for irreversible or sensitive actions (like locking screen, deleting, uninstalling, sending/paying).
-            - Keep spokenResponse ultra concise (under 18 words for fast AI voice playback) unless the user specifically asks for a long explanation.
-            - If a live screenshot is attached, inspect it carefully to answer screen questions or identify visible UI labels to tap/describe.
+            - ALWAYS honor Permanent Core Memory and User Preferences above.
+            - Use YOUTUBE_SEARCH to search or play any song/video on YouTube (put ONLY the clean query in "target").
+            - Use ACCESSIBILITY with target="scroll_down" for scroll/next short/reel/video; target="scroll_up" for scroll up/previous short.
+            - Use SCREEN_CLICK (exact visible UI label in "target") or SCREEN_TYPE (text in "extraData") to interact with current screen UI.
+            - Never output shell/code payloads. For OPEN_SETTINGS, say settings screen is opening (never claim toggled ON/OFF).
+            - Set requiresConfirmation=true and riskLevel="HIGH" for lock screen, delete, uninstall, or payment actions.
+            - Keep spokenResponse under 14 words unless the user asks for details. If a screenshot is attached, use it directly.
         """.trimIndent()
     }
 

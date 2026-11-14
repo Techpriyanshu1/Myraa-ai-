@@ -1,6 +1,8 @@
 package com.example.voice
 
 import android.content.Context
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.provider.Settings
 import android.util.Log
 import com.example.agents.AgentFleetManager
@@ -27,6 +29,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -133,6 +137,19 @@ class MyraaSessionCoordinator private constructor(context: Context) {
         const val GREETING_TEXT =
             "Namaste! Main MYRAA AI hoon, aapki Mahi voice ready hai. Boliye main aapki kya madad karu?"
 
+        internal val RAPID_GESTURE_TARGETS = setOf(
+            "scroll_down",
+            "scroll_up",
+            "swipe_up",
+            "swipe_down",
+            "next_short",
+            "next_video",
+            "previous_short",
+            "previous_video",
+            "home",
+            "back"
+        )
+
         @Volatile
         private var INSTANCE: MyraaSessionCoordinator? = null
 
@@ -149,7 +166,6 @@ class MyraaSessionCoordinator private constructor(context: Context) {
         }
         refreshVoiceProviderState()
         fleetManager.refreshFleetStatus(clearErrors = true)
-        prewarmVoiceGreeting()
     }
 
     fun setVoiceProviderMode(mode: String) {
@@ -164,9 +180,17 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     }
 
     fun prewarmVoiceGreeting() {
-        val geminiKey = prefs.getGeminiApiKey()
-        if (prefs.getEffectiveVoiceProvider() == SecurePreferences.VOICE_PROVIDER_GEMINI && geminiKey.isNotBlank()) {
-            elevenLabsClient.prewarmPhrase(GREETING_TEXT, geminiKey)
+        // Prewarm is intentionally skipped at launch to preserve free-tier TTS RPM quota.
+    }
+
+    private fun playReadyChime() {
+        coordinatorScope.launch(Dispatchers.IO) {
+            try {
+                val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 65)
+                tone.startTone(ToneGenerator.TONE_PROP_ACK, 90)
+                kotlinx.coroutines.delay(130L)
+                tone.release()
+            } catch (_: Exception) {}
         }
     }
 
@@ -228,8 +252,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
         _isStartingSession.value = true
         coordinatorScope.launch {
             try {
-                voiceManager.setCompanionState(CompanionState.THINKING)
-                val report = initVerifier.verifyAll(checkLiveConnectivity = true)
+                val report = initVerifier.verifyAll(checkLiveConnectivity = false)
                 if (!report.canStartVoiceSession) {
                     voiceManager.setCompanionState(CompanionState.ERROR)
                     _currentAiReply.value = report.buildSummaryMessage()
@@ -256,8 +279,11 @@ class MyraaSessionCoordinator private constructor(context: Context) {
         _isListeningPaused.value = false
         coordinatorScope.launch {
             try {
-                val summary = fleetManager.initializeAndStartEligibleAgents()
-                voiceManager.prepareSessionForGreeting()
+                val summary = withContext(Dispatchers.IO) {
+                    fleetManager.initializeAndStartEligibleAgents()
+                }
+                voiceManager.startContinuousListening()
+                playReadyChime()
                 try {
                     ContinuousVoiceService.start(appContext)
                 } catch (e: Exception) {
@@ -280,14 +306,13 @@ class MyraaSessionCoordinator private constructor(context: Context) {
 
                 val mandatoryUnavailable = summary.unavailableAgents.filter { !it.isOptional }
                 _currentAiReply.value = if (mandatoryUnavailable.isEmpty()) {
-                    GREETING_TEXT
+                    "Main sun rahi hoon! Boliye kya kaam hai?"
                 } else {
                     val coreReasons = mandatoryUnavailable.joinToString("; ") {
                         "${it.name}: ${it.errorReason ?: it.detailMessage}"
                     }
-                    "$GREETING_TEXT\n($coreReasons)"
+                    "Main sun rahi hoon!\n($coreReasons)"
                 }
-                speakMahiResponse(GREETING_TEXT)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
@@ -439,20 +464,24 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                 } catch (_: Exception) {
                     ""
                 }
-                val memoryContext = memoryManager.buildPromptMemoryContext()
-                val parsed = geminiClient.interpretCommand(
-                    prompt = trimmed,
-                    apiKey = apiKey,
-                    preferredModel = model,
-                    screenImageBase64 = screenSnapshot,
-                    memoryContext = memoryContext,
-                    screenContextSummary = screenUiSummary,
-                    onModelAutoUpdated = { workingModel ->
-                        if (workingModel != model) {
-                            prefs.setSelectedGeminiModel(workingModel)
+                val memoryContext = withContext(Dispatchers.IO) {
+                    memoryManager.buildPromptMemoryContext()
+                }
+                val parsed = withTimeout(20_000L) {
+                    geminiClient.interpretCommand(
+                        prompt = trimmed,
+                        apiKey = apiKey,
+                        preferredModel = model,
+                        screenImageBase64 = screenSnapshot,
+                        memoryContext = memoryContext,
+                        screenContextSummary = screenUiSummary,
+                        onModelAutoUpdated = { workingModel ->
+                            if (workingModel != model) {
+                                prefs.setSelectedGeminiModel(workingModel)
+                            }
                         }
-                    }
-                )
+                    )
+                }
                 if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connect nahi ho paaya", ignoreCase = true)) {
                     fleetManager.clearAgentError("gemini_intelligence")
                 }
@@ -504,20 +533,24 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                 } catch (_: Exception) {
                     ""
                 }
-                val memoryContext = memoryManager.buildPromptMemoryContext()
-                val parsed = geminiClient.interpretAudioCommand(
-                    audioWavBytes = audioWavBytes,
-                    apiKey = apiKey,
-                    preferredModel = model,
-                    screenImageBase64 = screenSnapshot,
-                    memoryContext = memoryContext,
-                    screenContextSummary = screenUiSummary,
-                    onModelAutoUpdated = { workingModel ->
-                        if (workingModel != model) {
-                            prefs.setSelectedGeminiModel(workingModel)
+                val memoryContext = withContext(Dispatchers.IO) {
+                    memoryManager.buildPromptMemoryContext()
+                }
+                val parsed = withTimeout(20_000L) {
+                    geminiClient.interpretAudioCommand(
+                        audioWavBytes = audioWavBytes,
+                        apiKey = apiKey,
+                        preferredModel = model,
+                        screenImageBase64 = screenSnapshot,
+                        memoryContext = memoryContext,
+                        screenContextSummary = screenUiSummary,
+                        onModelAutoUpdated = { workingModel ->
+                            if (workingModel != model) {
+                                prefs.setSelectedGeminiModel(workingModel)
+                            }
                         }
-                    }
-                )
+                    )
+                }
                 val heard = parsed.heardSummary.ifBlank { "Voice command" }
                 _currentSpeechTranscript.value = heard
                 if (apiKey.isNotBlank() && !parsed.spokenResponse.contains("connect nahi ho paaya", ignoreCase = true)) {
@@ -649,11 +682,27 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                     !result.spokenFeedback.isNullOrBlank() && parsed.actionType != "CHAT" -> result.spokenFeedback
                     else -> parsed.spokenResponse
                 }
+                val isRapidNavigationGesture = result.success && (
+                    parsed.actionType.equals("VOLUME", ignoreCase = true) ||
+                        (parsed.actionType.equals("ACCESSIBILITY", ignoreCase = true) &&
+                            parsed.target.trim().lowercase() in RAPID_GESTURE_TARGETS)
+                    )
+
                 _currentAiReply.value = finalSpeech
                 if (!result.success) {
                     voiceManager.setCompanionState(CompanionState.ERROR)
                 }
-                speakMahiResponse(finalSpeech)
+
+                if (isRapidNavigationGesture) {
+                    coordinatorScope.launch { elevenLabsClient.playQuickAckCue() }
+                    if (_isSessionActive.value && !_isListeningPaused.value) {
+                        voiceManager.resumeListeningAfterSpeech()
+                    } else {
+                        voiceManager.setCompanionState(CompanionState.IDLE)
+                    }
+                } else {
+                    speakMahiResponse(finalSpeech)
+                }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {

@@ -7,6 +7,7 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.media.MediaPlayer
+import android.media.PlaybackParams
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -37,6 +38,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 
@@ -47,10 +49,9 @@ sealed class VoiceTestResult {
 
 /**
  * Pure AI Neural Voice Client (NO Android native TextToSpeech).
- * - Supports user-selectable voice provider priority (`Auto (1st API)`, `Gemini`, `ElevenLabs`).
- * - Uses ElevenLabs Neural Voice when selected/configured.
- * - Uses Gemini Neural Voice (Mahi / Aoede) via shared HTTP/2 connection pool + zero-disk-I/O
- *   AudioTrack streaming (with MediaPlayer WAV fallback) + AudioFocus management.
+ * - Persistent disk + RAM cache so repeated phrases play in < 10ms with zero API calls.
+ * - Per-model HTTP 429 cooldown protection & smart retry/fallback between Gemini & ElevenLabs.
+ * - Direct AudioTrack PCM streaming (with MediaPlayer WAV fallback) + AudioFocus management.
  */
 class ElevenLabsClient(private val context: Context) {
 
@@ -58,6 +59,9 @@ class ElevenLabsClient(private val context: Context) {
     private val securePrefs by lazy { SecurePreferences(context.applicationContext) }
     private val audioManager by lazy {
         context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
+    private val ttsDiskCacheDir: File by lazy {
+        File(context.applicationContext.cacheDir, "myraa_tts_cache").apply { mkdirs() }
     }
     private val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -78,6 +82,8 @@ class ElevenLabsClient(private val context: Context) {
         const val MODEL_ELEVEN_FLASH_V2_5 = "eleven_flash_v2_5"
 
         private const val GEMINI_VOICE_MAHI = "Aoede"
+        private const val MAX_DISK_CACHE_FILES = 60
+        private const val RATE_LIMIT_COOLDOWN_MS = 22_000L
         private val DEFAULT_GEMINI_TTS_MODELS = listOf(
             "gemini-2.5-flash-preview-tts",
             "gemini-2.5-pro-preview-tts"
@@ -85,23 +91,79 @@ class ElevenLabsClient(private val context: Context) {
         private val discoveredTtsModelsCache = ConcurrentHashMap<String, List<String>>()
         private val verifiedTtsModelByKey = ConcurrentHashMap<String, String>()
         private val phrasePcmCache = ConcurrentHashMap<String, CachedPcmAudio>()
+        private val modelCooldownUntilMs = ConcurrentHashMap<String, Long>()
+        @Volatile
+        private var elevenLabsCooldownUntilMs = 0L
     }
 
     /**
-     * Silently pre-caches common short greetings so starting AI voice mode feels instant.
+     * Plays a crisp 45ms synthesized sine confirmation cue directly through AudioTrack
+     * for rapid gesture feedback (scroll/tap) without hitting any cloud API or rate limit.
+     */
+    suspend fun playQuickAckCue() = withContext(Dispatchers.IO) {
+        var track: AudioTrack? = null
+        try {
+            val sampleRate = 24000
+            val numSamples = (sampleRate * 45) / 1000
+            val pcm = ByteArray(numSamples * 2)
+            for (i in 0 until numSamples) {
+                val env = (1.0 - i.toDouble() / numSamples) * 0.22
+                val freq = 720.0 + (i.toDouble() / numSamples) * 240.0
+                val sample = (kotlin.math.sin(2.0 * Math.PI * freq * i / sampleRate) * 32767.0 * env).toInt()
+                    .coerceIn(-32768, 32767)
+                pcm[i * 2] = (sample and 0xFF).toByte()
+                pcm[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
+            }
+            val minBuf = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuf <= 0) return@withContext
+            track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(maxOf(minBuf, pcm.size))
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+            if (track.state == AudioTrack.STATE_INITIALIZED) {
+                track.write(pcm, 0, pcm.size)
+                track.play()
+                delay(55L)
+            }
+        } catch (_: Exception) {
+        } finally {
+            try {
+                track?.stop()
+                track?.release()
+            } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Silently pre-caches common short phrases only if not already cached on disk.
      */
     fun prewarmPhrase(phrase: String, geminiApiKey: String) {
         val clean = phrase.trim()
         val key = geminiApiKey.trim()
         if (clean.isBlank() || key.isBlank()) return
-        val cacheKey = "${GEMINI_VOICE_MAHI}:${clean.lowercase()}"
-        if (phrasePcmCache.containsKey(cacheKey)) return
+        if (loadCachedGeminiPcm(clean) != null) return
 
         clientScope.launch {
-            val res = synthesizeWithGeminiTts(clean, key)
+            val res = synthesizeWithGeminiTts(clean, key, allowRateLimitRetry = false)
             if (res is GeminiTtsOutcome.Success && res.isRawPcm) {
-                if (phrasePcmCache.size > 24) phrasePcmCache.clear()
-                phrasePcmCache[cacheKey] = CachedPcmAudio(res.audioBytes, res.sampleRate)
+                saveCachedGeminiPcm(clean, res.audioBytes, res.sampleRate)
             }
         }
     }
@@ -147,18 +209,19 @@ class ElevenLabsClient(private val context: Context) {
         if (useGeminiFirst) {
             val geminiRes = synthesizeWithGeminiTts(
                 text = "Namaste! Main Myraa hoon, Gemini voice ready hai.",
-                geminiApiKey = geminiKey
+                geminiApiKey = geminiKey,
+                allowRateLimitRetry = true
             )
             return@withContext when (geminiRes) {
                 is GeminiTtsOutcome.Success -> {
                     requestSpeechAudioFocus()
                     try {
                         if (geminiRes.isRawPcm) {
-                            playPcmDirectSuspend(geminiRes.audioBytes, geminiRes.sampleRate, ++speechGenerationId, {}, {})
+                            playPcmDirectSuspend(geminiRes.audioBytes, geminiRes.sampleRate, ++speechGenerationId, 1.0f, {}, {})
                         } else {
                             val cacheFile = File(context.cacheDir, "test_gemini_voice_${System.currentTimeMillis()}.${geminiRes.fileExtension}")
                             cacheFile.writeBytes(geminiRes.audioBytes)
-                            playAudioFileSuspend(cacheFile, ++speechGenerationId, {}, {})
+                            playAudioFileSuspend(cacheFile, ++speechGenerationId, 1.0f, {}, {})
                         }
                     } finally {
                         abandonSpeechAudioFocus()
@@ -202,7 +265,7 @@ class ElevenLabsClient(private val context: Context) {
                         try {
                             val cacheFile = File(context.cacheDir, "test_voice_${System.currentTimeMillis()}.mp3")
                             cacheFile.writeBytes(bytes)
-                            playAudioFileSuspend(cacheFile, ++speechGenerationId, {}, {})
+                            playAudioFileSuspend(cacheFile, ++speechGenerationId, 1.0f, {}, {})
                         } finally {
                             abandonSpeechAudioFocus()
                         }
@@ -219,7 +282,7 @@ class ElevenLabsClient(private val context: Context) {
                     val msg = when (code) {
                         401 -> "ElevenLabs API key is unauthorized or invalid."
                         404 -> "Voice ID '$cleanVoiceId' not found on ElevenLabs."
-                        429 -> "ElevenLabs quota or rate limit exceeded."
+                        429 -> "ElevenLabs quota or rate limit exceeded (HTTP 429)."
                         else -> "ElevenLabs returned HTTP $code: $err"
                     }
                     return@withContext VoiceTestResult.Failure(msg, isConfigError = code == 401 || code == 404)
@@ -288,13 +351,17 @@ class ElevenLabsClient(private val context: Context) {
         var didInvokeError = false
 
         try {
+            val now = System.currentTimeMillis()
+            val elevenReady = cleanElevenKey.isNotBlank() && now >= elevenLabsCooldownUntilMs
+            val geminiReady = geminiKey.isNotBlank() && !isAllGeminiTtsCoolingDown(now)
+
             val tryOrder: List<String> = when (preferredEngine) {
                 SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> listOfNotNull(
-                    SecurePreferences.VOICE_PROVIDER_ELEVENLABS.takeIf { cleanElevenKey.isNotBlank() },
-                    SecurePreferences.VOICE_PROVIDER_GEMINI.takeIf { geminiKey.isNotBlank() }
+                    SecurePreferences.VOICE_PROVIDER_ELEVENLABS.takeIf { elevenReady || (cleanElevenKey.isNotBlank() && geminiKey.isBlank()) },
+                    SecurePreferences.VOICE_PROVIDER_GEMINI.takeIf { geminiKey.isNotBlank() && (geminiReady || !elevenReady) }
                 )
                 else -> listOfNotNull(
-                    SecurePreferences.VOICE_PROVIDER_GEMINI.takeIf { geminiKey.isNotBlank() },
+                    SecurePreferences.VOICE_PROVIDER_GEMINI.takeIf { geminiReady || (geminiKey.isNotBlank() && cleanElevenKey.isBlank()) },
                     SecurePreferences.VOICE_PROVIDER_ELEVENLABS.takeIf { cleanElevenKey.isNotBlank() }
                 )
             }
@@ -311,12 +378,15 @@ class ElevenLabsClient(private val context: Context) {
                         targetVoiceId = targetVoiceId,
                         modelId = modelId,
                         genId = myGenId,
+                        speechSpeed = speechSpeed,
                         onStarted = { notifyStartOnce() }
                     )
                     SecurePreferences.VOICE_PROVIDER_GEMINI -> speakWithGeminiTts(
                         cleanText = cleanText,
                         geminiKey = geminiKey,
                         genId = myGenId,
+                        speechSpeed = speechSpeed,
+                        allowRateLimitRetry = cleanElevenKey.isBlank(),
                         onStarted = { notifyStartOnce() }
                     )
                     else -> "Unsupported voice engine"
@@ -360,8 +430,14 @@ class ElevenLabsClient(private val context: Context) {
         }
     }
 
+    private fun isAllGeminiTtsCoolingDown(now: Long): Boolean {
+        return DEFAULT_GEMINI_TTS_MODELS.all { model ->
+            (modelCooldownUntilMs[model] ?: 0L) > now
+        }
+    }
+
     /**
-     * Synthesizes & plays speech with ElevenLabs. Returns null on success, or a readable error message.
+     * Synthesizes & plays speech with ElevenLabs (with persistent disk cache). Returns null on success, or error message.
      */
     private suspend fun speakWithElevenLabs(
         cleanText: String,
@@ -369,9 +445,24 @@ class ElevenLabsClient(private val context: Context) {
         targetVoiceId: String,
         modelId: String,
         genId: Long,
+        speechSpeed: Float,
         onStarted: () -> Unit
     ): String? {
         if (cleanKey.isBlank()) return "ElevenLabs API key missing."
+
+        val cacheKey = cacheHash("eleven|$targetVoiceId|${cleanText.lowercase()}")
+        val cachedMp3 = File(ttsDiskCacheDir, "$cacheKey.mp3")
+        if (cachedMp3.exists() && cachedMp3.length() > 200L) {
+            val copyForPlay = File(context.cacheDir, "myraa_play_${System.currentTimeMillis()}.mp3")
+            cachedMp3.copyTo(copyForPlay, overwrite = true)
+            playAudioFileSuspend(copyForPlay, genId, speechSpeed, onStarted, {})
+            return null
+        }
+
+        if (System.currentTimeMillis() < elevenLabsCooldownUntilMs) {
+            return "ElevenLabs rate limit (429) cooldown active — retrying shortly."
+        }
+
         return try {
             val url = "https://api.elevenlabs.io/v1/text-to-speech/$targetVoiceId?optimize_streaming_latency=3"
             val jsonPayload = JSONObject().apply {
@@ -393,28 +484,38 @@ class ElevenLabsClient(private val context: Context) {
                 .build()
 
             var httpError: String? = null
+            var hitRateLimit = false
             val audioBytes = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
                 client.newCall(request).execute().use { response ->
                     if (response.isSuccessful && response.body != null) {
                         response.body!!.bytes()
                     } else {
                         val code = response.code
-                        if (code == 429 || code >= 500) {
+                        if (code == 429) {
+                            hitRateLimit = true
+                            elevenLabsCooldownUntilMs = System.currentTimeMillis() + RATE_LIMIT_COOLDOWN_MS
+                            httpError = "ElevenLabs rate limit (HTTP 429) — thoda ruk kar bolein ya Gemini Voice chunein."
+                            null
+                        } else if (code >= 500) {
                             throw java.io.IOException("Transient ElevenLabs HTTP $code")
+                        } else {
+                            httpError = "ElevenLabs error (HTTP $code)"
+                            null
                         }
-                        httpError = "ElevenLabs error (HTTP $code)"
-                        null
                     }
                 }
             }
 
             if (audioBytes != null && audioBytes.size > 200 && genId == speechGenerationId) {
-                val cacheFile = File(context.cacheDir, "myraa_speech_${System.currentTimeMillis()}.mp3")
-                FileOutputStream(cacheFile).use { it.write(audioBytes) }
-                playAudioFileSuspend(cacheFile, genId, onStarted, {})
+                if (cleanText.length <= 160) {
+                    saveBytesToDiskCache(cachedMp3, audioBytes)
+                }
+                val playFile = File(context.cacheDir, "myraa_speech_${System.currentTimeMillis()}.mp3")
+                FileOutputStream(playFile).use { it.write(audioBytes) }
+                playAudioFileSuspend(playFile, genId, speechSpeed, onStarted, {})
                 null
             } else {
-                httpError ?: "ElevenLabs returned empty audio."
+                if (hitRateLimit) httpError else (httpError ?: "ElevenLabs returned empty audio.")
             }
         } catch (ce: CancellationException) {
             throw ce
@@ -424,14 +525,15 @@ class ElevenLabsClient(private val context: Context) {
     }
 
     /**
-     * Synthesizes & plays speech with Gemini Neural Voice using safe sequential prefetch
-     * (starts chunk i+1 right as chunk i begins playback, preventing 429 bursts).
-     * Returns null on success, or a readable error message.
+     * Synthesizes & plays speech with Gemini Neural Voice using persistent disk + RAM cache
+     * and single-flight sequential prefetch (prevents parallel burst 429s).
      */
     private suspend fun speakWithGeminiTts(
         cleanText: String,
         geminiKey: String,
         genId: Long,
+        speechSpeed: Float,
+        allowRateLimitRetry: Boolean,
         onStarted: () -> Unit
     ): String? {
         if (geminiKey.isBlank()) return "Gemini API key missing."
@@ -442,9 +544,7 @@ class ElevenLabsClient(private val context: Context) {
 
         coroutineScope {
             suspend fun fetchChunk(chunk: String): GeminiTtsOutcome {
-                val cacheKey = "${GEMINI_VOICE_MAHI}:${chunk.lowercase()}"
-                val cached = phrasePcmCache[cacheKey]
-                if (cached != null) {
+                loadCachedGeminiPcm(chunk)?.let { cached ->
                     return GeminiTtsOutcome.Success(
                         audioBytes = cached.pcmBytes,
                         fileExtension = "pcm",
@@ -453,10 +553,9 @@ class ElevenLabsClient(private val context: Context) {
                         sampleRate = cached.sampleRate
                     )
                 }
-                return synthesizeWithGeminiTts(chunk, geminiKey).also { res ->
-                    if (res is GeminiTtsOutcome.Success && res.isRawPcm && chunk.length <= 170) {
-                        if (phrasePcmCache.size > 24) phrasePcmCache.clear()
-                        phrasePcmCache[cacheKey] = CachedPcmAudio(res.audioBytes, res.sampleRate)
+                return synthesizeWithGeminiTts(chunk, geminiKey, allowRateLimitRetry).also { res ->
+                    if (res is GeminiTtsOutcome.Success && res.isRawPcm && chunk.length <= 160) {
+                        saveCachedGeminiPcm(chunk, res.audioBytes, res.sampleRate)
                     }
                 }
             }
@@ -487,6 +586,7 @@ class ElevenLabsClient(private val context: Context) {
                                 pcmData = outcome.audioBytes,
                                 sampleRate = outcome.sampleRate,
                                 genId = genId,
+                                speechSpeed = speechSpeed,
                                 onStart = onStarted,
                                 onEnd = {}
                             )
@@ -499,6 +599,7 @@ class ElevenLabsClient(private val context: Context) {
                             playAudioFileSuspend(
                                 file = cacheFile,
                                 genId = genId,
+                                speechSpeed = speechSpeed,
                                 onStart = onStarted,
                                 onEnd = {}
                             )
@@ -507,6 +608,7 @@ class ElevenLabsClient(private val context: Context) {
                     is GeminiTtsOutcome.Failure -> {
                         lastErrorReason = outcome.reason
                         Log.w("ElevenLabsClient", "Gemini TTS chunk $i failed: ${outcome.reason}")
+                        if (outcome.reason.contains("429")) break
                     }
                 }
             }
@@ -515,7 +617,7 @@ class ElevenLabsClient(private val context: Context) {
         return if (playedAnyChunk || genId != speechGenerationId) {
             null
         } else {
-            "Gemini AI voice unavailable: ${lastErrorReason ?: "Synthesis failed"}"
+            lastErrorReason ?: "Gemini AI voice unavailable."
         }
     }
 
@@ -563,13 +665,15 @@ class ElevenLabsClient(private val context: Context) {
 
     private suspend fun synthesizeWithGeminiTts(
         text: String,
-        geminiApiKey: String
+        geminiApiKey: String,
+        allowRateLimitRetry: Boolean = true
     ): GeminiTtsOutcome = withContext(Dispatchers.IO) {
         val cleanKey = geminiApiKey.trim()
         if (cleanKey.isBlank()) {
             return@withContext GeminiTtsOutcome.Failure("Gemini API key is missing.")
         }
 
+        val now = System.currentTimeMillis()
         val queue = ArrayDeque<String>()
         val attempted = mutableSetOf<String>()
         verifiedTtsModelByKey[cleanKey]?.let { queue.add(it) }
@@ -578,11 +682,18 @@ class ElevenLabsClient(private val context: Context) {
 
         var didDiscovery = !discoveredTtsModelsCache[cleanKey].isNullOrEmpty()
         var lastError = "Gemini TTS synthesis failed."
-        val spokenDirectiveText = "Speak aloud clearly in a warm, natural voice without adding extra words:\n$text"
+        var sawRateLimit = false
+        val spokenDirectiveText = "Speak aloud naturally and concisely without adding extra words:\n$text"
 
         while (queue.isNotEmpty()) {
             val model = queue.removeFirst()
             if (!attempted.add(model)) continue
+
+            val cooldownUntil = modelCooldownUntilMs[model] ?: 0L
+            if (cooldownUntil > System.currentTimeMillis()) {
+                sawRateLimit = true
+                continue
+            }
 
             try {
                 val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
@@ -615,19 +726,49 @@ class ElevenLabsClient(private val context: Context) {
                     .post(body)
                     .build()
 
-                val (code, respBody) = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
-                    client.newCall(request).execute().use { resp ->
-                        Pair(resp.code, resp.body?.string() ?: "")
+                var code = 0
+                var respBody = ""
+                var retryAfterMs = 1200L
+                val maxCalls = if (allowRateLimitRetry) 2 else 1
+
+                for (callAttempt in 1..maxCalls) {
+                    val outcome = NetworkRetryHelper.withExponentialBackoff(maxAttempts = 2) {
+                        client.newCall(request).execute().use { resp ->
+                            val ra = resp.header("Retry-After")?.toLongOrNull()?.times(1000L)
+                            Triple(resp.code, resp.body?.string() ?: "", ra)
+                        }
                     }
+                    code = outcome.first
+                    respBody = outcome.second
+                    val lowerErr = respBody.lowercase()
+                    val isZeroQuota = lowerErr.contains("limit: 0") || lowerErr.contains("limit:0")
+                    val bodyRetryMs = Regex("retry in\\s+([0-9]+(?:\\.[0-9]+)?)s", RegexOption.IGNORE_CASE)
+                        .find(respBody)?.groupValues?.get(1)?.toDoubleOrNull()?.times(1000.0)?.toLong()
+                    val resolvedDelay = bodyRetryMs ?: outcome.third
+                    if (resolvedDelay != null) {
+                        retryAfterMs = resolvedDelay.coerceIn(700L, 1800L)
+                    }
+                    if (code != 429 || isZeroQuota || callAttempt == maxCalls || queue.isNotEmpty()) break
+                    delay(retryAfterMs)
                 }
 
                 if (code in 200..299 && respBody.isNotBlank()) {
                     val extracted = extractAudioFromGeminiResponse(respBody)
                     if (extracted != null) {
                         verifiedTtsModelByKey[cleanKey] = model
+                        modelCooldownUntilMs.remove(model)
                         return@withContext extracted.copy(modelUsed = model)
                     } else {
                         lastError = "Gemini TTS ($model) returned no audio bytes."
+                    }
+                } else if (code == 429) {
+                    sawRateLimit = true
+                    val isZeroQuota = respBody.lowercase().let { it.contains("limit: 0") || it.contains("limit:0") }
+                    val cooldownDuration = if (isZeroQuota) 120_000L else RATE_LIMIT_COOLDOWN_MS
+                    modelCooldownUntilMs[model] = System.currentTimeMillis() + cooldownDuration
+                    lastError = "Gemini Voice rate limit (HTTP 429) — 20s me auto-recover hoga, ya ElevenLabs key use karein."
+                    if (!allowRateLimitRetry && !isZeroQuota) {
+                        return@withContext GeminiTtsOutcome.Failure(lastError)
                     }
                 } else {
                     lastError = "HTTP $code"
@@ -652,7 +793,11 @@ class ElevenLabsClient(private val context: Context) {
             }
         }
 
-        GeminiTtsOutcome.Failure(lastError)
+        if (sawRateLimit) {
+            GeminiTtsOutcome.Failure("Gemini Voice rate limit (HTTP 429) — thoda ruk kar bolein ya ElevenLabs API chunein.")
+        } else {
+            GeminiTtsOutcome.Failure(lastError)
+        }
     }
 
     private fun discoverGeminiTtsModels(geminiApiKey: String): List<String> {
@@ -730,6 +875,59 @@ class ElevenLabsClient(private val context: Context) {
         }
     }
 
+    private fun loadCachedGeminiPcm(text: String): CachedPcmAudio? {
+        val memKey = "${GEMINI_VOICE_MAHI}:${text.lowercase()}"
+        phrasePcmCache[memKey]?.let { return it }
+
+        val hash = cacheHash("gemini|$GEMINI_VOICE_MAHI|${text.lowercase()}")
+        val diskFile = ttsDiskCacheDir.listFiles { _, name -> name.startsWith("${hash}_") && name.endsWith(".pcm") }
+            ?.firstOrNull() ?: return null
+        return try {
+            val rateStr = diskFile.name.substringAfterLast('_').substringBefore(".pcm")
+            val rate = rateStr.toIntOrNull() ?: 24000
+            val bytes = diskFile.readBytes()
+            if (bytes.size > 64) {
+                diskFile.setLastModified(System.currentTimeMillis())
+                CachedPcmAudio(bytes, rate).also {
+                    if (phrasePcmCache.size > 32) phrasePcmCache.clear()
+                    phrasePcmCache[memKey] = it
+                }
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun saveCachedGeminiPcm(text: String, pcmBytes: ByteArray, sampleRate: Int) {
+        if (pcmBytes.size < 64) return
+        val memKey = "${GEMINI_VOICE_MAHI}:${text.lowercase()}"
+        if (phrasePcmCache.size > 32) phrasePcmCache.clear()
+        phrasePcmCache[memKey] = CachedPcmAudio(pcmBytes, sampleRate)
+
+        val hash = cacheHash("gemini|$GEMINI_VOICE_MAHI|${text.lowercase()}")
+        val outFile = File(ttsDiskCacheDir, "${hash}_${sampleRate}.pcm")
+        saveBytesToDiskCache(outFile, pcmBytes)
+    }
+
+    private fun saveBytesToDiskCache(target: File, data: ByteArray) {
+        try {
+            FileOutputStream(target).use { it.write(data) }
+            val all = ttsDiskCacheDir.listFiles() ?: return
+            if (all.size > MAX_DISK_CACHE_FILES) {
+                all.sortedBy { it.lastModified() }
+                    .take(all.size - MAX_DISK_CACHE_FILES)
+                    .forEach { it.delete() }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun cacheHash(key: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(key.toByteArray(Charsets.UTF_8))
+        return digest.take(12).joinToString("") { "%02x".format(it) }
+    }
+
     private fun requestSpeechAudioFocus() {
         try {
             val am = audioManager ?: return
@@ -768,6 +966,7 @@ class ElevenLabsClient(private val context: Context) {
         pcmData: ByteArray,
         sampleRate: Int,
         genId: Long,
+        speechSpeed: Float,
         onStart: () -> Unit,
         onEnd: () -> Unit
     ) = withContext(Dispatchers.IO) {
@@ -779,6 +978,7 @@ class ElevenLabsClient(private val context: Context) {
 
         var track: AudioTrack? = null
         var fallbackToWav = false
+        val safeSpeed = speechSpeed.coerceIn(0.85f, 1.4f)
 
         try {
             val minBuf = AudioTrack.getMinBufferSize(
@@ -812,6 +1012,11 @@ class ElevenLabsClient(private val context: Context) {
                     fallbackToWav = genId == speechGenerationId
                 } else {
                     activeAudioTrack = track
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && safeSpeed != 1.0f) {
+                        try {
+                            track.playbackParams = PlaybackParams().setSpeed(safeSpeed)
+                        } catch (_: Exception) {}
+                    }
                     val startedAt = System.currentTimeMillis()
                     onStart()
                     track.setVolume(1.0f)
@@ -830,10 +1035,10 @@ class ElevenLabsClient(private val context: Context) {
                     }
 
                     if (!fallbackToWav && genId == speechGenerationId && isActive) {
-                        val totalAudioMs = (validLength * 1000L) / (sampleRate * 2L)
+                        val totalAudioMs = ((validLength * 1000L) / (sampleRate * 2L) / safeSpeed).toLong()
                         val elapsed = System.currentTimeMillis() - startedAt
                         val remaining = (totalAudioMs - elapsed).coerceAtLeast(0L)
-                        delay(remaining + 180L)
+                        delay(remaining + 160L)
                     }
                 }
             }
@@ -858,7 +1063,7 @@ class ElevenLabsClient(private val context: Context) {
             val wavFile = File(context.cacheDir, "myraa_pcm_fallback_${System.currentTimeMillis()}.wav")
             try {
                 writePcm16AsWavFile(pcmData, validLength, sampleRate, wavFile)
-                playAudioFileSuspend(wavFile, genId, onStart, onEnd)
+                playAudioFileSuspend(wavFile, genId, speechSpeed, onStart, onEnd)
                 return@withContext
             } catch (ce: CancellationException) {
                 try { wavFile.delete() } catch (_: Exception) {}
@@ -906,6 +1111,7 @@ class ElevenLabsClient(private val context: Context) {
     private suspend fun playAudioFileSuspend(
         file: File,
         genId: Long,
+        speechSpeed: Float,
         onStart: () -> Unit,
         onEnd: () -> Unit
     ) = suspendCancellableCoroutine<Unit> { cont ->
@@ -957,11 +1163,17 @@ class ElevenLabsClient(private val context: Context) {
                         safeFinish()
                         return@setOnPreparedListener
                     }
+                    val safeSpeed = speechSpeed.coerceIn(0.85f, 1.4f)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && safeSpeed != 1.0f) {
+                        try {
+                            preparedMp.playbackParams = preparedMp.playbackParams.setSpeed(safeSpeed)
+                        } catch (_: Exception) {}
+                    }
                     onStart()
                     preparedMp.start()
 
                     val duration = preparedMp.duration
-                    val timeout = if (duration > 0) duration + 1500L else 12000L
+                    val timeout = if (duration > 0) (duration / safeSpeed).toLong() + 1500L else 12000L
                     mainHandler.postDelayed({ safeFinish() }, timeout)
                 }
                 mp.setOnCompletionListener { completedMp ->

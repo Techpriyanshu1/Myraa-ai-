@@ -42,15 +42,28 @@ class DeviceActionExecutor(private val context: Context) {
     private val logDao = db.automationLogDao()
     private val prefs = SecurePreferences(context)
 
-    fun getInstalledLaunchableApps(): List<LaunchableAppInfo> {
-        val pm = context.packageManager
+    @Volatile
+    private var cachedAppsList: List<LaunchableAppInfo>? = null
+
+    @Volatile
+    private var cachedAppsAtMs: Long = 0L
+
+    fun getInstalledLaunchableApps(forceRefresh: Boolean = false): List<LaunchableAppInfo> {
+        val now = System.currentTimeMillis()
+        val existing = cachedAppsList
         val selected = prefs.getSelectedApps()
+        if (!forceRefresh && existing != null && (now - cachedAppsAtMs) < 30_000L) {
+            return existing.map { it.copy(isSelectedByUser = selected.contains(it.packageName)) }
+                .sortedWith(compareByDescending<LaunchableAppInfo> { it.isSelectedByUser }.thenBy { it.label.lowercase() })
+        }
+
+        val pm = context.packageManager
         val mainIntent = Intent(Intent.ACTION_MAIN).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
         }
         return try {
             val resolveInfos = pm.queryIntentActivities(mainIntent, 0)
-            resolveInfos
+            val result = resolveInfos
                 .mapNotNull { info ->
                     val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
                     if (pkg == context.packageName) return@mapNotNull null
@@ -64,6 +77,9 @@ class DeviceActionExecutor(private val context: Context) {
                 }
                 .distinctBy { it.packageName }
                 .sortedWith(compareByDescending<LaunchableAppInfo> { it.isSelectedByUser }.thenBy { it.label.lowercase() })
+            cachedAppsList = result
+            cachedAppsAtMs = now
+            result
         } catch (e: Exception) {
             Log.e("DeviceActionExecutor", "Failed to query launchable apps", e)
             emptyList()
@@ -274,30 +290,7 @@ class DeviceActionExecutor(private val context: Context) {
             }
         }
 
-        // 1. Check user-selected preferred apps first
-        val installed = getInstalledLaunchableApps()
-        val userSelectedMatch = installed.firstOrNull {
-            it.isSelectedByUser && (it.label.lowercase() == query || it.label.lowercase().contains(query))
-        }
-        if (userSelectedMatch != null) {
-            val intent = pm.getLaunchIntentForPackage(userSelectedMatch.packageName)?.apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            if (intent != null) {
-                try {
-                    context.startActivity(intent)
-                    return ExecutionResult(
-                        success = true,
-                        actionType = "OPEN_APP",
-                        target = userSelectedMatch.label,
-                        details = "Launched user-selected app ${userSelectedMatch.label} (${userSelectedMatch.packageName})",
-                        spokenFeedback = "${userSelectedMatch.label} open kar diya hai."
-                    )
-                } catch (_: Exception) {}
-            }
-        }
-
-        // 2. Known direct package mappings
+        // 1. Instant direct package lookup when no custom user app priority conflicts
         val directPackages = mapOf(
             "youtube" to "com.google.android.youtube",
             "whatsapp" to "com.whatsapp",
@@ -330,20 +323,65 @@ class DeviceActionExecutor(private val context: Context) {
             "calendar" to "com.google.android.calendar",
             "files" to "com.google.android.apps.nbu.files"
         )
-        directPackages[query]?.let { pkg ->
-            val launchIntent = pm.getLaunchIntentForPackage(pkg)
-            if (launchIntent != null) {
+        val hasSelectedApps = prefs.getSelectedApps().isNotEmpty()
+        if (!hasSelectedApps) {
+            directPackages[query]?.let { pkg ->
+                val launchIntent = pm.getLaunchIntentForPackage(pkg)
+                if (launchIntent != null) {
+                    try {
+                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(launchIntent)
+                        return ExecutionResult(
+                            success = true,
+                            actionType = "OPEN_APP",
+                            target = appName,
+                            details = "Launched official app intent for $pkg",
+                            spokenFeedback = "$appName open kar diya hai."
+                        )
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+
+        // 2. Check user-selected preferred apps & cached launchable list
+        val installed = getInstalledLaunchableApps()
+        val userSelectedMatch = installed.firstOrNull {
+            it.isSelectedByUser && (it.label.lowercase() == query || it.label.lowercase().contains(query))
+        }
+        if (userSelectedMatch != null) {
+            val intent = pm.getLaunchIntentForPackage(userSelectedMatch.packageName)?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (intent != null) {
                 try {
-                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    context.startActivity(launchIntent)
+                    context.startActivity(intent)
                     return ExecutionResult(
                         success = true,
                         actionType = "OPEN_APP",
-                        target = appName,
-                        details = "Launched official app intent for $pkg",
-                        spokenFeedback = "$appName open kar diya hai."
+                        target = userSelectedMatch.label,
+                        details = "Launched user-selected app ${userSelectedMatch.label} (${userSelectedMatch.packageName})",
+                        spokenFeedback = "${userSelectedMatch.label} open kar diya hai."
                     )
                 } catch (_: Exception) {}
+            }
+        }
+
+        if (hasSelectedApps) {
+            directPackages[query]?.let { pkg ->
+                val launchIntent = pm.getLaunchIntentForPackage(pkg)
+                if (launchIntent != null) {
+                    try {
+                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        context.startActivity(launchIntent)
+                        return ExecutionResult(
+                            success = true,
+                            actionType = "OPEN_APP",
+                            target = appName,
+                            details = "Launched official app intent for $pkg",
+                            spokenFeedback = "$appName open kar diya hai."
+                        )
+                    } catch (_: Exception) {}
+                }
             }
         }
 

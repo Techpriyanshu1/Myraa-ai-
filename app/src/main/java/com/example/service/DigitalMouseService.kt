@@ -186,7 +186,7 @@ class DigitalMouseService : Service() {
             val currentY = params.y.toFloat()
 
             val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 380
+                duration = 95L
                 addUpdateListener { va ->
                     val progress = va.animatedFraction
                     params.x = (currentX + (destParamX - currentX) * progress).toInt()
@@ -206,7 +206,7 @@ class DigitalMouseService : Service() {
                     } catch (_: Exception) {}
                     overlay.triggerRipple()
                     MyraaAccessibilityService.instance?.dispatchClickAt(targetX, targetY) {
-                        mainHandler.postDelayed({ onFinished() }, 180)
+                        onFinished()
                     } ?: onFinished()
                 }
             })
@@ -216,49 +216,31 @@ class DigitalMouseService : Service() {
 
     fun animateTyping(text: String, onFinished: () -> Unit = {}) {
         mainHandler.post {
+            MyraaAccessibilityService.instance?.typeTextIntoFocused(text)
             val overlay = keyboardOverlayView
             val labelView = keyboardTextView
             if (overlay == null || labelView == null) {
-                MyraaAccessibilityService.instance?.typeTextIntoFocused(text)
                 onFinished()
                 return@post
             }
 
             overlay.visibility = View.VISIBLE
             labelView.text = "AI Typing: \"$text\""
-
-            var charIndex = 0
-            val runnable = object : Runnable {
-                override fun run() {
-                    if (charIndex <= text.length) {
-                        val partial = text.substring(0, charIndex)
-                        labelView.text = "AI Typing: \"$partial\"_"
-                        charIndex++
-                        mainHandler.postDelayed(this, 45)
-                    } else {
-                        MyraaAccessibilityService.instance?.typeTextIntoFocused(text)
-                        mainHandler.postDelayed({
-                            overlay.visibility = View.GONE
-                            onFinished()
-                        }, 500)
-                    }
-                }
-            }
-            mainHandler.post(runnable)
+            mainHandler.postDelayed({
+                overlay.visibility = View.GONE
+                onFinished()
+            }, 220L)
         }
     }
 
     fun animateSwipe(startX: Float, startY: Float, endX: Float, endY: Float, onFinished: () -> Unit = {}) {
         mainHandler.post {
-            val params = mouseParams
-            val overlay = mouseOverlayView
-            if (params == null || overlay == null) {
-                MyraaAccessibilityService.instance?.dispatchSwipe(startX, startY, endX, endY) {
-                    onFinished()
-                } ?: onFinished()
-                return@post
-            }
+            MyraaAccessibilityService.instance?.dispatchSwipe(startX, startY, endX, endY, durationMs = 180L) {
+                onFinished()
+            } ?: onFinished()
 
+            val params = mouseParams ?: return@post
+            val overlay = mouseOverlayView ?: return@post
             val (offsetX, offsetY) = computeWindowOriginOffset(overlay, params)
             val startParamX = startX - DigitalMouseView.TIP_OFFSET_PX - offsetX
             val startParamY = startY - DigitalMouseView.TIP_OFFSET_PX - offsetY
@@ -271,8 +253,8 @@ class DigitalMouseService : Service() {
                 windowManager?.updateViewLayout(overlay, params)
             } catch (_: Exception) {}
 
-            val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 420
+            ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 140L
                 addUpdateListener { va ->
                     val progress = va.animatedFraction
                     params.x = (startParamX + (endParamX - startParamX) * progress).toInt()
@@ -281,16 +263,8 @@ class DigitalMouseService : Service() {
                         windowManager?.updateViewLayout(overlay, params)
                     } catch (_: Exception) {}
                 }
+                start()
             }
-
-            animator.addListener(object : android.animation.AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: android.animation.Animator) {
-                    MyraaAccessibilityService.instance?.dispatchSwipe(startX, startY, endX, endY) {
-                        onFinished()
-                    } ?: onFinished()
-                }
-            })
-            animator.start()
         }
     }
 

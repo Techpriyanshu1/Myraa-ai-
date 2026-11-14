@@ -149,8 +149,8 @@ class RealScreenCaptureService : Service() {
                 Triple(metrics.widthPixels.coerceAtLeast(1), metrics.heightPixels.coerceAtLeast(1), metrics.densityDpi)
             }
 
-            // Downscale VirtualDisplay so frames stay sharp for Gemini vision while keeping voice+vision fast
-            val scale = if (rawW > 540) 540f / rawW else 1f
+            // Downscale VirtualDisplay so frames stay readable for Gemini vision while uploading in milliseconds
+            val scale = if (rawW > 480) 480f / rawW else 1f
             val width = (rawW * scale).toInt().coerceAtLeast(320)
             val height = (rawH * scale).toInt().coerceAtLeast(568)
 
@@ -161,7 +161,7 @@ class RealScreenCaptureService : Service() {
                 var croppedBitmap: Bitmap? = null
                 try {
                     val now = System.currentTimeMillis()
-                    if (now - lastFrameCapturedAt < 2000L) {
+                    if (now - lastFrameCapturedAt < 1200L) {
                         return@setOnImageAvailableListener
                     }
                     lastFrameCapturedAt = now
@@ -184,7 +184,7 @@ class RealScreenCaptureService : Service() {
                     }
 
                     val out = ByteArrayOutputStream()
-                    finalBitmap.compress(Bitmap.CompressFormat.JPEG, 55, out)
+                    finalBitmap.compress(Bitmap.CompressFormat.JPEG, 45, out)
                     _latestScreenFrameBase64.value = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
                 } catch (e: Exception) {
                     Log.w("RealScreenCapture", "Frame encode skipped: ${e.message}")

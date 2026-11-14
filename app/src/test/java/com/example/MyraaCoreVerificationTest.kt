@@ -566,4 +566,51 @@ class MyraaCoreVerificationTest {
         assertEquals(com.example.voice.CompanionState.TALKING, voiceManager.companionState.value)
         voiceManager.destroy()
     }
+
+    @Test
+    fun `Retired Gemini 2_5 Pro and 2_0 Flash models are excluded and auto-migrated`() {
+        assertFalse(GeminiClient.AVAILABLE_MODELS.contains("gemini-2.5-pro"))
+        assertFalse(GeminiClient.AVAILABLE_MODELS.contains("gemini-2.0-flash"))
+        assertTrue(GeminiClient.AVAILABLE_MODELS.contains("gemini-3.1-pro-preview"))
+        assertTrue(GeminiClient.AVAILABLE_MODELS.contains("gemini-3-flash-preview"))
+
+        prefs.setSelectedGeminiModel("gemini-2.5-pro")
+        assertEquals(SecurePreferences.DEFAULT_GEMINI_MODEL, prefs.getSelectedGeminiModel())
+
+        prefs.setSelectedGeminiModel("gemini-2.0-flash")
+        assertEquals(SecurePreferences.DEFAULT_GEMINI_MODEL, prefs.getSelectedGeminiModel())
+    }
+
+    @Test
+    fun `DeviceActionExecutor getInstalledLaunchableApps caches consistently`() {
+        val executor = com.example.automation.DeviceActionExecutor(context)
+        val first = executor.getInstalledLaunchableApps(forceRefresh = true)
+        val second = executor.getInstalledLaunchableApps()
+        assertEquals(first, second)
+    }
+
+    @Test
+    fun `ElevenLabsClient rapid ack cue and rapid gesture targets prevent unnecessary TTS quota burn`() = runTest {
+        val elevenLabs = ElevenLabsClient(context)
+        elevenLabs.playQuickAckCue()
+        elevenLabs.shutdown()
+
+        assertTrue("scroll_down" in com.example.voice.MyraaSessionCoordinator.RAPID_GESTURE_TARGETS)
+        assertTrue("scroll_up" in com.example.voice.MyraaSessionCoordinator.RAPID_GESTURE_TARGETS)
+        assertTrue("back" in com.example.voice.MyraaSessionCoordinator.RAPID_GESTURE_TARGETS)
+        assertTrue("home" in com.example.voice.MyraaSessionCoordinator.RAPID_GESTURE_TARGETS)
+    }
+
+    @Test
+    fun `InitializationVerifier skips blocking network ping when checkLiveConnectivity is false`() = runTest {
+        prefs.setGeminiApiKey("AIzaSyFastStartupTest12345")
+        val fleet = AgentFleetManager(context, prefs)
+        val verifier = InitializationVerifier(context, prefs, GeminiClient(), fleet)
+        val startMs = System.currentTimeMillis()
+        val report = verifier.verifyAll(checkLiveConnectivity = false)
+        val elapsedMs = System.currentTimeMillis() - startMs
+
+        assertEquals(11, report.checks.size)
+        assertTrue("Local preflight should stay near-instant (<1000ms), was ${elapsedMs}ms", elapsedMs < 1000L)
+    }
 }
