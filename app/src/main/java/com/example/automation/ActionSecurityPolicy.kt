@@ -28,7 +28,8 @@ enum class AllowlistedAction(val actionKey: String, val defaultRisk: ActionRiskL
     SHOW_HISTORY("SHOW_HISTORY", ActionRiskLevel.LOW),
     ACCESSIBILITY("ACCESSIBILITY", ActionRiskLevel.MEDIUM),
     SCREEN_CLICK("SCREEN_CLICK", ActionRiskLevel.MEDIUM),
-    SCREEN_TYPE("SCREEN_TYPE", ActionRiskLevel.MEDIUM);
+    SCREEN_TYPE("SCREEN_TYPE", ActionRiskLevel.MEDIUM),
+    BUILD_WEBSITE("BUILD_WEBSITE", ActionRiskLevel.LOW);
 
     companion object {
         fun fromKey(key: String): AllowlistedAction? {

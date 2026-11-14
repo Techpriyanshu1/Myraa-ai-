@@ -163,6 +163,7 @@ class DeviceActionExecutor(private val context: Context) {
             "STOP_AI" -> ExecutionResult(true, "STOP_AI", "session", "MYRAA AI session stopped by user")
             "LIST_APPS" -> ExecutionResult(true, "LIST_APPS", "apps", "Opened installed apps browser")
             "SHOW_HISTORY" -> ExecutionResult(true, "SHOW_HISTORY", "history", "Navigated to local activity history")
+            "BUILD_WEBSITE" -> ExecutionResult(true, "BUILD_WEBSITE", command.target, "Opened built-in MYRAA Web Studio for: ${command.target}", "Web Studio me website bana rahi hoon.")
             "SYSTEM_QUERY" -> ExecutionResult(true, "SYSTEM_QUERY", command.target, "Answered user system query")
             else -> ExecutionResult(true, "CHAT", command.target, "Conversational response delivered")
         }
@@ -195,6 +196,7 @@ class DeviceActionExecutor(private val context: Context) {
         "ACCESSIBILITY", "SCREEN_CLICK", "SCREEN_TYPE" -> "Accessibility Agent"
         "PAUSE_LISTENING", "RESUME_LISTENING", "STOP_AI" -> "Voice Recognition Agent"
         "SHOW_HISTORY" -> "Activity Logger Agent"
+        "BUILD_WEBSITE" -> "Web Studio Builder Agent"
         else -> "Gemini Intelligence Agent"
     }
 

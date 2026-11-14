@@ -218,6 +218,50 @@ class SecurePreferences(private val context: Context) {
         prefs.edit().putBoolean("avatar_mode_enabled", enabled).apply()
     }
 
+    // --- BOSS / JAAN VOICE BIOMETRIC GUARD ---
+    fun getBossVoiceprintJson(): String {
+        val encrypted = prefs.getString("boss_voiceprint_vault", "") ?: ""
+        return keystoreVault.decrypt(encrypted).trim()
+    }
+
+    fun saveBossVoiceprintJson(profileJson: String) {
+        val trimmed = profileJson.trim()
+        if (trimmed.isBlank()) {
+            clearBossVoiceprint()
+            return
+        }
+        val encrypted = keystoreVault.encrypt(trimmed)
+        prefs.edit()
+            .putString("boss_voiceprint_vault", encrypted)
+            .putBoolean("boss_voice_guard_enabled", true)
+            .apply()
+    }
+
+    fun clearBossVoiceprint() {
+        prefs.edit()
+            .remove("boss_voiceprint_vault")
+            .apply()
+    }
+
+    fun hasBossVoiceprint(): Boolean = getBossVoiceprintJson().isNotBlank()
+
+    fun isBossVoiceGuardEnabled(): Boolean {
+        return prefs.getBoolean("boss_voice_guard_enabled", true)
+    }
+
+    fun setBossVoiceGuardEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("boss_voice_guard_enabled", enabled).apply()
+    }
+
+    fun getBossDisplayName(): String {
+        return prefs.getString("boss_display_name", "Boss (Priyanshu)") ?: "Boss (Priyanshu)"
+    }
+
+    fun setBossDisplayName(name: String) {
+        val clean = name.trim().ifBlank { "Boss (Priyanshu)" }
+        prefs.edit().putString("boss_display_name", clean).apply()
+    }
+
     fun getPreferredLanguage(): String {
         return prefs.getString("preferred_language", "auto") ?: "auto"
     }

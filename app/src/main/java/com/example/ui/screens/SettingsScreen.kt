@@ -1,6 +1,10 @@
 package com.example.ui.screens
 
-import android.content.Context
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -27,13 +31,16 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Warning
@@ -53,15 +60,15 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -70,7 +77,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -86,18 +92,6 @@ import com.example.data.api.ElevenLabsClient
 import com.example.data.api.GeminiClient
 import com.example.data.api.VoiceTestResult
 import com.example.data.pref.SecurePreferences
-import com.example.ui.theme.AuroraEmerald
-import com.example.ui.theme.AuroraPink
-import com.example.ui.theme.CardGlowBorder
-import com.example.ui.theme.CyanPrimary
-import com.example.ui.theme.DangerRed
-import com.example.ui.theme.DarkBackground
-import com.example.ui.theme.DarkSurface
-import com.example.ui.theme.DarkSurfaceBorder
-import com.example.ui.theme.DarkSurfaceElevated
-import com.example.ui.theme.TextPrimary
-import com.example.ui.theme.TextSecondary
-import com.example.ui.theme.VioletSecondary
 import com.example.voice.MyraaSessionCoordinator
 import kotlinx.coroutines.launch
 
@@ -110,12 +104,14 @@ fun SettingsScreen(
     onNavigateToAgentFleet: () -> Unit,
     onNavigateToSecurity: () -> Unit,
     onNavigateToAbout: () -> Unit,
+    onNavigateToWebBuilder: () -> Unit = {},
     onRerunSetup: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
-    val prefs = remember { SecurePreferences(context) }
+    val coordinator = remember(context) { MyraaSessionCoordinator.getInstance(context) }
+    val prefs = coordinator.prefs
     val geminiClient = remember { GeminiClient() }
     val elevenLabsClient = remember { ElevenLabsClient(context) }
     val fleetManager = remember { AgentFleetManager.getInstance(context, prefs) }
@@ -138,20 +134,32 @@ fun SettingsScreen(
     var isOverlayEnabled by remember { mutableStateOf(prefs.isOverlayEnabled()) }
     var isContinuousListening by remember { mutableStateOf(prefs.isContinuousListeningEnabled()) }
 
+    val isBossVoiceEnrolled by coordinator.isBossVoiceEnrolled.collectAsState()
+    val isBossVoiceGuardEnabled by coordinator.isBossVoiceGuardEnabled.collectAsState()
+    val isEnrollingBossVoice by coordinator.isEnrollingBossVoice.collectAsState()
+    val bossEnrollmentStatus by coordinator.bossEnrollmentStatus.collectAsState()
+
+    val enrollMicLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            coordinator.enrollBossVoiceSample()
+        }
+    }
+
     var savedMessage by remember { mutableStateOf<String?>(null) }
 
     DisposableEffect(Unit) {
-        onDispose {
-            elevenLabsClient.shutdown()
-        }
+        onDispose { elevenLabsClient.shutdown() }
     }
 
     val voices = listOf(
         Pair("Mahi (Default Indian Conversational)", SecurePreferences.VOICE_MAHI)
     )
+    val colors = MaterialTheme.colorScheme
 
     Scaffold(
-        containerColor = DarkBackground,
+        containerColor = colors.background,
         topBar = {
             TopAppBar(
                 title = {
@@ -159,7 +167,7 @@ fun SettingsScreen(
                         Icon(
                             imageVector = Icons.Default.Tune,
                             contentDescription = null,
-                            tint = CyanPrimary,
+                            tint = colors.primary,
                             modifier = Modifier.size(22.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
@@ -167,7 +175,7 @@ fun SettingsScreen(
                             text = "Settings & Configuration",
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
-                            color = TextPrimary
+                            color = colors.onSurface
                         )
                     }
                 },
@@ -179,11 +187,11 @@ fun SettingsScreen(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
-                            tint = TextPrimary
+                            tint = colors.onSurface
                         )
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = DarkBackground)
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = colors.background)
             )
         },
         modifier = modifier.fillMaxSize()
@@ -196,20 +204,26 @@ fun SettingsScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // Quick Navigation Hub to Dedicated Screens
+            // Management & Studio Hub
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                border = androidx.compose.foundation.BorderStroke(1.dp, CardGlowBorder)
+                shape = MaterialTheme.shapes.large,
+                colors = CardDefaults.cardColors(containerColor = colors.surfaceContainerLow)
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text(
-                        text = "Management & Diagnostic Hubs",
+                        text = "Studio & Management Hubs",
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
-                        color = CyanPrimary,
+                        color = colors.primary,
                         modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+                    )
+
+                    SettingsNavRow(
+                        icon = Icons.Default.Language,
+                        title = "MYRAA Web Studio",
+                        subtitle = "Build, preview & export interactive HTML websites inside the app",
+                        onClick = onNavigateToWebBuilder
                     )
 
                     SettingsNavRow(
@@ -249,26 +263,127 @@ fun SettingsScreen(
                 }
             }
 
+            // Boss / Jaan Voice Biometric Guard Card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.large,
+                colors = CardDefaults.cardColors(containerColor = colors.surfaceContainerLow)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.VerifiedUser,
+                            contentDescription = null,
+                            tint = colors.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Boss / Jaan Voice Biometric Guard",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = colors.onSurface
+                        )
+                    }
+                    Text(
+                        text = "MYRAA aapki awaaz pehchanti hai — agar kisi doosre ki awaaz aaye toh alert cue aur voice warning milegi.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.onSurfaceVariant
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (isBossVoiceEnrolled) "Warn on Different Voice" else "Not Enrolled Yet",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = colors.onSurface
+                        )
+                        Switch(
+                            checked = isBossVoiceGuardEnabled,
+                            enabled = isBossVoiceEnrolled,
+                            onCheckedChange = { coordinator.setBossVoiceGuardEnabled(it) }
+                        )
+                    }
+
+                    if (!bossEnrollmentStatus.isNullOrBlank()) {
+                        Text(
+                            text = bossEnrollmentStatus!!,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.primary
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                val hasMic = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                                    PackageManager.PERMISSION_GRANTED
+                                if (hasMic) {
+                                    coordinator.enrollBossVoiceSample()
+                                } else {
+                                    enrollMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                            },
+                            enabled = !isEnrollingBossVoice,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("settings_enroll_boss_voice_button")
+                        ) {
+                            if (isEnrollingBossVoice) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                    color = colors.onPrimary
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Listening 2.6s...")
+                            } else {
+                                Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(if (isBossVoiceEnrolled) "Add Sample" else "Enroll Voice ID")
+                            }
+                        }
+                        if (isBossVoiceEnrolled) {
+                            OutlinedButton(
+                                onClick = { coordinator.clearBossVoiceprint() },
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.error)
+                            ) {
+                                Text("Clear")
+                            }
+                        }
+                    }
+                }
+            }
+
             // Gemini API Configuration & Live Test Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                shape = RoundedCornerShape(16.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, DarkSurfaceBorder)
+                colors = CardDefaults.cardColors(containerColor = colors.surfaceContainerLow),
+                shape = MaterialTheme.shapes.large
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             imageVector = Icons.Default.Key,
                             contentDescription = null,
-                            tint = VioletSecondary,
+                            tint = colors.secondary,
                             modifier = Modifier.size(20.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "Gemini API Configuration",
                             style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary,
+                            color = colors.onSurface,
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -294,20 +409,12 @@ fun SettingsScreen(
                                 Icon(
                                     imageVector = if (showGeminiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
                                     contentDescription = if (showGeminiKey) "Hide API Key" else "Show API Key",
-                                    tint = TextSecondary
+                                    tint = colors.onSurfaceVariant
                                 )
                             }
                         },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = CyanPrimary,
-                            unfocusedBorderColor = DarkSurfaceBorder,
-                            focusedTextColor = TextPrimary,
-                            unfocusedTextColor = TextPrimary,
-                            focusedContainerColor = DarkSurfaceElevated,
-                            unfocusedContainerColor = DarkSurfaceElevated
-                        ),
                         singleLine = true,
-                        shape = RoundedCornerShape(12.dp)
+                        shape = MaterialTheme.shapes.small
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
@@ -328,24 +435,15 @@ fun SettingsScreen(
                                 .fillMaxWidth()
                                 .menuAnchor(MenuAnchorType.PrimaryNotEditable)
                                 .testTag("settings_gemini_model"),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = CyanPrimary,
-                                unfocusedBorderColor = DarkSurfaceBorder,
-                                focusedTextColor = TextPrimary,
-                                unfocusedTextColor = TextPrimary,
-                                focusedContainerColor = DarkSurfaceElevated,
-                                unfocusedContainerColor = DarkSurfaceElevated
-                            ),
-                            shape = RoundedCornerShape(12.dp)
+                            shape = MaterialTheme.shapes.small
                         )
                         ExposedDropdownMenu(
                             expanded = isModelDropdownExpanded,
-                            onDismissRequest = { isModelDropdownExpanded = false },
-                            modifier = Modifier.background(DarkSurfaceElevated)
+                            onDismissRequest = { isModelDropdownExpanded = false }
                         ) {
                             GeminiClient.AVAILABLE_MODELS.forEach { model ->
                                 DropdownMenuItem(
-                                    text = { Text(model, color = TextPrimary) },
+                                    text = { Text(model) },
                                     onClick = {
                                         selectedGeminiModel = model
                                         prefs.setSelectedGeminiModel(model)
@@ -368,7 +466,7 @@ fun SettingsScreen(
                             prefs.setGeminiApiKey(cleanKey)
                             prefs.setSelectedGeminiModel(selectedGeminiModel)
                             firstVoiceProvider = prefs.getFirstConfiguredVoiceProvider()
-                            MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
+                            coordinator.refreshVoiceProviderState()
                             coroutineScope.launch {
                                 val res = geminiClient.testConnection(cleanKey, selectedGeminiModel)
                                 geminiTestResult = res
@@ -383,76 +481,73 @@ fun SettingsScreen(
                             }
                         },
                         enabled = !isTestingGemini,
-                        border = androidx.compose.foundation.BorderStroke(1.dp, VioletSecondary),
-                        shape = RoundedCornerShape(12.dp),
+                        shape = MaterialTheme.shapes.small,
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("settings_test_gemini_button")
                     ) {
                         if (isTestingGemini) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                                color = CyanPrimary
-                            )
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Testing Gemini Connection...", color = TextPrimary, fontSize = 13.sp)
+                            Text("Testing Gemini Connection...")
                         } else {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = VioletSecondary, modifier = Modifier.size(16.dp))
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Save & Test Gemini Connection", color = VioletSecondary, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text("Save & Test Gemini Connection", fontWeight = FontWeight.Bold)
                         }
                     }
 
                     geminiTestResult?.let { result ->
                         Spacer(modifier = Modifier.height(8.dp))
                         val isSuccess = result is ConnectionTestResult.Success
-                        val statusColor = if (isSuccess) AuroraEmerald else DangerRed
+                        val bg = if (isSuccess) colors.primaryContainer else colors.errorContainer
+                        val fg = if (isSuccess) colors.onPrimaryContainer else colors.onErrorContainer
                         val msg = when (result) {
                             is ConnectionTestResult.Success -> result.message
                             is ConnectionTestResult.Failure -> result.errorMessage
                         }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(statusColor.copy(alpha = 0.14f))
-                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                        Surface(
+                            color = bg,
+                            shape = MaterialTheme.shapes.small,
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Icon(
-                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
-                                contentDescription = null,
-                                tint = statusColor,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(text = msg, color = statusColor, fontSize = 12.sp)
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                    contentDescription = null,
+                                    tint = fg,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(text = msg, color = fg, style = MaterialTheme.typography.bodySmall)
+                            }
                         }
                     }
                 }
             }
 
-            // Voice Configuration
+            // Pure AI Voice Configuration (Zero Android TTS)
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                shape = RoundedCornerShape(16.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, DarkSurfaceBorder)
+                colors = CardDefaults.cardColors(containerColor = colors.surfaceContainerLow),
+                shape = MaterialTheme.shapes.large
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             imageVector = Icons.Default.RecordVoiceOver,
                             contentDescription = null,
-                            tint = AuroraPink,
+                            tint = colors.tertiary,
                             modifier = Modifier.size(20.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Neural Voice Persona",
+                            text = "Pure AI Voice Engine (Zero Android TTS)",
                             style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary,
+                            color = colors.onSurface,
                             fontWeight = FontWeight.Bold
                         )
                     }
@@ -477,20 +572,12 @@ fun SettingsScreen(
                                 Icon(
                                     imageVector = if (showVoiceKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
                                     contentDescription = if (showVoiceKey) "Hide ElevenLabs Key" else "Show ElevenLabs Key",
-                                    tint = TextSecondary
+                                    tint = colors.onSurfaceVariant
                                 )
                             }
                         },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = AuroraPink,
-                            unfocusedBorderColor = DarkSurfaceBorder,
-                            focusedTextColor = TextPrimary,
-                            unfocusedTextColor = TextPrimary,
-                            focusedContainerColor = DarkSurfaceElevated,
-                            unfocusedContainerColor = DarkSurfaceElevated
-                        ),
                         singleLine = true,
-                        shape = RoundedCornerShape(12.dp)
+                        shape = MaterialTheme.shapes.small
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
@@ -501,12 +588,12 @@ fun SettingsScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(vertical = 4.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (isSelected) CyanPrimary.copy(alpha = 0.15f) else DarkSurfaceElevated)
+                                .clip(MaterialTheme.shapes.small)
+                                .background(if (isSelected) colors.primaryContainer else colors.surfaceContainerHigh)
                                 .border(
                                     1.dp,
-                                    if (isSelected) CyanPrimary else DarkSurfaceBorder,
-                                    RoundedCornerShape(10.dp)
+                                    if (isSelected) colors.primary else colors.outlineVariant,
+                                    MaterialTheme.shapes.small
                                 )
                                 .clickable { selectedVoiceId = id }
                                 .padding(horizontal = 12.dp, vertical = 10.dp),
@@ -516,14 +603,14 @@ fun SettingsScreen(
                             Text(
                                 text = name,
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = if (isSelected) CyanPrimary else TextPrimary,
+                                color = if (isSelected) colors.onPrimaryContainer else colors.onSurface,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                             )
                             if (isSelected) {
                                 Icon(
                                     imageVector = Icons.Default.Check,
                                     contentDescription = null,
-                                    tint = CyanPrimary,
+                                    tint = colors.onPrimaryContainer,
                                     modifier = Modifier.size(18.dp)
                                 )
                             }
@@ -535,7 +622,7 @@ fun SettingsScreen(
                     Text(
                         text = "Voice API Engine Priority",
                         style = MaterialTheme.typography.labelLarge,
-                        color = TextPrimary,
+                        color = colors.onSurface,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(4.dp))
@@ -547,7 +634,7 @@ fun SettingsScreen(
                     Text(
                         text = firstApiText,
                         style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary
+                        color = colors.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(
@@ -560,21 +647,20 @@ fun SettingsScreen(
                             Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "settings_voice_provider_elevenlabs")
                         ).forEach { (modeKey, label, tag) ->
                             val selected = selectedVoiceProviderMode == modeKey
-                            val accent = if (modeKey == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) AuroraPink else CyanPrimary
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(if (selected) accent.copy(alpha = 0.2f) else DarkSurfaceElevated)
+                                    .clip(MaterialTheme.shapes.small)
+                                    .background(if (selected) colors.primaryContainer else colors.surfaceContainerHigh)
                                     .border(
                                         1.dp,
-                                        if (selected) accent else DarkSurfaceBorder,
-                                        RoundedCornerShape(10.dp)
+                                        if (selected) colors.primary else colors.outlineVariant,
+                                        MaterialTheme.shapes.small
                                     )
                                     .clickable {
                                         selectedVoiceProviderMode = modeKey
                                         prefs.setVoiceProviderMode(modeKey)
-                                        MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
+                                        coordinator.refreshVoiceProviderState()
                                         voiceTestResult = null
                                     }
                                     .padding(vertical = 10.dp)
@@ -583,7 +669,7 @@ fun SettingsScreen(
                             ) {
                                 Text(
                                     text = label,
-                                    color = if (selected) accent else TextSecondary,
+                                    color = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant,
                                     fontSize = 12.sp,
                                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
                                 )
@@ -603,7 +689,7 @@ fun SettingsScreen(
                             prefs.setSelectedVoiceId(selectedVoiceId)
                             prefs.setVoiceProviderMode(selectedVoiceProviderMode)
                             firstVoiceProvider = prefs.getFirstConfiguredVoiceProvider()
-                            MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
+                            coordinator.refreshVoiceProviderState()
                             coroutineScope.launch {
                                 val res = elevenLabsClient.testVoiceConnection(cleanVoiceKey, selectedVoiceId)
                                 voiceTestResult = res
@@ -615,47 +701,49 @@ fun SettingsScreen(
                             }
                         },
                         enabled = !isTestingVoice,
-                        border = androidx.compose.foundation.BorderStroke(1.dp, AuroraPink),
-                        shape = RoundedCornerShape(12.dp),
+                        shape = MaterialTheme.shapes.small,
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("settings_test_voice_button")
                     ) {
                         if (isTestingVoice) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = AuroraPink)
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Testing Mahi Voice...", color = TextPrimary, fontSize = 13.sp)
+                            Text("Testing Mahi Voice...")
                         } else {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = AuroraPink, modifier = Modifier.size(16.dp))
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Test AI Mahi Voice", color = AuroraPink, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text("Test AI Mahi Voice", fontWeight = FontWeight.Bold)
                         }
                     }
 
                     voiceTestResult?.let { result ->
                         Spacer(modifier = Modifier.height(8.dp))
                         val isSuccess = result is VoiceTestResult.Success
-                        val statusColor = if (isSuccess) AuroraEmerald else DangerRed
+                        val bg = if (isSuccess) colors.primaryContainer else colors.errorContainer
+                        val fg = if (isSuccess) colors.onPrimaryContainer else colors.onErrorContainer
                         val msg = when (result) {
                             is VoiceTestResult.Success -> result.message
                             is VoiceTestResult.Failure -> result.errorMessage
                         }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(statusColor.copy(alpha = 0.14f))
-                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                        Surface(
+                            color = bg,
+                            shape = MaterialTheme.shapes.small,
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Icon(
-                                imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
-                                contentDescription = null,
-                                tint = statusColor,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(text = msg, color = statusColor, fontSize = 12.sp)
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                    contentDescription = null,
+                                    tint = fg,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(text = msg, color = fg, style = MaterialTheme.typography.bodySmall)
+                            }
                         }
                     }
                 }
@@ -664,15 +752,14 @@ fun SettingsScreen(
             // Behavior & Overlay
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                shape = RoundedCornerShape(16.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, DarkSurfaceBorder)
+                colors = CardDefaults.cardColors(containerColor = colors.surfaceContainerLow),
+                shape = MaterialTheme.shapes.large
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
                         text = "Behavior & Ambient Display",
                         style = MaterialTheme.typography.titleMedium,
-                        color = TextPrimary,
+                        color = colors.onSurface,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(12.dp))
@@ -686,24 +773,18 @@ fun SettingsScreen(
                             Text(
                                 text = "Floating Aurora Light Overlay",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = TextPrimary,
+                                color = colors.onSurface,
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
                                 text = "Display ambient glowing orb when using other apps",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondary
+                                color = colors.onSurfaceVariant
                             )
                         }
                         Switch(
                             checked = isOverlayEnabled,
-                            onCheckedChange = { isOverlayEnabled = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = CyanPrimary,
-                                checkedTrackColor = CyanPrimary.copy(alpha = 0.3f),
-                                uncheckedThumbColor = TextSecondary,
-                                uncheckedTrackColor = DarkSurfaceBorder
-                            )
+                            onCheckedChange = { isOverlayEnabled = it }
                         )
                     }
 
@@ -718,24 +799,18 @@ fun SettingsScreen(
                             Text(
                                 text = "Continuous Listening Mode",
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = TextPrimary,
+                                color = colors.onSurface,
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
                                 text = "Keep listening continuously until START button is toggled off",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = TextSecondary
+                                color = colors.onSurfaceVariant
                             )
                         }
                         Switch(
                             checked = isContinuousListening,
-                            onCheckedChange = { isContinuousListening = it },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = CyanPrimary,
-                                checkedTrackColor = CyanPrimary.copy(alpha = 0.3f),
-                                uncheckedThumbColor = TextSecondary,
-                                uncheckedTrackColor = DarkSurfaceBorder
-                            )
+                            onCheckedChange = { isContinuousListening = it }
                         )
                     }
                 }
@@ -754,7 +829,7 @@ fun SettingsScreen(
                     prefs.setSelectedVoiceId(selectedVoiceId)
                     prefs.setVoiceProviderMode(selectedVoiceProviderMode)
                     firstVoiceProvider = prefs.getFirstConfiguredVoiceProvider()
-                    MyraaSessionCoordinator.getInstance(context).refreshVoiceProviderState()
+                    coordinator.refreshVoiceProviderState()
                     prefs.setOverlayEnabled(isOverlayEnabled)
                     prefs.setContinuousListeningEnabled(isContinuousListening)
                     fleetManager.refreshFleetStatus(clearErrors = true)
@@ -764,12 +839,10 @@ fun SettingsScreen(
                     .fillMaxWidth()
                     .height(50.dp)
                     .testTag("save_settings_button"),
-                colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary),
-                shape = RoundedCornerShape(14.dp)
+                shape = MaterialTheme.shapes.medium
             ) {
                 Text(
                     text = "Save Preferences Securely",
-                    color = Color(0xFF04141E),
                     fontWeight = FontWeight.Bold
                 )
             }
@@ -777,8 +850,8 @@ fun SettingsScreen(
             if (savedMessage != null) {
                 Text(
                     text = savedMessage!!,
-                    color = AuroraEmerald,
-                    fontSize = 12.sp,
+                    color = colors.primary,
+                    style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.align(Alignment.CenterHorizontally)
                 )
@@ -790,9 +863,8 @@ fun SettingsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("rerun_setup_button"),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary),
-                border = androidx.compose.foundation.BorderStroke(1.dp, DarkSurfaceBorder),
-                shape = RoundedCornerShape(14.dp)
+                border = BorderStroke(1.dp, colors.outlineVariant),
+                shape = MaterialTheme.shapes.medium
             ) {
                 Icon(
                     imageVector = Icons.Default.Refresh,
@@ -800,7 +872,7 @@ fun SettingsScreen(
                     modifier = Modifier.size(16.dp)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Re-open Setup Wizard", fontSize = 13.sp)
+                Text("Re-open Setup Wizard")
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -815,25 +887,26 @@ private fun SettingsNavRow(
     subtitle: String,
     onClick: () -> Unit
 ) {
+    val colors = MaterialTheme.colorScheme
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
+            .clip(MaterialTheme.shapes.small)
             .clickable(onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             modifier = Modifier
-                .size(32.dp)
+                .size(36.dp)
                 .clip(CircleShape)
-                .background(CyanPrimary.copy(alpha = 0.15f)),
+                .background(colors.primaryContainer),
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = CyanPrimary,
+                tint = colors.onPrimaryContainer,
                 modifier = Modifier.size(18.dp)
             )
         }
@@ -845,20 +918,19 @@ private fun SettingsNavRow(
                 text = title,
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.Bold,
-                color = TextPrimary
+                color = colors.onSurface
             )
             Text(
                 text = subtitle,
-                style = MaterialTheme.typography.labelSmall,
-                color = TextSecondary,
-                fontSize = 11.sp
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.onSurfaceVariant
             )
         }
 
         Icon(
             imageVector = Icons.AutoMirrored.Filled.ArrowForward,
             contentDescription = null,
-            tint = TextSecondary,
+            tint = colors.onSurfaceVariant,
             modifier = Modifier.size(16.dp)
         )
     }

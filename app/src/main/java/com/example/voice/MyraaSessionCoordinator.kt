@@ -110,6 +110,24 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     private val _navigateToLogsEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val navigateToLogsEvent: SharedFlow<Unit> = _navigateToLogsEvent.asSharedFlow()
 
+    private val _navigateToWebBuilderEvent = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val navigateToWebBuilderEvent: SharedFlow<String> = _navigateToWebBuilderEvent.asSharedFlow()
+
+    private val _speakerVerificationState = MutableStateFlow<SpeakerVerificationResult?>(null)
+    val speakerVerificationState: StateFlow<SpeakerVerificationResult?> = _speakerVerificationState.asStateFlow()
+
+    private val _isBossVoiceEnrolled = MutableStateFlow(prefs.hasBossVoiceprint())
+    val isBossVoiceEnrolled: StateFlow<Boolean> = _isBossVoiceEnrolled.asStateFlow()
+
+    private val _isBossVoiceGuardEnabled = MutableStateFlow(prefs.isBossVoiceGuardEnabled())
+    val isBossVoiceGuardEnabled: StateFlow<Boolean> = _isBossVoiceGuardEnabled.asStateFlow()
+
+    private val _isEnrollingBossVoice = MutableStateFlow(false)
+    val isEnrollingBossVoice: StateFlow<Boolean> = _isEnrollingBossVoice.asStateFlow()
+
+    private val _bossEnrollmentStatus = MutableStateFlow<String?>(null)
+    val bossEnrollmentStatus: StateFlow<String?> = _bossEnrollmentStatus.asStateFlow()
+
     private val _voiceProviderMode = MutableStateFlow(prefs.getVoiceProviderMode())
     val voiceProviderMode: StateFlow<String> = _voiceProviderMode.asStateFlow()
 
@@ -165,6 +183,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
             memoryManager.ensurePermanentMemorySeeded()
         }
         refreshVoiceProviderState()
+        refreshVoiceGuardState()
         fleetManager.refreshFleetStatus(clearErrors = true)
     }
 
@@ -177,6 +196,76 @@ class MyraaSessionCoordinator private constructor(context: Context) {
         _voiceProviderMode.value = prefs.getVoiceProviderMode()
         _effectiveVoiceProvider.value = prefs.getEffectiveVoiceProvider()
         _firstConfiguredVoiceProvider.value = prefs.getFirstConfiguredVoiceProvider()
+    }
+
+    fun refreshVoiceGuardState() {
+        _isBossVoiceEnrolled.value = prefs.hasBossVoiceprint()
+        _isBossVoiceGuardEnabled.value = prefs.isBossVoiceGuardEnabled()
+    }
+
+    fun setBossVoiceGuardEnabled(enabled: Boolean) {
+        prefs.setBossVoiceGuardEnabled(enabled)
+        _isBossVoiceGuardEnabled.value = enabled
+        if (!enabled) {
+            _speakerVerificationState.value = null
+        }
+    }
+
+    fun clearBossVoiceprint() {
+        prefs.clearBossVoiceprint()
+        _isBossVoiceEnrolled.value = false
+        _speakerVerificationState.value = null
+        _bossEnrollmentStatus.value = "Boss Voice ID cleared."
+    }
+
+    fun enrollBossVoiceSample(bossName: String = prefs.getBossDisplayName()) {
+        if (_isEnrollingBossVoice.value) return
+        prefs.setBossDisplayName(bossName)
+        _isEnrollingBossVoice.value = true
+        _bossEnrollmentStatus.value = "Listening 2.6s — boliye: 'Hey MYRAA, main Priyanshu hoon'..."
+
+        coordinatorScope.launch {
+            val wasSessionActive = _isSessionActive.value
+            val wasPaused = _isListeningPaused.value
+            if (wasSessionActive && !wasPaused) {
+                voiceManager.pauseListening()
+            }
+            try {
+                val result = VoiceBiometricManager.captureEnrollmentSample(
+                    context = appContext,
+                    bossName = bossName,
+                    durationMs = 2600L
+                )
+                result.onSuccess { freshProfile ->
+                    val existing = VoiceprintProfile.fromJsonString(prefs.getBossVoiceprintJson())
+                    val finalProfile = if (existing != null) {
+                        VoiceBiometricManager.mergeProfiles(listOf(existing, freshProfile), bossName) ?: freshProfile
+                    } else {
+                        freshProfile
+                    }
+                    prefs.saveBossVoiceprintJson(finalProfile.toJsonString())
+                    refreshVoiceGuardState()
+                    _speakerVerificationState.value = SpeakerVerificationResult(
+                        isEnrolled = true,
+                        isBossMatch = true,
+                        similarityPercent = 100,
+                        measuredPitchHz = finalProfile.meanPitchHz,
+                        enrolledPitchHz = finalProfile.meanPitchHz,
+                        statusLabel = "${finalProfile.bossName} Enrolled (${finalProfile.sampleCount}x • ${finalProfile.meanPitchHz.toInt()} Hz)"
+                    )
+                    _bossEnrollmentStatus.value =
+                        "Boss Voice ID saved (${finalProfile.sampleCount} sample(s), pitch ${finalProfile.meanPitchHz.toInt()} Hz). Doosri awaaz aate hi warning milegi!"
+                    playReadyChime()
+                }.onFailure { err ->
+                    _bossEnrollmentStatus.value = err.localizedMessage ?: "Voice sample capture failed."
+                }
+            } finally {
+                _isEnrollingBossVoice.value = false
+                if (wasSessionActive && !wasPaused) {
+                    voiceManager.resumeListening()
+                }
+            }
+        }
     }
 
     fun prewarmVoiceGreeting() {
@@ -200,6 +289,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
 
     fun refreshFleetOnResume() {
         refreshVoiceProviderState()
+        refreshVoiceGuardState()
         fleetManager.refreshFleetStatus(clearErrors = true)
     }
 
@@ -533,8 +623,27 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                 } catch (_: Exception) {
                     ""
                 }
+
+                // Ultra-fast (< 3ms) On-Device Boss/Jaan Speaker Verification
+                val bossGuardDirective = withContext(Dispatchers.Default) {
+                    if (prefs.isBossVoiceGuardEnabled() && prefs.hasBossVoiceprint()) {
+                        val enrolled = VoiceprintProfile.fromJsonString(prefs.getBossVoiceprintJson())
+                        val verification = VoiceBiometricManager.verifySpeaker(enrolled, audioWavBytes)
+                        _speakerVerificationState.value = verification
+                        if (!verification.isBossMatch) {
+                            launch(Dispatchers.IO) { elevenLabsClient.playSecurityAlertCue() }
+                            "[SECURITY ALERT — DIFFERENT / UNKNOWN VOICE DETECTED! Match=${verification.similarityPercent}%, speaker pitch=${verification.measuredPitchHz.toInt()} Hz vs Boss=${verification.enrolledPitchHz.toInt()} Hz. Yeh ${prefs.getBossDisplayName()} ki awaaz NAHI hai! Apne spokenResponse me sabse pehle is anjaan speaker ko clearly warn karo ki aap Boss/Jaan ki awaaz nahi ho aur sensitive actions allow nahi hain.]\n"
+                        } else {
+                            ""
+                        }
+                    } else {
+                        _speakerVerificationState.value = null
+                        ""
+                    }
+                }
+
                 val memoryContext = withContext(Dispatchers.IO) {
-                    memoryManager.buildPromptMemoryContext()
+                    bossGuardDirective + memoryManager.buildPromptMemoryContext()
                 }
                 val parsed = withTimeout(20_000L) {
                     geminiClient.interpretAudioCommand(
@@ -669,6 +778,15 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                         _lastExecutedAction.value = "SHOW_HISTORY"
                         _lastActionSuccess.value = true
                         _navigateToLogsEvent.tryEmit(Unit)
+                        return@launch
+                    }
+                    "BUILD_WEBSITE" -> {
+                        val res = actionExecutor.executeCommand(parsed, confirmationStatus)
+                        _lastExecutedAction.value = res.actionType
+                        _lastActionSuccess.value = res.success
+                        _currentAiReply.value = parsed.spokenResponse
+                        _navigateToWebBuilderEvent.tryEmit(parsed.target.ifBlank { parsed.rawPrompt })
+                        speakMahiResponse(parsed.spokenResponse)
                         return@launch
                     }
                 }

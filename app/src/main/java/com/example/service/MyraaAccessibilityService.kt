@@ -64,7 +64,7 @@ class MyraaAccessibilityService : AccessibilityService() {
         val path = Path().apply {
             moveTo(x, y)
         }
-        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+        val stroke = GestureDescription.StrokeDescription(path, 0, 28)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
         return dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
@@ -115,7 +115,7 @@ class MyraaAccessibilityService : AccessibilityService() {
         val startY = if (forward) h * 0.78f else h * 0.25f
         val endY = if (forward) h * 0.22f else h * 0.78f
 
-        val swiped = dispatchSwipe(cx, startY, cx, endY, durationMs = 240L)
+        val swiped = dispatchSwipe(cx, startY, cx, endY, durationMs = 130L)
         if (swiped) return true
         return scroll(forward)
     }
@@ -214,7 +214,7 @@ class MyraaAccessibilityService : AccessibilityService() {
         }
     }
 
-    // AI Virtual Keyboard text injection into focused field
+    // AI Virtual Keyboard text injection into focused field (fast SET_TEXT + clipboard ACTION_PASTE fallback)
     fun typeTextIntoFocused(text: String): Boolean {
         val root = rootInActiveWindow ?: return false
         val focusedNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
@@ -224,7 +224,17 @@ class MyraaAccessibilityService : AccessibilityService() {
         val arguments = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        return focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+        if (focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) {
+            return true
+        }
+        return try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("MYRAA Input", text))
+            focusedNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            focusedNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun findFirstEditableNode(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {

@@ -724,9 +724,9 @@ class GeminiClient {
             Respond ONLY with a valid single JSON object (no markdown fences, no prose outside JSON) using this exact schema:
             {
               "heardSummary": "Brief summary or transcript of what the user asked",
-              "intent": "open_app|youtube_search|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
-              "actionType": "OPEN_APP|YOUTUBE_SEARCH|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
-              "target": "target app, YouTube song/video search query, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, accessibility target (home|back|scroll_down|scroll_up|lock), or search query",
+              "intent": "open_app|youtube_search|build_website|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
+              "actionType": "OPEN_APP|YOUTUBE_SEARCH|BUILD_WEBSITE|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
+              "target": "target app, website description/topic, YouTube query, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, accessibility target (home|back|scroll_down|scroll_up|lock), or search query",
               "extraData": "optional text to type or extra info",
               "riskLevel": "LOW|MEDIUM|HIGH",
               "requiresConfirmation": false,
@@ -734,6 +734,7 @@ class GeminiClient {
             }
             STRICT RULES:
             - ALWAYS honor Permanent Core Memory and User Preferences above.
+            - Use BUILD_WEBSITE when the user asks to build, create, or design a website/webpage inside the app (put clean site prompt in "target").
             - Use YOUTUBE_SEARCH to search or play any song/video on YouTube (put ONLY the clean query in "target").
             - Use ACCESSIBILITY with target="scroll_down" for scroll/next short/reel/video; target="scroll_up" for scroll up/previous short.
             - Use SCREEN_CLICK (exact visible UI label in "target") or SCREEN_TYPE (text in "extraData") to interact with current screen UI.
@@ -1179,7 +1180,127 @@ class GeminiClient {
             }
         }
 
+        // Built-in Website Builder ("build a portfolio website", "website banao", "open web studio")
+        if (lower.contains("website") && (lower.contains("build") || lower.contains("create") ||
+                lower.contains("make") || lower.contains("design") || lower.contains("banao") ||
+                lower.contains("banado") || lower.contains("generate")) ||
+            lower.contains("web studio") || lower.contains("website builder")
+        ) {
+            return ParsedCommand(
+                spokenResponse = "Web Studio khol kar website bana rahi hoon!",
+                actionType = "BUILD_WEBSITE",
+                target = normalized,
+                rawPrompt = rawPrompt,
+                intent = "build_website"
+            )
+        }
+
         return null
+    }
+
+    /**
+     * Generates a complete responsive single-file HTML5 + CSS3 + Vanilla JS website using Gemini.
+     */
+    suspend fun generateWebsiteHtml(
+        prompt: String,
+        apiKey: String,
+        preferredModel: String = AVAILABLE_MODELS.first(),
+        existingHtml: String? = null
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val cleanPrompt = prompt.trim()
+        if (cleanPrompt.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Website prompt is empty."))
+        }
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank()) {
+            return@withContext Result.success(
+                com.example.webbuilder.WebsiteBuilderManager.buildStarterTemplate(cleanPrompt)
+            )
+        }
+
+        val safePreferred = sanitizePreferredModel(preferredModel)
+        val cachedVerified = verifiedModelByKey[cleanKey]?.takeIf { it !in RETIRED_MODELS }
+        val initialDiscovered = discoveredModelsCache[cleanKey].orEmpty().filterNot { it in RETIRED_MODELS }
+        val queue = ArrayDeque<String>()
+        val attempted = mutableSetOf<String>()
+        if (!cachedVerified.isNullOrBlank()) queue.add(cachedVerified)
+        queue.add(safePreferred)
+        initialDiscovered.forEach { if (!queue.contains(it)) queue.add(it) }
+        AVAILABLE_MODELS.forEach { if (!queue.contains(it)) queue.add(it) }
+
+        val instruction = buildString {
+            appendLine("Generate a complete, modern, responsive single-file HTML5 website with embedded <style> and interactive <script>.")
+            appendLine("Output ONLY raw valid HTML starting with <!DOCTYPE html> and ending with </html>. Do NOT wrap in markdown code blocks.")
+            appendLine("Use clean Material-You inspired typography, cards, responsive mobile layout, hover animations, and realistic interactive UI sections.")
+            if (!existingHtml.isNullOrBlank()) {
+                appendLine("\nUpdate/refine the existing HTML below according to the new request:")
+                appendLine(existingHtml.take(6000))
+            }
+            appendLine("\nUser Request: $cleanPrompt")
+        }
+
+        var lastError = "Unable to generate website."
+        while (queue.isNotEmpty()) {
+            val model = queue.removeFirst()
+            if (!attempted.add(model)) continue
+            val cooldownUntil = modelCooldownUntilMs[model] ?: 0L
+            if (cooldownUntil > System.currentTimeMillis() && queue.isNotEmpty()) continue
+
+            try {
+                val (code, rawBody, retryAfterSec) = executeGenerateRequest(model, cleanKey) { includeThinking ->
+                    JSONObject().apply {
+                        put("contents", JSONArray().apply {
+                            put(JSONObject().apply {
+                                put("role", "user")
+                                put("parts", JSONArray().apply {
+                                    put(JSONObject().put("text", instruction))
+                                })
+                            })
+                        })
+                        put("generationConfig", JSONObject().apply {
+                            put("temperature", 0.55)
+                            put("maxOutputTokens", 4096)
+                            if (includeThinking) {
+                                buildThinkingConfig(model)?.let { put("thinkingConfig", it) }
+                            }
+                        })
+                    }
+                }
+                if (code in 200..299 && rawBody.isNotBlank()) {
+                    modelCooldownUntilMs.remove(model)
+                    val root = JSONObject(rawBody)
+                    val parts = root.optJSONArray("candidates")?.optJSONObject(0)
+                        ?.optJSONObject("content")?.optJSONArray("parts")
+                    val rawHtml = buildString {
+                        if (parts != null) {
+                            for (i in 0 until parts.length()) {
+                                val p = parts.optJSONObject(i) ?: continue
+                                if (!p.optBoolean("thought", false)) {
+                                    append(p.optString("text", ""))
+                                }
+                            }
+                        }
+                    }
+                    val cleaned = com.example.webbuilder.WebsiteBuilderManager.stripCodeFences(rawHtml)
+                    if (cleaned.contains("<html", ignoreCase = true) || cleaned.contains("<body", ignoreCase = true)) {
+                        verifiedModelByKey[cleanKey] = model
+                        return@withContext Result.success(cleaned)
+                    }
+                } else {
+                    lastError = "HTTP $code: ${parseErrorMessage(rawBody)}"
+                    if (code == 429) {
+                        recordRateLimitCooldown(model, rawBody, retryAfterSec)
+                    } else if (code == 401 || code == 403) {
+                        break
+                    }
+                }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                lastError = e.localizedMessage ?: "Network error"
+            }
+        }
+        Result.failure(IllegalStateException(lastError))
     }
 
     private fun intelligentConversationalEngine(

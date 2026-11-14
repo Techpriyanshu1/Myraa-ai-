@@ -613,4 +613,73 @@ class MyraaCoreVerificationTest {
         assertEquals(11, report.checks.size)
         assertTrue("Local preflight should stay near-instant (<1000ms), was ${elapsedMs}ms", elapsedMs < 1000L)
     }
+
+    @Test
+    fun `VoiceBiometricManager verifies Boss voice and warns on different speaker pitch and timbre`() {
+        fun buildSyntheticVoiceWav(f0Hz: Double, brightHarmonics: Boolean, durationSamples: Int = 16000): ByteArray {
+            val pcmBytes = ByteArray(durationSamples * 2)
+            for (i in 0 until durationSamples) {
+                val t = i / 16000.0
+                val wave = if (brightHarmonics) {
+                    0.20 * kotlin.math.sin(2.0 * Math.PI * f0Hz * t) +
+                        0.40 * kotlin.math.sin(2.0 * Math.PI * (f0Hz * 3.0) * t) +
+                        0.30 * kotlin.math.sin(2.0 * Math.PI * (f0Hz * 6.0) * t) +
+                        0.10 * kotlin.math.sin(2.0 * Math.PI * (f0Hz * 9.0) * t)
+                } else {
+                    0.65 * kotlin.math.sin(2.0 * Math.PI * f0Hz * t) +
+                        0.25 * kotlin.math.sin(2.0 * Math.PI * (f0Hz * 2.0) * t) +
+                        0.10 * kotlin.math.sin(2.0 * Math.PI * (f0Hz * 3.0) * t)
+                }
+                val s = (wave * 24000.0).toInt().coerceIn(-32768, 32767)
+                pcmBytes[i * 2] = (s and 0xFF).toByte()
+                pcmBytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+            }
+            // Prepend 44-byte dummy WAV header
+            return ByteArray(44) + pcmBytes
+        }
+
+        val bossWav1 = buildSyntheticVoiceWav(132.0, brightHarmonics = false)
+        val bossWav2 = buildSyntheticVoiceWav(135.0, brightHarmonics = false)
+        val strangerWav = buildSyntheticVoiceWav(255.0, brightHarmonics = true)
+
+        val enrolled = com.example.voice.VoiceBiometricManager.extractVoiceprintFromWav(bossWav1, "Boss (Priyanshu)")
+        assertNotNull(enrolled)
+
+        prefs.saveBossVoiceprintJson(enrolled!!.toJsonString())
+        assertTrue(prefs.hasBossVoiceprint())
+        val restored = com.example.voice.VoiceprintProfile.fromJsonString(prefs.getBossVoiceprintJson())
+        assertNotNull(restored)
+
+        val bossCheck = com.example.voice.VoiceBiometricManager.verifySpeaker(restored, bossWav2)
+        assertTrue("Same speaker voice should match Boss profile", bossCheck.isBossMatch)
+
+        val strangerCheck = com.example.voice.VoiceBiometricManager.verifySpeaker(restored, strangerWav)
+        assertFalse("Different speaker pitch + timbre should trigger warning", strangerCheck.isBossMatch)
+
+        prefs.clearBossVoiceprint()
+        assertFalse(prefs.hasBossVoiceprint())
+    }
+
+    @Test
+    fun `Built-in Website Builder command parsing, HTML fence stripping, and project storage work cleanly`() = runTest {
+        val gemini = GeminiClient()
+        val parsed = gemini.interpretCommand("mere liye ek coffee shop website banao", "")
+        assertEquals("BUILD_WEBSITE", parsed.actionType)
+        val validation = ActionSecurityPolicy.validate(parsed)
+        assertTrue(validation.allowed)
+
+        val stripped = com.example.webbuilder.WebsiteBuilderManager.stripCodeFences(
+            "Here is the code:\n```html\n<!DOCTYPE html><html><body><h1>Coffee</h1></body></html>\n```"
+        )
+        assertTrue(stripped.startsWith("<!DOCTYPE html>"))
+        assertFalse(stripped.contains("```"))
+
+        val manager = com.example.webbuilder.WebsiteBuilderManager(context)
+        val saved = manager.saveProject("Coffee Shop", "Coffee Shop Landing Page", stripped)
+        val loaded = manager.getSavedProjects()
+        assertTrue(loaded.any { it.id == saved.id && it.title == "Coffee Shop" })
+
+        manager.deleteProject(saved.id)
+        assertFalse(manager.getSavedProjects().any { it.id == saved.id })
+    }
 }

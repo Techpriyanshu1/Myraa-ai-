@@ -7,6 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -25,8 +26,8 @@ import com.example.ui.screens.SecurityPrivacyScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.SetupWizardScreen
 import com.example.ui.screens.SplashScreen
+import com.example.ui.screens.WebsiteBuilderScreen
 import com.example.ui.screens.WelcomeScreen
-import com.example.ui.theme.DarkBackground
 import com.example.ui.theme.MyApplicationTheme
 
 enum class AppScreen {
@@ -40,7 +41,8 @@ enum class AppScreen {
     PERMISSION_CENTER,
     AGENT_FLEET,
     SECURITY_PRIVACY,
-    ABOUT
+    ABOUT,
+    WEB_BUILDER
 }
 
 class MainActivity : ComponentActivity() {
@@ -55,11 +57,13 @@ class MainActivity : ComponentActivity() {
             MyApplicationTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = DarkBackground
+                    color = MaterialTheme.colorScheme.background
                 ) {
                     var currentScreen by remember { mutableStateOf(AppScreen.SPLASH) }
                     var agentFleetReturnScreen by remember { mutableStateOf(AppScreen.SETTINGS) }
                     var memoryReturnScreen by remember { mutableStateOf(AppScreen.MAIN) }
+                    var webBuilderReturnScreen by remember { mutableStateOf(AppScreen.MAIN) }
+                    var webBuilderInitialPrompt by remember { mutableStateOf<String?>(null) }
 
                     Crossfade(targetState = currentScreen, label = "screen_crossfade") { screen ->
                         when (screen) {
@@ -101,6 +105,11 @@ class MainActivity : ComponentActivity() {
                                     onNavigateToAgentFleet = {
                                         agentFleetReturnScreen = AppScreen.MAIN
                                         currentScreen = AppScreen.AGENT_FLEET
+                                    },
+                                    onNavigateToWebBuilder = { prompt ->
+                                        webBuilderReturnScreen = AppScreen.MAIN
+                                        webBuilderInitialPrompt = prompt?.takeIf { it.isNotBlank() }
+                                        currentScreen = AppScreen.WEB_BUILDER
                                     }
                                 )
                             }
@@ -131,6 +140,11 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onNavigateToSecurity = { currentScreen = AppScreen.SECURITY_PRIVACY },
                                     onNavigateToAbout = { currentScreen = AppScreen.ABOUT },
+                                    onNavigateToWebBuilder = {
+                                        webBuilderReturnScreen = AppScreen.SETTINGS
+                                        webBuilderInitialPrompt = null
+                                        currentScreen = AppScreen.WEB_BUILDER
+                                    },
                                     onRerunSetup = { currentScreen = AppScreen.SETUP }
                                 )
                             }
@@ -156,6 +170,13 @@ class MainActivity : ComponentActivity() {
                                 BackHandler { currentScreen = AppScreen.SETTINGS }
                                 AboutScreen(
                                     onNavigateBack = { currentScreen = AppScreen.SETTINGS }
+                                )
+                            }
+                            AppScreen.WEB_BUILDER -> {
+                                BackHandler { currentScreen = webBuilderReturnScreen }
+                                WebsiteBuilderScreen(
+                                    initialPrompt = webBuilderInitialPrompt,
+                                    onNavigateBack = { currentScreen = webBuilderReturnScreen }
                                 )
                             }
                         }

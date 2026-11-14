@@ -29,6 +29,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -45,17 +46,26 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -63,7 +73,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -99,19 +111,9 @@ import com.example.ui.components.AuroraWaveGlow
 import com.example.ui.components.InitializationDiagnosticsDialog
 import com.example.ui.components.InstalledAppsDialog
 import com.example.ui.components.VideoAvatarPlayer
-import com.example.ui.theme.AuroraEmerald
-import com.example.ui.theme.AuroraPink
-import com.example.ui.theme.CyanPrimary
-import com.example.ui.theme.DangerRed
-import com.example.ui.theme.DarkBackground
-import com.example.ui.theme.DarkSurface
-import com.example.ui.theme.DarkSurfaceBorder
-import com.example.ui.theme.DarkSurfaceElevated
-import com.example.ui.theme.TextPrimary
-import com.example.ui.theme.TextSecondary
-import com.example.ui.theme.VioletSecondary
 import com.example.voice.CompanionState
 import com.example.voice.MyraaSessionCoordinator
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -120,6 +122,7 @@ fun MainAssistantScreen(
     onNavigateToSettings: () -> Unit,
     onNavigateToMemory: () -> Unit = {},
     onNavigateToAgentFleet: () -> Unit = {},
+    onNavigateToWebBuilder: (String?) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -146,6 +149,7 @@ fun MainAssistantScreen(
 
     var textInput by remember { mutableStateOf("") }
     var isAvatarMode by remember { mutableStateOf(prefs.isAvatarModeEnabled()) }
+    var showBossVoiceDialog by remember { mutableStateOf(false) }
 
     val isSessionActive by coordinator.isSessionActive.collectAsState()
     val isListeningPaused by coordinator.isListeningPaused.collectAsState()
@@ -166,6 +170,12 @@ fun MainAssistantScreen(
     val pendingConfirmation by coordinator.pendingConfirmation.collectAsState()
     val preflightReportDialog by coordinator.preflightReportDialog.collectAsState()
 
+    val speakerVerification by coordinator.speakerVerificationState.collectAsState()
+    val isBossVoiceEnrolled by coordinator.isBossVoiceEnrolled.collectAsState()
+    val isBossVoiceGuardEnabled by coordinator.isBossVoiceGuardEnabled.collectAsState()
+    val isEnrollingBossVoice by coordinator.isEnrollingBossVoice.collectAsState()
+    val bossEnrollmentStatus by coordinator.bossEnrollmentStatus.collectAsState()
+
     val micLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -175,15 +185,28 @@ fun MainAssistantScreen(
         } else {
             coordinator.fleetManager.refreshFleetStatus()
             coordinator.setErrorMessage(
-                "Voice control ke liye Microphone permission zaroori hai. Settings -> Permission Center me jakar enable karein."
+                "Voice control ke liye Microphone permission zaroori hai. Settings -> Permission Center me enable karein."
             )
+        }
+    }
+
+    val enrollMicLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            coordinator.enrollBossVoiceSample()
         }
     }
 
     LaunchedEffect(coordinator) {
         coordinator.initializeOnScreenAppear()
-        coordinator.navigateToLogsEvent.collect {
-            onNavigateToLogs()
+        launch {
+            coordinator.navigateToLogsEvent.collect { onNavigateToLogs() }
+        }
+        launch {
+            coordinator.navigateToWebBuilderEvent.collect { webPrompt ->
+                onNavigateToWebBuilder(webPrompt)
+            }
         }
     }
 
@@ -200,11 +223,7 @@ fun MainAssistantScreen(
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            // Intentionally do NOT destroy voiceManager or stop ContinuousVoiceService here:
-            // Voice Mode stays continuously active in background across app switches (YouTube, Screen Share, etc.).
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     pendingConfirmation?.let { pending ->
@@ -234,8 +253,31 @@ fun MainAssistantScreen(
         )
     }
 
+    if (showBossVoiceDialog) {
+        BossVoiceGuardDialog(
+            isEnrolled = isBossVoiceEnrolled,
+            isGuardEnabled = isBossVoiceGuardEnabled,
+            isCapturing = isEnrollingBossVoice,
+            statusMessage = bossEnrollmentStatus,
+            onCaptureSample = {
+                val hasMic = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+                if (hasMic) {
+                    coordinator.enrollBossVoiceSample()
+                } else {
+                    enrollMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                }
+            },
+            onToggleGuard = { coordinator.setBossVoiceGuardEnabled(it) },
+            onClearVoiceprint = { coordinator.clearBossVoiceprint() },
+            onDismiss = { showBossVoiceDialog = false }
+        )
+    }
+
+    val colors = MaterialTheme.colorScheme
+
     Scaffold(
-        containerColor = DarkBackground,
+        containerColor = colors.background,
         topBar = {
             TopAppBar(
                 title = {
@@ -246,9 +288,9 @@ fun MainAssistantScreen(
                                 .clip(CircleShape)
                                 .background(
                                     when {
-                                        isSessionActive && !isListeningPaused -> AuroraEmerald
-                                        isSessionActive && isListeningPaused -> AuroraPink
-                                        else -> CyanPrimary
+                                        isSessionActive && !isListeningPaused -> colors.primary
+                                        isSessionActive && isListeningPaused -> colors.tertiary
+                                        else -> colors.secondary
                                     }
                                 )
                         )
@@ -258,21 +300,31 @@ fun MainAssistantScreen(
                                 text = "MYRAA AI",
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.ExtraBold,
-                                color = TextPrimary
+                                color = colors.onSurface
                             )
                             Text(
                                 text = when {
                                     isSessionActive && isListeningPaused -> "Voice Paused"
-                                    isSessionActive -> "Direct Voice • Background Active"
-                                    else -> "Ready"
+                                    isSessionActive -> "Direct Voice Active"
+                                    else -> "Material You • Ready"
                                 },
-                                fontSize = 10.sp,
-                                color = TextSecondary
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colors.onSurfaceVariant
                             )
                         }
                     }
                 },
                 actions = {
+                    IconButton(
+                        onClick = { onNavigateToWebBuilder(null) },
+                        modifier = Modifier.testTag("nav_to_web_builder_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Language,
+                            contentDescription = "Web Studio",
+                            tint = colors.primary
+                        )
+                    }
                     IconButton(
                         onClick = onNavigateToMemory,
                         modifier = Modifier.testTag("nav_to_memory_button")
@@ -280,7 +332,7 @@ fun MainAssistantScreen(
                         Icon(
                             imageVector = Icons.Default.Psychology,
                             contentDescription = "Memory Core",
-                            tint = CyanPrimary
+                            tint = colors.secondary
                         )
                     }
                     IconButton(
@@ -301,25 +353,37 @@ fun MainAssistantScreen(
                         modifier = Modifier.testTag("screen_share_toggle_button")
                     ) {
                         Icon(
-                            imageVector = if (isRealScreenSharing) Icons.AutoMirrored.Filled.StopScreenShare else Icons.AutoMirrored.Filled.ScreenShare,
+                            imageVector = if (isRealScreenSharing) {
+                                Icons.AutoMirrored.Filled.StopScreenShare
+                            } else {
+                                Icons.AutoMirrored.Filled.ScreenShare
+                            },
                             contentDescription = "Screen Share",
-                            tint = if (isRealScreenSharing) AuroraPink else TextSecondary
+                            tint = if (isRealScreenSharing) colors.tertiary else colors.onSurfaceVariant
                         )
                     }
                     IconButton(
                         onClick = onNavigateToLogs,
                         modifier = Modifier.testTag("nav_to_logs_button")
                     ) {
-                        Icon(Icons.AutoMirrored.Filled.ListAlt, contentDescription = "Activity History", tint = TextSecondary)
+                        Icon(
+                            Icons.AutoMirrored.Filled.ListAlt,
+                            contentDescription = "Activity History",
+                            tint = colors.onSurfaceVariant
+                        )
                     }
                     IconButton(
                         onClick = onNavigateToSettings,
                         modifier = Modifier.testTag("nav_to_settings_button")
                     ) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings", tint = TextSecondary)
+                        Icon(
+                            Icons.Default.Settings,
+                            contentDescription = "Settings",
+                            tint = colors.onSurfaceVariant
+                        )
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = DarkBackground)
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = colors.background)
             )
         },
         bottomBar = {
@@ -345,56 +409,105 @@ fun MainAssistantScreen(
         ) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .widthIn(max = 600.dp)
+                    .fillMaxWidth()
             ) {
                 if (!prefs.hasStoredGeminiKey()) {
-                    Box(
+                    Surface(
+                        color = colors.secondaryContainer,
+                        shape = MaterialTheme.shapes.medium,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 10.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(VioletSecondary.copy(alpha = 0.22f))
+                            .padding(bottom = 8.dp)
                             .clickable { onNavigateToSettings() }
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
                             .testTag("missing_gemini_key_banner")
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.Center,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)
                         ) {
-                            Icon(Icons.Default.Key, contentDescription = null, tint = CyanPrimary, modifier = Modifier.size(16.dp))
+                            Icon(
+                                Icons.Default.Key,
+                                contentDescription = null,
+                                tint = colors.onSecondaryContainer,
+                                modifier = Modifier.size(16.dp)
+                            )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Gemini API Key missing • Tap here to configure",
-                                color = TextPrimary,
-                                fontSize = 12.sp,
+                                text = "Gemini API Key missing • Tap to configure",
+                                color = colors.onSecondaryContainer,
+                                style = MaterialTheme.typography.labelLarge,
                                 fontWeight = FontWeight.Bold
                             )
                         }
                     }
                 }
 
-                if (isRealScreenSharing) {
-                    Box(
+                // Unknown / Different Voice Biometric Alert Banner
+                val activeVerification = speakerVerification
+                if (activeVerification != null && activeVerification.isEnrolled && !activeVerification.isBossMatch) {
+                    Surface(
+                        color = colors.errorContainer,
+                        shape = MaterialTheme.shapes.medium,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 10.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(AuroraPink.copy(alpha = 0.2f))
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                            .padding(bottom = 8.dp)
+                            .testTag("unknown_voice_warning_banner")
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Different voice alert",
+                                tint = colors.onErrorContainer,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Warning: Different Voice Detected (${activeVerification.similarityPercent}%)",
+                                    color = colors.onErrorContainer,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                                Text(
+                                    text = "Yeh Boss/Jaan ki awaaz nahi hai (${activeVerification.measuredPitchHz.toInt()} Hz vs ${activeVerification.enrolledPitchHz.toInt()} Hz).",
+                                    color = colors.onErrorContainer,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (isRealScreenSharing) {
+                    Surface(
+                        color = colors.tertiaryContainer,
+                        shape = MaterialTheme.shapes.medium,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.Center,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                         ) {
-                            Icon(Icons.Default.Mouse, contentDescription = null, tint = AuroraPink, modifier = Modifier.size(16.dp))
+                            Icon(
+                                Icons.Default.Mouse,
+                                contentDescription = null,
+                                tint = colors.onTertiaryContainer,
+                                modifier = Modifier.size(16.dp)
+                            )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "SCREEN SHARE ACTIVE",
-                                color = Color.White,
-                                fontSize = 11.sp,
+                                text = "SCREEN SHARE ACTIVE • LIVE CURSOR READY",
+                                color = colors.onTertiaryContainer,
+                                style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold
                             )
                         }
@@ -403,86 +516,139 @@ fun MainAssistantScreen(
 
                 val bannerError = voiceError?.takeIf { it.isNotBlank() } ?: voiceOutputError?.takeIf { it.isNotBlank() }
                 if (!bannerError.isNullOrBlank()) {
-                    Box(
+                    Surface(
+                        color = colors.errorContainer,
+                        shape = MaterialTheme.shapes.small,
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(bottom = 8.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(DarkSurfaceElevated)
-                            .padding(horizontal = 12.dp, vertical = 6.dp)
                     ) {
                         Text(
                             text = bannerError,
-                            color = AuroraPink,
-                            fontSize = 11.sp,
+                            color = colors.onErrorContainer,
+                            style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.SemiBold,
                             textAlign = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
                         )
                     }
                 }
 
-                // Sleek Orb <-> AI Avatar Switch Pill
+                // Material You Top Pill Row: Orb <-> AI Avatar Switcher + Boss Voice ID Guard
                 Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(DarkSurfaceElevated)
-                        .padding(4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(if (!isAvatarMode) CyanPrimary.copy(alpha = 0.22f) else Color.Transparent)
-                            .clickable {
-                                isAvatarMode = false
-                                prefs.setAvatarModeEnabled(false)
-                            }
-                            .padding(horizontal = 16.dp, vertical = 10.dp)
-                            .testTag("switch_to_orb_button"),
-                        verticalAlignment = Alignment.CenterVertically
+                    Surface(
+                        color = colors.surfaceContainerHigh,
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier.padding(end = 8.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.AutoAwesome,
-                            contentDescription = "AI Orb Mode",
-                            tint = if (!isAvatarMode) CyanPrimary else TextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "AI Orb",
-                            color = if (!isAvatarMode) CyanPrimary else TextSecondary,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Row(
+                            modifier = Modifier.padding(4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(if (!isAvatarMode) colors.primaryContainer else Color.Transparent)
+                                    .clickable {
+                                        isAvatarMode = false
+                                        prefs.setAvatarModeEnabled(false)
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                                    .testTag("switch_to_orb_button"),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.AutoAwesome,
+                                    contentDescription = "AI Orb Mode",
+                                    tint = if (!isAvatarMode) colors.onPrimaryContainer else colors.onSurfaceVariant,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Orb",
+                                    color = if (!isAvatarMode) colors.onPrimaryContainer else colors.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(if (isAvatarMode) colors.tertiaryContainer else Color.Transparent)
+                                    .clickable {
+                                        isAvatarMode = true
+                                        prefs.setAvatarModeEnabled(true)
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                                    .testTag("switch_to_avatar_button"),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Face,
+                                    contentDescription = "AI Avatar Mode",
+                                    tint = if (isAvatarMode) colors.onTertiaryContainer else colors.onSurfaceVariant,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Avatar",
+                                    color = if (isAvatarMode) colors.onTertiaryContainer else colors.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
 
-                    Row(
+                    // Boss/Jaan Voice ID Quick Chip
+                    val bossChipColor = when {
+                        activeVerification != null && activeVerification.isEnrolled && !activeVerification.isBossMatch -> colors.errorContainer
+                        isBossVoiceEnrolled && isBossVoiceGuardEnabled -> colors.primaryContainer
+                        else -> colors.surfaceContainerHigh
+                    }
+                    val bossChipContent = when {
+                        activeVerification != null && activeVerification.isEnrolled && !activeVerification.isBossMatch -> colors.onErrorContainer
+                        isBossVoiceEnrolled && isBossVoiceGuardEnabled -> colors.onPrimaryContainer
+                        else -> colors.onSurfaceVariant
+                    }
+                    Surface(
+                        color = bossChipColor,
+                        shape = RoundedCornerShape(50),
                         modifier = Modifier
                             .clip(RoundedCornerShape(50))
-                            .background(if (isAvatarMode) AuroraPink.copy(alpha = 0.22f) else Color.Transparent)
-                            .clickable {
-                                isAvatarMode = true
-                                prefs.setAvatarModeEnabled(true)
-                            }
-                            .padding(horizontal = 16.dp, vertical = 10.dp)
-                            .testTag("switch_to_avatar_button"),
-                        verticalAlignment = Alignment.CenterVertically
+                            .clickable { showBossVoiceDialog = true }
+                            .testTag("boss_voice_guard_chip")
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Face,
-                            contentDescription = "AI Avatar Mode",
-                            tint = if (isAvatarMode) AuroraPink else TextSecondary,
-                            modifier = Modifier.size(15.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "AI Avatar",
-                            color = if (isAvatarMode) AuroraPink else TextSecondary,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (isBossVoiceEnrolled) Icons.Default.VerifiedUser else Icons.Default.Security,
+                                contentDescription = "Boss Voice Recognition",
+                                tint = bossChipContent,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(
+                                text = when {
+                                    activeVerification != null && !activeVerification.isBossMatch -> "Stranger!"
+                                    isBossVoiceEnrolled && isBossVoiceGuardEnabled -> "Boss ID"
+                                    else -> "Set Voice ID"
+                                },
+                                color = bossChipContent,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
 
@@ -500,11 +666,10 @@ fun MainAssistantScreen(
                             .testTag("video_avatar_player")
                     )
                 } else {
-                    // Clean Centered Animated AI Orb (Tap while listening to send utterance immediately)
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(250.dp)
+                            .height(235.dp)
                             .clickable(enabled = isSessionActive && companionState == CompanionState.LISTENING) {
                                 coordinator.finishUtteranceNow()
                             },
@@ -513,19 +678,19 @@ fun MainAssistantScreen(
                         AnimatedAiOrb(
                             companionState = companionState,
                             rmsLevel = rmsLevel,
-                            size = 220.dp
+                            size = 210.dp
                         )
                     }
                 }
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(10.dp))
 
-                // Clean Conversation Card
+                // Material You Conversation Card
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = DarkSurface),
-                    shape = RoundedCornerShape(18.dp),
-                    border = BorderStroke(1.dp, DarkSurfaceBorder)
+                    colors = CardDefaults.cardColors(containerColor = colors.surfaceContainerLow),
+                    shape = MaterialTheme.shapes.large,
+                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         val displayPrompt = when {
@@ -535,8 +700,18 @@ fun MainAssistantScreen(
                         }
                         if (displayPrompt != null) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("You: ", style = MaterialTheme.typography.bodyMedium, color = CyanPrimary, fontWeight = FontWeight.Bold)
-                                Text(displayPrompt, style = MaterialTheme.typography.bodyMedium, color = TextPrimary, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "You: ",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = colors.primary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    displayPrompt,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = colors.onSurface,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             }
                             Spacer(modifier = Modifier.height(8.dp))
                         }
@@ -548,29 +723,29 @@ fun MainAssistantScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "MYRAA (AI Voice):",
+                                    text = "MYRAA • AI Neural Voice",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = AuroraPink,
+                                    color = colors.tertiary,
                                     fontWeight = FontWeight.Bold
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = currentAiReply,
                                     style = MaterialTheme.typography.bodyMedium,
-                                    color = TextPrimary,
+                                    color = colors.onSurface,
                                     fontWeight = FontWeight.Medium
                                 )
                             }
                             IconButton(
                                 onClick = { coordinator.replayCurrentReply() },
                                 modifier = Modifier
-                                    .size(40.dp)
+                                    .size(48.dp)
                                     .testTag("replay_voice_button")
                             ) {
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.VolumeUp,
                                     contentDescription = "Replay AI Voice",
-                                    tint = CyanPrimary,
+                                    tint = colors.primary,
                                     modifier = Modifier.size(22.dp)
                                 )
                             }
@@ -578,18 +753,18 @@ fun MainAssistantScreen(
 
                         if (!lastExecutedAction.isNullOrBlank() && lastExecutedAction != "CHAT") {
                             Spacer(modifier = Modifier.height(8.dp))
-                            val badgeColor = if (lastActionSuccess) AuroraEmerald else DangerRed
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(badgeColor.copy(alpha = 0.2f))
-                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            val containerBg = if (lastActionSuccess) colors.primaryContainer else colors.errorContainer
+                            val containerFg = if (lastActionSuccess) colors.onPrimaryContainer else colors.onErrorContainer
+                            Surface(
+                                color = containerBg,
+                                shape = RoundedCornerShape(8.dp)
                             ) {
                                 Text(
-                                    text = if (lastActionSuccess) "Executed: $lastExecutedAction" else "Action Blocked/Failed: $lastExecutedAction",
-                                    color = badgeColor,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold
+                                    text = if (lastActionSuccess) "Executed: $lastExecutedAction" else "Action Failed: $lastExecutedAction",
+                                    color = containerFg,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                                 )
                             }
                         }
@@ -599,10 +774,11 @@ fun MainAssistantScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Clean Input & Upgraded Direct Voice Controls
+            // Clean Material You Controls & Direct Voice Bar
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
+                    .widthIn(max = 600.dp)
                     .fillMaxWidth()
                     .padding(bottom = 10.dp)
             ) {
@@ -612,7 +788,7 @@ fun MainAssistantScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("command_keyboard_input"),
-                    placeholder = { Text("Ask MYRAA anything or type a command...", fontSize = 13.sp) },
+                    placeholder = { Text("Ask MYRAA or say 'build a website for...'") },
                     trailingIcon = {
                         IconButton(
                             onClick = {
@@ -625,7 +801,11 @@ fun MainAssistantScreen(
                             },
                             modifier = Modifier.testTag("send_command_button")
                         ) {
-                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", tint = CyanPrimary)
+                            Icon(
+                                Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send",
+                                tint = colors.primary
+                            )
                         }
                     },
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
@@ -640,15 +820,13 @@ fun MainAssistantScreen(
                         }
                     ),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = CyanPrimary,
-                        unfocusedBorderColor = DarkSurfaceBorder,
-                        focusedTextColor = TextPrimary,
-                        unfocusedTextColor = TextPrimary,
-                        focusedContainerColor = DarkSurfaceElevated,
-                        unfocusedContainerColor = DarkSurfaceElevated
+                        focusedBorderColor = colors.primary,
+                        unfocusedBorderColor = colors.outlineVariant,
+                        focusedContainerColor = colors.surfaceContainerHigh,
+                        unfocusedContainerColor = colors.surfaceContainerLow
                     ),
                     singleLine = true,
-                    shape = RoundedCornerShape(24.dp)
+                    shape = RoundedCornerShape(28.dp)
                 )
 
                 Spacer(modifier = Modifier.height(14.dp))
@@ -662,7 +840,7 @@ fun MainAssistantScreen(
                         initialValue = 1f,
                         targetValue = if (isSessionActive && !isListeningPaused) 1.07f else 1f,
                         animationSpec = infiniteRepeatable(
-                            animation = tween(1200, easing = FastOutSlowInEasing),
+                            animation = tween(1100, easing = FastOutSlowInEasing),
                             repeatMode = RepeatMode.Reverse
                         ),
                         label = "pulse_scale"
@@ -674,11 +852,11 @@ fun MainAssistantScreen(
                             .size(72.dp)
                             .clip(CircleShape)
                             .background(
-                                Brush.radialGradient(
+                                Brush.linearGradient(
                                     colors = if (isSessionActive) {
-                                        listOf(DangerRed, DangerRed.copy(alpha = 0.6f))
+                                        listOf(colors.error, colors.tertiary)
                                     } else {
-                                        listOf(CyanPrimary, VioletSecondary)
+                                        listOf(colors.primary, colors.secondary)
                                     }
                                 )
                             )
@@ -701,33 +879,23 @@ fun MainAssistantScreen(
                         Icon(
                             imageVector = if (isSessionActive) Icons.Default.PowerSettingsNew else Icons.Default.Mic,
                             contentDescription = if (isSessionActive) "Stop Voice AI" else "Start Direct Voice AI",
-                            tint = Color.White,
+                            tint = if (isSessionActive) colors.onError else colors.onPrimary,
                             modifier = Modifier.size(34.dp)
                         )
                     }
 
                     if (isSessionActive && companionState == CompanionState.LISTENING) {
-                        OutlinedButton(
+                        FilledTonalButton(
                             onClick = { coordinator.finishUtteranceNow() },
-                            border = BorderStroke(1.dp, CyanPrimary),
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                containerColor = DarkSurfaceElevated
-                            ),
                             modifier = Modifier.testTag("send_voice_now_button")
                         ) {
                             Icon(
                                 imageVector = Icons.Default.GraphicEq,
                                 contentDescription = "Send Voice Now",
-                                tint = CyanPrimary,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "SEND VOICE",
-                                color = CyanPrimary,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Text("SEND", fontWeight = FontWeight.Bold)
                         }
                     }
 
@@ -736,25 +904,16 @@ fun MainAssistantScreen(
                             onClick = {
                                 if (isListeningPaused) coordinator.resumeListening() else coordinator.pauseListening()
                             },
-                            border = BorderStroke(1.dp, if (isListeningPaused) AuroraEmerald else AuroraPink),
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                containerColor = DarkSurfaceElevated
-                            ),
+                            border = BorderStroke(1.dp, colors.outline),
                             modifier = Modifier.testTag("pause_resume_listening_button")
                         ) {
                             Icon(
                                 imageVector = if (isListeningPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
                                 contentDescription = if (isListeningPaused) "Resume Listening" else "Pause Listening",
-                                tint = if (isListeningPaused) AuroraEmerald else AuroraPink,
                                 modifier = Modifier.size(18.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (isListeningPaused) "RESUME" else "PAUSE",
-                                color = if (isListeningPaused) AuroraEmerald else AuroraPink,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Text(if (isListeningPaused) "RESUME" else "PAUSE", fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -764,25 +923,21 @@ fun MainAssistantScreen(
                 Text(
                     text = when {
                         isSessionActive && isListeningPaused -> "VOICE PAUSED • TAP RESUME OR STOP"
-                        isSessionActive && companionState == CompanionState.THINKING -> "UNDERSTANDING YOUR VOICE..."
-                        isSessionActive && companionState == CompanionState.TALKING -> "SPEAKING IN AI VOICE..."
+                        isSessionActive && companionState == CompanionState.THINKING -> "THINKING FAST..."
+                        isSessionActive && companionState == CompanionState.TALKING -> "SPEAKING IN PURE AI VOICE..."
                         isSessionActive -> "LISTENING DIRECTLY • SPEAK NATURALLY"
-                        else -> "TAP MIC FOR DIRECT VOICE-TO-VOICE AI"
+                        else -> "TAP MIC FOR FAST VOICE-TO-VOICE AI"
                     },
                     style = MaterialTheme.typography.labelSmall,
-                    color = when {
-                        isSessionActive && isListeningPaused -> AuroraPink
-                        isSessionActive -> CyanPrimary
-                        else -> CyanPrimary
-                    },
-                    fontWeight = FontWeight.ExtraBold,
-                    letterSpacing = 0.7.sp,
+                    color = if (isSessionActive && isListeningPaused) colors.tertiary else colors.primary,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 0.6.sp,
                     textAlign = TextAlign.Center
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Sleek Voice Mode API Selector (Auto uses 1st configured API)
+                // Material You Segmented Voice Engine Switcher
                 val firstLabel = when (firstConfiguredVoiceProvider) {
                     SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> "1st: 11Labs"
                     SecurePreferences.VOICE_PROVIDER_GEMINI -> "1st: Gemini"
@@ -791,14 +946,15 @@ fun MainAssistantScreen(
                 val activeVoiceLabel = if (effectiveVoiceProvider == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) {
                     "ElevenLabs"
                 } else {
-                    "Gemini Voice"
+                    "Gemini Neural Voice"
                 }
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+
+                Surface(
+                    color = colors.surfaceContainerHigh,
+                    shape = RoundedCornerShape(50)
+                ) {
                     Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(DarkSurfaceElevated)
-                            .padding(3.dp),
+                        modifier = Modifier.padding(3.dp),
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -808,11 +964,10 @@ fun MainAssistantScreen(
                             Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "voice_provider_elevenlabs")
                         ).forEach { (modeKey, title, tag) ->
                             val selected = voiceProviderMode == modeKey
-                            val accent = if (modeKey == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) AuroraPink else CyanPrimary
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(50))
-                                    .background(if (selected) accent.copy(alpha = 0.22f) else Color.Transparent)
+                                    .background(if (selected) colors.primaryContainer else Color.Transparent)
                                     .clickable { coordinator.setVoiceProviderMode(modeKey) }
                                     .padding(horizontal = 12.dp, vertical = 8.dp)
                                     .testTag(tag),
@@ -820,21 +975,131 @@ fun MainAssistantScreen(
                             ) {
                                 Text(
                                     text = title,
-                                    color = if (selected) accent else TextSecondary,
-                                    fontSize = 11.sp,
+                                    color = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant,
+                                    style = MaterialTheme.typography.labelMedium,
                                     fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
                                 )
                             }
                         }
                     }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Voice Engine: $activeVoiceLabel",
-                        color = TextSecondary,
-                        fontSize = 10.sp
-                    )
                 }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "AI Voice: $activeVoiceLabel",
+                    color = colors.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall
+                )
             }
         }
     }
+}
+
+@Composable
+private fun BossVoiceGuardDialog(
+    isEnrolled: Boolean,
+    isGuardEnabled: Boolean,
+    isCapturing: Boolean,
+    statusMessage: String?,
+    onCaptureSample: () -> Unit,
+    onToggleGuard: (Boolean) -> Unit,
+    onClearVoiceprint: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val colors = MaterialTheme.colorScheme
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Icon(
+                imageVector = Icons.Default.RecordVoiceOver,
+                contentDescription = null,
+                tint = colors.primary
+            )
+        },
+        title = {
+            Text("Boss / Jaan Voice Recognition")
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "Apni awaaz (Boss / Priyanshu) record karke save karein. Jab bhi koi doosra insaan bolega, MYRAA turant alert cue bajayegi aur voice warning degi.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.onSurfaceVariant
+                )
+
+                Surface(
+                    color = if (isEnrolled) colors.primaryContainer else colors.surfaceContainerHigh,
+                    shape = MaterialTheme.shapes.medium,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = if (isEnrolled) {
+                            "Boss Voice ID: Enrolled & ${if (isGuardEnabled) "Active" else "Paused"}"
+                        } else {
+                            "Boss Voice ID: Not enrolled yet"
+                        },
+                        color = if (isEnrolled) colors.onPrimaryContainer else colors.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(12.dp)
+                    )
+                }
+
+                if (!statusMessage.isNullOrBlank()) {
+                    Text(
+                        text = statusMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.primary
+                    )
+                }
+
+                Button(
+                    onClick = onCaptureSample,
+                    enabled = !isCapturing,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("enroll_boss_voice_button")
+                ) {
+                    if (isCapturing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = colors.onPrimary
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Listening 2.6s... Speak Now")
+                    } else {
+                        Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (isEnrolled) "Add Another Voice Sample" else "Record Boss Voice (2.6s)")
+                    }
+                }
+
+                if (isEnrolled) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { onToggleGuard(!isGuardEnabled) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (isGuardEnabled) "Pause Guard" else "Enable Guard")
+                        }
+                        OutlinedButton(
+                            onClick = onClearVoiceprint,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = colors.error),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Reset ID")
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Done")
+            }
+        }
+    )
 }

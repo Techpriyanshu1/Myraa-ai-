@@ -186,7 +186,7 @@ class DigitalMouseService : Service() {
             val currentY = params.y.toFloat()
 
             val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 95L
+                duration = 35L
                 addUpdateListener { va ->
                     val progress = va.animatedFraction
                     params.x = (currentX + (destParamX - currentX) * progress).toInt()
@@ -229,13 +229,13 @@ class DigitalMouseService : Service() {
             mainHandler.postDelayed({
                 overlay.visibility = View.GONE
                 onFinished()
-            }, 220L)
+            }, 120L)
         }
     }
 
     fun animateSwipe(startX: Float, startY: Float, endX: Float, endY: Float, onFinished: () -> Unit = {}) {
         mainHandler.post {
-            MyraaAccessibilityService.instance?.dispatchSwipe(startX, startY, endX, endY, durationMs = 180L) {
+            MyraaAccessibilityService.instance?.dispatchSwipe(startX, startY, endX, endY, durationMs = 115L) {
                 onFinished()
             } ?: onFinished()
 
@@ -254,7 +254,7 @@ class DigitalMouseService : Service() {
             } catch (_: Exception) {}
 
             ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = 140L
+                duration = 75L
                 addUpdateListener { va ->
                     val progress = va.animatedFraction
                     params.x = (startParamX + (endParamX - startParamX) * progress).toInt()

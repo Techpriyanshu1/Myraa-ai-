@@ -83,7 +83,7 @@ class ElevenLabsClient(private val context: Context) {
 
         private const val GEMINI_VOICE_MAHI = "Aoede"
         private const val MAX_DISK_CACHE_FILES = 60
-        private const val RATE_LIMIT_COOLDOWN_MS = 22_000L
+        private const val RATE_LIMIT_COOLDOWN_MS = 7_000L
         private val DEFAULT_GEMINI_TTS_MODELS = listOf(
             "gemini-2.5-flash-preview-tts",
             "gemini-2.5-pro-preview-tts"
@@ -94,6 +94,60 @@ class ElevenLabsClient(private val context: Context) {
         private val modelCooldownUntilMs = ConcurrentHashMap<String, Long>()
         @Volatile
         private var elevenLabsCooldownUntilMs = 0L
+    }
+
+    /**
+     * Plays a crisp dual-tone synthesized warning beep via AudioTrack when an unknown/different
+     * voice is detected instead of Boss/Jaan (zero Android TTS).
+     */
+    suspend fun playSecurityAlertCue() = withContext(Dispatchers.IO) {
+        var track: AudioTrack? = null
+        try {
+            val sampleRate = 24000
+            val totalSamples = (sampleRate * 220) / 1000
+            val pcm = ByteArray(totalSamples * 2)
+            for (i in 0 until totalSamples) {
+                val t = i.toDouble() / totalSamples
+                val inFirstPulse = t < 0.42
+                val inSecondPulse = t > 0.56
+                val amp = if (inFirstPulse || inSecondPulse) 0.34 else 0.0
+                val freq = if (inFirstPulse) 980.0 else 740.0
+                val sample = (kotlin.math.sin(2.0 * Math.PI * freq * i / sampleRate) * 32767.0 * amp).toInt()
+                    .coerceIn(-32768, 32767)
+                pcm[i * 2] = (sample and 0xFF).toByte()
+                pcm[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
+            }
+            val minBuf = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            if (minBuf <= 0) return@withContext
+            track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(maxOf(minBuf, pcm.size))
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+            if (track.state == AudioTrack.STATE_INITIALIZED) {
+                track.write(pcm, 0, pcm.size)
+                track.play()
+                delay(235L)
+            }
+        } catch (_: Exception) {
+        } finally {
+            try {
+                track?.stop()
+                track?.release()
+            } catch (_: Exception) {}
+        }
     }
 
     /**
@@ -464,7 +518,7 @@ class ElevenLabsClient(private val context: Context) {
         }
 
         return try {
-            val url = "https://api.elevenlabs.io/v1/text-to-speech/$targetVoiceId?optimize_streaming_latency=3"
+            val url = "https://api.elevenlabs.io/v1/text-to-speech/$targetVoiceId?optimize_streaming_latency=4"
             val jsonPayload = JSONObject().apply {
                 put("text", cleanText)
                 put("model_id", if (modelId.isNotBlank()) modelId.trim() else MODEL_ELEVEN_FLASH_V2_5)
@@ -537,7 +591,7 @@ class ElevenLabsClient(private val context: Context) {
         onStarted: () -> Unit
     ): String? {
         if (geminiKey.isBlank()) return "Gemini API key missing."
-        val chunks = splitIntoFastSpeechChunks(cleanText)
+        val chunks = splitIntoFastSpeechChunks(cleanText, maxChunkChars = 280)
 
         var playedAnyChunk = false
         var lastErrorReason: String? = null
@@ -625,9 +679,9 @@ class ElevenLabsClient(private val context: Context) {
      * Keeps typical replies in a single fast request (<= 140 chars) while splitting longer multi-sentence
      * answers into clean sentence groups for sequential prefetch pipelining.
      */
-    internal fun splitIntoFastSpeechChunks(text: String): List<String> {
+    internal fun splitIntoFastSpeechChunks(text: String, maxChunkChars: Int = 140): List<String> {
         val clean = text.trim()
-        if (clean.length <= 140) return listOf(clean)
+        if (clean.length <= maxChunkChars) return listOf(clean)
 
         val rawSentences = clean.split(Regex("(?<=[.!?।])\\s+"))
             .map { it.trim() }
@@ -640,7 +694,7 @@ class ElevenLabsClient(private val context: Context) {
         for (sentence in rawSentences) {
             if (current.isEmpty()) {
                 current.append(sentence)
-            } else if (current.length + 1 + sentence.length <= 140) {
+            } else if (current.length + 1 + sentence.length <= maxChunkChars) {
                 current.append(' ').append(sentence)
             } else {
                 chunks.add(current.toString())
@@ -683,7 +737,7 @@ class ElevenLabsClient(private val context: Context) {
         var didDiscovery = !discoveredTtsModelsCache[cleanKey].isNullOrEmpty()
         var lastError = "Gemini TTS synthesis failed."
         var sawRateLimit = false
-        val spokenDirectiveText = "Speak aloud naturally and concisely without adding extra words:\n$text"
+        val spokenDirectiveText = text.trim()
 
         while (queue.isNotEmpty()) {
             val model = queue.removeFirst()
@@ -1017,13 +1071,21 @@ class ElevenLabsClient(private val context: Context) {
                             track.playbackParams = PlaybackParams().setSpeed(safeSpeed)
                         } catch (_: Exception) {}
                     }
+                    val initialWrite = minOf(streamBufSize, validLength)
+                    var offset = 0
+                    if (initialWrite > 0) {
+                        val preWritten = track.write(pcmData, 0, initialWrite)
+                        if (preWritten > 0) {
+                            offset = preWritten
+                        }
+                    }
+
                     val startedAt = System.currentTimeMillis()
                     onStart()
                     track.setVolume(1.0f)
                     track.play()
 
-                    var offset = 0
-                    val writeChunk = 4096
+                    val writeChunk = 8192
                     while (offset < validLength && isActive && genId == speechGenerationId) {
                         val toWrite = minOf(writeChunk, validLength - offset)
                         val written = track.write(pcmData, offset, toWrite)
@@ -1038,7 +1100,7 @@ class ElevenLabsClient(private val context: Context) {
                         val totalAudioMs = ((validLength * 1000L) / (sampleRate * 2L) / safeSpeed).toLong()
                         val elapsed = System.currentTimeMillis() - startedAt
                         val remaining = (totalAudioMs - elapsed).coerceAtLeast(0L)
-                        delay(remaining + 160L)
+                        delay(remaining + 180L)
                     }
                 }
             }
