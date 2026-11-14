@@ -682,4 +682,25 @@ class MyraaCoreVerificationTest {
         manager.deleteProject(saved.id)
         assertFalse(manager.getSavedProjects().any { it.id == saved.id })
     }
+
+    @Test
+    fun `Fast Flash default model and zero-RPM local identity time date reflexes work offline`() = runTest {
+        assertEquals("gemini-2.5-flash", SecurePreferences.DEFAULT_GEMINI_MODEL)
+        assertEquals("gemini-2.5-flash", GeminiClient.AVAILABLE_MODELS.first())
+
+        val gemini = GeminiClient()
+        val whoCmd = gemini.interpretCommand("tum kaun ho", "")
+        assertEquals("CHAT", whoCmd.actionType)
+        assertTrue(whoCmd.spokenResponse.contains("MYRAA", ignoreCase = true))
+
+        val timeCmd = gemini.interpretCommand("what time is it right now", "")
+        assertEquals("CHAT", timeCmd.actionType)
+        assertEquals("time_query", timeCmd.intent)
+        assertTrue(timeCmd.spokenResponse.contains("samay ho raha hai", ignoreCase = true))
+
+        val dateCmd = gemini.interpretCommand("aaj ki date kya hai", "")
+        assertEquals("CHAT", dateCmd.actionType)
+        assertEquals("date_query", dateCmd.intent)
+        assertTrue(dateCmd.spokenResponse.contains("Aaj", ignoreCase = true))
+    }
 }

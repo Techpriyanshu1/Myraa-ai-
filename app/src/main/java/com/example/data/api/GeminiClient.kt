@@ -38,11 +38,11 @@ class GeminiClient {
 
     companion object {
         val AVAILABLE_MODELS = listOf(
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
             "gemini-3-flash-preview",
             "gemini-flash-latest",
-            "gemini-3.1-pro-preview",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite"
+            "gemini-3.1-pro-preview"
         )
 
         private val RETIRED_MODELS = setOf(
@@ -116,11 +116,11 @@ class GeminiClient {
         private fun modelRankTier(name: String): Int {
             val l = name.lowercase()
             return when {
-                l.startsWith("gemini-3") && l.contains("flash") -> 0
-                l == "gemini-flash-latest" -> 1
-                l.contains("flash") && !l.startsWith("gemini-1") -> 2
-                l.startsWith("gemini-3") && l.contains("pro") -> 3
-                l.contains("pro") && !l.startsWith("gemini-1") -> 4
+                l == "gemini-2.5-flash" -> 0
+                l == "gemini-2.5-flash-lite" -> 1
+                l.startsWith("gemini-3") && l.contains("flash") -> 2
+                l.contains("flash") && !l.startsWith("gemini-1") -> 3
+                l.contains("pro") -> 4
                 else -> 5
             }
         }
@@ -152,10 +152,10 @@ class GeminiClient {
             .find(errBody)?.groupValues?.get(1)?.toDoubleOrNull()?.times(1000.0)?.toLong()
         val headerMs = retryHeaderSec?.times(1000L)
         val cooldownMs = when {
-            isZeroQuota -> 120_000L
-            retryMsFromBody != null -> retryMsFromBody.coerceIn(2_000L, 60_000L)
-            headerMs != null -> headerMs.coerceIn(2_000L, 60_000L)
-            else -> 20_000L
+            isZeroQuota -> 300_000L
+            retryMsFromBody != null -> retryMsFromBody.coerceIn(1_000L, 4_500L)
+            headerMs != null -> headerMs.coerceIn(1_000L, 4_500L)
+            else -> 3_000L
         }
         modelCooldownUntilMs[model] = System.currentTimeMillis() + cooldownMs
         return cooldownMs
@@ -717,30 +717,24 @@ class GeminiClient {
             "\n[CURRENT ACTIVE SCREEN UI]:\n$screenContextSummary\n"
         } else ""
         return """
-            You are MYRAA AI, a warm, loving, respectful Indian AI smartphone assistant speaking in Mahi's voice.
-            
-            $memoryBlock
-            $screenSection
-            Respond ONLY with a valid single JSON object (no markdown fences, no prose outside JSON) using this exact schema:
+            You are MYRAA AI, a warm, loving, fast Indian AI smartphone assistant (Mahi voice).
+            $memoryBlock$screenSection
+            Reply ONLY with valid raw JSON:
             {
-              "heardSummary": "Brief summary or transcript of what the user asked",
+              "heardSummary": "short user transcript",
               "intent": "open_app|youtube_search|build_website|open_settings|open_camera|open_calculator|open_clock|flashlight|volume|accessibility|screen_click|screen_type|web_search|dial|pause_listening|resume_listening|stop_ai|list_apps|show_history|chat",
               "actionType": "OPEN_APP|YOUTUBE_SEARCH|BUILD_WEBSITE|OPEN_SETTINGS|OPEN_CAMERA|OPEN_CALCULATOR|OPEN_CLOCK|FLASHLIGHT|VOLUME|ACCESSIBILITY|SCREEN_CLICK|SCREEN_TYPE|WEB_SEARCH|DIAL|PAUSE_LISTENING|RESUME_LISTENING|STOP_AI|LIST_APPS|SHOW_HISTORY|CHAT",
-              "target": "target app, website description/topic, YouTube query, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), phone number, accessibility target (home|back|scroll_down|scroll_up|lock), or search query",
-              "extraData": "optional text to type or extra info",
+              "target": "app name, website prompt, YouTube query, setting (wifi|bluetooth|display|sound|location|app|notifications|settings), number, accessibility (home|back|scroll_down|scroll_up|lock), or search query",
+              "extraData": "text to type or extra info",
               "riskLevel": "LOW|MEDIUM|HIGH",
               "requiresConfirmation": false,
-              "spokenResponse": "Crisp 1-sentence reply in Hindi, Hinglish, or English matching user language, max 14 words for instant AI voice, no markdown or emojis"
+              "spokenResponse": "Crisp natural 1-sentence reply in user's Hindi/Hinglish/English language (<= 12 words, plain text, no markdown/emojis)"
             }
-            STRICT RULES:
-            - ALWAYS honor Permanent Core Memory and User Preferences above.
-            - Use BUILD_WEBSITE when the user asks to build, create, or design a website/webpage inside the app (put clean site prompt in "target").
-            - Use YOUTUBE_SEARCH to search or play any song/video on YouTube (put ONLY the clean query in "target").
-            - Use ACCESSIBILITY with target="scroll_down" for scroll/next short/reel/video; target="scroll_up" for scroll up/previous short.
-            - Use SCREEN_CLICK (exact visible UI label in "target") or SCREEN_TYPE (text in "extraData") to interact with current screen UI.
-            - Never output shell/code payloads. For OPEN_SETTINGS, say settings screen is opening (never claim toggled ON/OFF).
-            - Set requiresConfirmation=true and riskLevel="HIGH" for lock screen, delete, uninstall, or payment actions.
-            - Keep spokenResponse under 14 words unless the user asks for details. If a screenshot is attached, use it directly.
+            RULES:
+            - Honor Permanent Core Memory first.
+            - Use BUILD_WEBSITE for building/designing websites; YOUTUBE_SEARCH for songs/videos on YouTube; ACCESSIBILITY ("scroll_down"/"scroll_up") for shorts/reels; SCREEN_CLICK/SCREEN_TYPE for visible UI.
+            - Set requiresConfirmation=true, riskLevel="HIGH" for lock/delete/uninstall/payment.
+            - Keep spokenResponse under 12 words for instant voice.
         """.trimIndent()
     }
 
@@ -881,6 +875,46 @@ class GeminiClient {
 
     private fun parseDeviceHardwareReflex(normalized: String, rawPrompt: String): ParsedCommand? {
         val lower = normalized.lowercase().trim()
+
+        // Zero-latency personal & utility reflexes (saves RPM quota & answers in 0ms)
+        if (lower in listOf("who are you", "tum kaun ho", "aap kaun ho", "what is your name", "apna naam batao", "tera naam")) {
+            return ParsedCommand(
+                spokenResponse = "Main MYRAA AI hoon, aapki fast Mahi personal assistant.",
+                actionType = "CHAT",
+                target = rawPrompt,
+                rawPrompt = rawPrompt,
+                intent = "identity"
+            )
+        }
+        if (lower in listOf("how are you", "kaise ho", "kaisi ho", "kya haal hai", "kya haal")) {
+            return ParsedCommand(
+                spokenResponse = "Main bilkul badhiya hoon! Boliye aaj kya kaam hai?",
+                actionType = "CHAT",
+                target = rawPrompt,
+                rawPrompt = rawPrompt,
+                intent = "greeting"
+            )
+        }
+        if (lower in listOf("time", "what time is it", "what time is it right now", "time kya hai", "kitne baje", "kitne baje hain", "samay kya hai")) {
+            val timeStr = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
+            return ParsedCommand(
+                spokenResponse = "Abhi samay ho raha hai $timeStr.",
+                actionType = "CHAT",
+                target = rawPrompt,
+                rawPrompt = rawPrompt,
+                intent = "time_query"
+            )
+        }
+        if (lower in listOf("date", "what is the date", "what is today's date", "aaj kya date hai", "aaj ki date kya hai", "aaj ki tareekh", "aaj ki tareekh kya hai", "today date")) {
+            val dateStr = SimpleDateFormat("EEEE, MMMM dd", Locale.getDefault()).format(Date())
+            return ParsedCommand(
+                spokenResponse = "Aaj $dateStr hai.",
+                actionType = "CHAT",
+                target = rawPrompt,
+                rawPrompt = rawPrompt,
+                intent = "date_query"
+            )
+        }
 
         // Session & Voice Control Commands
         if (lower in listOf("pause listening", "pause", "listening pause karo", "stop listening", "chup raho")) {

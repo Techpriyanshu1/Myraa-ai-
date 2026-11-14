@@ -937,58 +937,66 @@ fun MainAssistantScreen(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                // Material You Segmented Voice Engine Switcher
-                val firstLabel = when (firstConfiguredVoiceProvider) {
-                    SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> "1st: 11Labs"
-                    SecurePreferences.VOICE_PROVIDER_GEMINI -> "1st: Gemini"
-                    else -> "1st API"
-                }
-                val activeVoiceLabel = if (effectiveVoiceProvider == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) {
-                    "ElevenLabs"
-                } else {
-                    "Gemini Neural Voice"
-                }
-
-                Surface(
-                    color = colors.surfaceContainerHigh,
-                    shape = RoundedCornerShape(50)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(3.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                // Clean Voice Engine Indicator (Multi-provider switcher shown only if ElevenLabs key is also added)
+                val hasElevenLabsKey = prefs.hasStoredVoiceKey()
+                if (hasElevenLabsKey) {
+                    val firstLabel = when (firstConfiguredVoiceProvider) {
+                        SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> "1st: 11Labs"
+                        SecurePreferences.VOICE_PROVIDER_GEMINI -> "1st: Gemini"
+                        else -> "1st API"
+                    }
+                    Surface(
+                        color = colors.surfaceContainerHigh,
+                        shape = RoundedCornerShape(50)
                     ) {
-                        listOf(
-                            Triple(SecurePreferences.VOICE_PROVIDER_AUTO, "Auto ($firstLabel)", "voice_provider_auto"),
-                            Triple(SecurePreferences.VOICE_PROVIDER_GEMINI, "Gemini", "voice_provider_gemini"),
-                            Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "voice_provider_elevenlabs")
-                        ).forEach { (modeKey, title, tag) ->
-                            val selected = voiceProviderMode == modeKey
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .background(if (selected) colors.primaryContainer else Color.Transparent)
-                                    .clickable { coordinator.setVoiceProviderMode(modeKey) }
-                                    .padding(horizontal = 12.dp, vertical = 8.dp)
-                                    .testTag(tag),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = title,
-                                    color = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant,
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
-                                )
+                        Row(
+                            modifier = Modifier.padding(3.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            listOf(
+                                Triple(SecurePreferences.VOICE_PROVIDER_AUTO, "Auto ($firstLabel)", "voice_provider_auto"),
+                                Triple(SecurePreferences.VOICE_PROVIDER_GEMINI, "Gemini", "voice_provider_gemini"),
+                                Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "voice_provider_elevenlabs")
+                            ).forEach { (modeKey, title, tag) ->
+                                val selected = voiceProviderMode == modeKey
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(if (selected) colors.primaryContainer else Color.Transparent)
+                                        .clickable { coordinator.setVoiceProviderMode(modeKey) }
+                                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                                        .testTag(tag),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = title,
+                                        color = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                    )
+                                }
                             }
                         }
                     }
+                    Spacer(modifier = Modifier.height(4.dp))
                 }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "AI Voice: $activeVoiceLabel",
-                    color = colors.onSurfaceVariant,
-                    style = MaterialTheme.typography.labelSmall
-                )
+                val activeVoiceLabel = if (hasElevenLabsKey && effectiveVoiceProvider == SecurePreferences.VOICE_PROVIDER_ELEVENLABS) {
+                    "ElevenLabs"
+                } else {
+                    "Gemini Neural (Mahi)"
+                }
+                Surface(
+                    color = colors.surfaceContainerLow,
+                    shape = RoundedCornerShape(50)
+                ) {
+                    Text(
+                        text = "AI Voice: $activeVoiceLabel",
+                        color = colors.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
+                    )
+                }
             }
         }
     }

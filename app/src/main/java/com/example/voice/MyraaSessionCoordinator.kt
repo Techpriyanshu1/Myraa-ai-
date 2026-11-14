@@ -151,6 +151,12 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     @Volatile
     private var lastProcessedCommandAt = 0L
 
+    @Volatile
+    private var cachedMemoryContext: String = ""
+
+    @Volatile
+    private var cachedMemoryAtMs: Long = 0L
+
     companion object {
         const val GREETING_TEXT =
             "Namaste! Main MYRAA AI hoon, aapki Mahi voice ready hai. Boliye main aapki kya madad karu?"
@@ -181,10 +187,26 @@ class MyraaSessionCoordinator private constructor(context: Context) {
     fun initializeOnScreenAppear() {
         coordinatorScope.launch {
             memoryManager.ensurePermanentMemorySeeded()
+            cachedMemoryContext = memoryManager.buildPromptMemoryContext()
+            cachedMemoryAtMs = System.currentTimeMillis()
         }
         refreshVoiceProviderState()
         refreshVoiceGuardState()
         fleetManager.refreshFleetStatus(clearErrors = true)
+    }
+
+    private suspend fun getPromptMemoryContextFast(): String {
+        val now = System.currentTimeMillis()
+        val cached = cachedMemoryContext
+        if (cached.isNotBlank() && (now - cachedMemoryAtMs) < 5_000L) {
+            return cached
+        }
+        return withContext(Dispatchers.IO) {
+            memoryManager.buildPromptMemoryContext().also {
+                cachedMemoryContext = it
+                cachedMemoryAtMs = System.currentTimeMillis()
+            }
+        }
     }
 
     fun setVoiceProviderMode(mode: String) {
@@ -325,8 +347,16 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                     }
                 },
                 onError = { err ->
-                    _voiceOutputError.value = err
-                    fleetManager.recordAgentError("mahi_voice_output", err)
+                    val isRateLimit = err.contains("429") ||
+                        err.contains("busy", ignoreCase = true) ||
+                        err.contains("rate limit", ignoreCase = true)
+                    if (isRateLimit && !prefs.hasStoredVoiceKey()) {
+                        _voiceOutputError.value = "Voice busy (rate limit) — auto-recovering"
+                        fleetManager.clearAgentError("mahi_voice_output")
+                    } else {
+                        _voiceOutputError.value = err
+                        fleetManager.recordAgentError("mahi_voice_output", err)
+                    }
                     if (_isSessionActive.value && !_isListeningPaused.value) {
                         voiceManager.resumeListeningAfterSpeech()
                     } else {
@@ -554,9 +584,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                 } catch (_: Exception) {
                     ""
                 }
-                val memoryContext = withContext(Dispatchers.IO) {
-                    memoryManager.buildPromptMemoryContext()
-                }
+                val memoryContext = getPromptMemoryContextFast()
                 val parsed = withTimeout(20_000L) {
                     geminiClient.interpretCommand(
                         prompt = trimmed,
@@ -642,9 +670,7 @@ class MyraaSessionCoordinator private constructor(context: Context) {
                     }
                 }
 
-                val memoryContext = withContext(Dispatchers.IO) {
-                    bossGuardDirective + memoryManager.buildPromptMemoryContext()
-                }
+                val memoryContext = bossGuardDirective + getPromptMemoryContextFast()
                 val parsed = withTimeout(20_000L) {
                     geminiClient.interpretAudioCommand(
                         audioWavBytes = audioWavBytes,

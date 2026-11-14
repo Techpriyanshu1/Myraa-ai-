@@ -545,39 +545,18 @@ fun SettingsScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Pure AI Voice Engine (Zero Android TTS)",
+                            text = "Gemini Neural AI Voice (Zero Android TTS)",
                             style = MaterialTheme.typography.titleMedium,
                             color = colors.onSurface,
                             fontWeight = FontWeight.Bold
                         )
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    OutlinedTextField(
-                        value = voiceKey,
-                        onValueChange = {
-                            voiceKey = it
-                            voiceTestResult = null
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("settings_voice_key"),
-                        label = { Text("ElevenLabs API Key (Optional)") },
-                        placeholder = { Text("sk_... (leave blank for Gemini Neural AI Voice)") },
-                        visualTransformation = if (showVoiceKey) VisualTransformation.None else PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        trailingIcon = {
-                            IconButton(onClick = { showVoiceKey = !showVoiceKey }) {
-                                Icon(
-                                    imageVector = if (showVoiceKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = if (showVoiceKey) "Hide ElevenLabs Key" else "Show ElevenLabs Key",
-                                    tint = colors.onSurfaceVariant
-                                )
-                            }
-                        },
-                        singleLine = true,
-                        shape = MaterialTheme.shapes.small
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Aapki Gemini API key se hi Mahi AI Voice automatically chalti hai — kisi extra voice API ki zaroorat nahi hai.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.onSurfaceVariant
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
@@ -617,62 +596,108 @@ fun SettingsScreen(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    Text(
-                        text = "Voice API Engine Priority",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = colors.onSurface,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    val firstApiText = when (firstVoiceProvider) {
-                        SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> "First API given: ElevenLabs"
-                        SecurePreferences.VOICE_PROVIDER_GEMINI -> "First API given: Gemini"
-                        else -> "Auto uses whichever API key you provide first"
-                    }
-                    Text(
-                        text = firstApiText,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = colors.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    var showOptionalElevenLabs by remember { mutableStateOf(voiceKey.isNotBlank()) }
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(MaterialTheme.shapes.small)
+                            .clickable { showOptionalElevenLabs = !showOptionalElevenLabs }
+                            .padding(vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        listOf(
-                            Triple(SecurePreferences.VOICE_PROVIDER_AUTO, "Auto (1st)", "settings_voice_provider_auto"),
-                            Triple(SecurePreferences.VOICE_PROVIDER_GEMINI, "Gemini", "settings_voice_provider_gemini"),
-                            Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "settings_voice_provider_elevenlabs")
-                        ).forEach { (modeKey, label, tag) ->
-                            val selected = selectedVoiceProviderMode == modeKey
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(MaterialTheme.shapes.small)
-                                    .background(if (selected) colors.primaryContainer else colors.surfaceContainerHigh)
-                                    .border(
-                                        1.dp,
-                                        if (selected) colors.primary else colors.outlineVariant,
-                                        MaterialTheme.shapes.small
+                        Text(
+                            text = if (showOptionalElevenLabs) "Hide Optional ElevenLabs Setup" else "Optional: Add ElevenLabs Key (Not Needed)",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = colors.primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    if (showOptionalElevenLabs) {
+                        OutlinedTextField(
+                            value = voiceKey,
+                            onValueChange = {
+                                voiceKey = it
+                                voiceTestResult = null
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_voice_key"),
+                            label = { Text("ElevenLabs API Key (Optional)") },
+                            placeholder = { Text("sk_... (leave blank for Gemini Neural AI Voice)") },
+                            visualTransformation = if (showVoiceKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            trailingIcon = {
+                                IconButton(onClick = { showVoiceKey = !showVoiceKey }) {
+                                    Icon(
+                                        imageVector = if (showVoiceKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = if (showVoiceKey) "Hide ElevenLabs Key" else "Show ElevenLabs Key",
+                                        tint = colors.onSurfaceVariant
                                     )
-                                    .clickable {
-                                        selectedVoiceProviderMode = modeKey
-                                        prefs.setVoiceProviderMode(modeKey)
-                                        coordinator.refreshVoiceProviderState()
-                                        voiceTestResult = null
-                                    }
-                                    .padding(vertical = 10.dp)
-                                    .testTag(tag),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = label,
-                                    color = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant,
-                                    fontSize = 12.sp,
-                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
-                                )
+                                }
+                            },
+                            singleLine = true,
+                            shape = MaterialTheme.shapes.small
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        Text(
+                            text = "Voice API Engine Priority",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = colors.onSurface,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        val firstApiText = when (firstVoiceProvider) {
+                            SecurePreferences.VOICE_PROVIDER_ELEVENLABS -> "First API given: ElevenLabs"
+                            SecurePreferences.VOICE_PROVIDER_GEMINI -> "First API given: Gemini"
+                            else -> "Auto uses whichever API key you provide first"
+                        }
+                        Text(
+                            text = firstApiText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            listOf(
+                                Triple(SecurePreferences.VOICE_PROVIDER_AUTO, "Auto (1st)", "settings_voice_provider_auto"),
+                                Triple(SecurePreferences.VOICE_PROVIDER_GEMINI, "Gemini", "settings_voice_provider_gemini"),
+                                Triple(SecurePreferences.VOICE_PROVIDER_ELEVENLABS, "ElevenLabs", "settings_voice_provider_elevenlabs")
+                            ).forEach { (modeKey, label, tag) ->
+                                val selected = selectedVoiceProviderMode == modeKey
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(MaterialTheme.shapes.small)
+                                        .background(if (selected) colors.primaryContainer else colors.surfaceContainerHigh)
+                                        .border(
+                                            1.dp,
+                                            if (selected) colors.primary else colors.outlineVariant,
+                                            MaterialTheme.shapes.small
+                                        )
+                                        .clickable {
+                                            selectedVoiceProviderMode = modeKey
+                                            prefs.setVoiceProviderMode(modeKey)
+                                            coordinator.refreshVoiceProviderState()
+                                            voiceTestResult = null
+                                        }
+                                        .padding(vertical = 10.dp)
+                                        .testTag(tag),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = label,
+                                        color = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                    )
+                                }
                             }
                         }
                     }

@@ -70,14 +70,14 @@ class VoiceRecognitionManager(
         private const val CHANNELS = 1
         private const val BITS_PER_SAMPLE = 16
         private const val CHUNK_SHORTS = 800 // 50ms per chunk at 16kHz for snappy VAD
-        private const val PRE_ROLL_CHUNKS = 8 // ~400ms pre-roll before speech trigger
+        private const val PRE_ROLL_CHUNKS = 6 // ~300ms pre-roll before speech trigger
         private const val SPEECH_RMS_THRESHOLD = 0.018
-        private const val SILENCE_END_MS = 480L
-        private const val MIN_SPEECH_MS = 220L
+        private const val SILENCE_END_MS = 380L
+        private const val MIN_SPEECH_MS = 200L
         private const val MAX_UTTERANCE_MS = 12000L
         private const val IDLE_WINDOW_MS = 20000L
         private const val MIN_FORCED_BYTES = 4800 // ~150ms
-        private const val TAIL_SILENCE_KEEP_BYTES = 800 * 2 * 2 // ~100ms tail
+        private const val TAIL_SILENCE_KEEP_BYTES = 640 * 2 // ~40ms tail
     }
 
     fun prepareSessionForGreeting() {

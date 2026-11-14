@@ -21,8 +21,8 @@ class SecurePreferences(private val context: Context) {
         const val MODEL_ELEVEN_MULTILINGUAL_V2 = "eleven_multilingual_v2"
         const val MODEL_ELEVEN_FLASH_V2_5 = "eleven_flash_v2_5"
 
-        // Default Gemini Model (with live /v1beta/models auto-discovery fallback)
-        const val DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
+        // Default Gemini Model (fast zero-thinking flash with automatic fallback)
+        const val DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
         // Voice Provider Modes
         const val VOICE_PROVIDER_AUTO = "auto"

@@ -1,11 +1,9 @@
 package com.example.ui.components
 
-import android.content.res.AssetFileDescriptor
-import android.media.MediaPlayer
-import android.util.Log
-import android.view.Surface
+import android.graphics.Matrix
 import android.view.TextureView
 import android.view.View
+import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,7 +21,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -33,15 +34,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
 import com.example.ui.theme.AuroraEmerald
 import com.example.ui.theme.CyanPrimary
 import com.example.voice.CompanionState
 
 /**
- * High-Performance Single-MediaPlayer Video Avatar Player.
- * Completely eliminates lag by running only ONE active hardware video decoder at a time.
- * Displays BIG with NO BORDER as explicitly requested by the user.
+ * High-Performance Single-ExoPlayer (Media3) Video Avatar Player.
+ * Avoids android.media.MediaPlayer completely (preventing MediaPlayer-JNI -38 errors),
+ * disables audio tracks on avatar loops so voice AudioRecord/AudioTrack never contend,
+ * and renders borderless center-cropped animations on a hardware-accelerated TextureView.
  */
+@OptIn(UnstableApi::class)
 @Composable
 fun VideoAvatarPlayer(
     companionState: CompanionState,
@@ -50,89 +59,88 @@ fun VideoAvatarPlayer(
 ) {
     val context = LocalContext.current
 
-    // Determine target asset based on companion state
     val targetAsset = when (companionState) {
         CompanionState.TALKING -> "talking.mp4"
         CompanionState.THINKING -> "thinking.mp4"
         CompanionState.IDLE, CompanionState.LISTENING, CompanionState.ERROR -> "idle.mp4"
     }
 
-    // Holder for the single active MediaPlayer instance
-    val playerHolder = remember { arrayOf<MediaPlayer?>(null) }
-    val surfaceHolder = remember { arrayOf<Surface?>(null) }
-    val currentAssetHolder = remember { arrayOf("") }
+    var textureViewRef by remember { mutableStateOf<TextureView?>(null) }
+    var currentVideoSize by remember { mutableStateOf(VideoSize.UNKNOWN) }
 
-    // Helper to safely play an asset on the existing prepared surface
-    fun switchVideo(assetName: String) {
-        if (currentAssetHolder[0] == assetName && playerHolder[0]?.isPlaying == true) {
+    fun applyCenterCropTransform(tv: TextureView?, videoSize: VideoSize) {
+        if (tv == null || tv.width <= 0 || tv.height <= 0 || videoSize.width <= 0 || videoSize.height <= 0) {
             return
         }
-        val surface = surfaceHolder[0] ?: return
-        try {
-            val existingMp = playerHolder[0]
-            if (existingMp != null) {
-                try {
-                    existingMp.reset()
-                } catch (ignored: Exception) {}
-            }
-            val mp = existingMp ?: MediaPlayer()
-            playerHolder[0] = mp
+        val viewWidth = tv.width.toFloat()
+        val viewHeight = tv.height.toFloat()
+        val viewAspect = viewWidth / viewHeight
+        val videoAspect = (videoSize.width * videoSize.pixelWidthHeightRatio) / videoSize.height.toFloat()
 
-            val afd: AssetFileDescriptor = context.assets.openFd(assetName)
-            mp.setSurface(surface)
-            mp.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-            afd.close()
+        val scaleX: Float
+        val scaleY: Float
+        if (videoAspect > viewAspect) {
+            scaleX = videoAspect / viewAspect
+            scaleY = 1f
+        } else {
+            scaleX = 1f
+            scaleY = viewAspect / videoAspect
+        }
 
-            mp.isLooping = true
-            mp.setVolume(0f, 0f)
-            mp.setVideoScalingMode(MediaPlayer.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
-            mp.setOnPreparedListener { prepared ->
-                prepared.start()
-                currentAssetHolder[0] = assetName
+        val matrix = Matrix().apply {
+            setScale(scaleX, scaleY, viewWidth / 2f, viewHeight / 2f)
+        }
+        tv.setTransform(matrix)
+    }
+
+    val exoPlayer = remember(context) {
+        ExoPlayer.Builder(context.applicationContext)
+            .setHandleAudioBecomingNoisy(false)
+            .build()
+            .apply {
+                repeatMode = Player.REPEAT_MODE_ONE
+                volume = 0f
+                videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+                trackSelectionParameters = trackSelectionParameters
+                    .buildUpon()
+                    .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+                    .build()
+                playWhenReady = true
             }
-            mp.prepareAsync()
-        } catch (e: Exception) {
-            Log.e("VideoAvatarPlayer", "Error switching video to $assetName", e)
+    }
+
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                currentVideoSize = videoSize
+                applyCenterCropTransform(textureViewRef, videoSize)
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+            textureViewRef?.let { tv ->
+                exoPlayer.clearVideoTextureView(tv)
+            }
+            exoPlayer.release()
         }
     }
 
-    // Trigger video switch when state changes
-    LaunchedEffect(targetAsset) {
-        switchVideo(targetAsset)
+    LaunchedEffect(targetAsset, exoPlayer) {
+        exoPlayer.setMediaItem(MediaItem.fromUri("asset:///$targetAsset"))
+        exoPlayer.prepare()
+        exoPlayer.playWhenReady = true
     }
 
-    // Keep THINKING animation strictly to ~4.5 seconds per cycle and repeat until answer arrives
-    LaunchedEffect(companionState) {
+    // Keep THINKING animation cycling every ~4.5 seconds until answer arrives
+    LaunchedEffect(companionState, exoPlayer) {
         if (companionState == CompanionState.THINKING) {
             while (companionState == CompanionState.THINKING) {
                 kotlinx.coroutines.delay(4500L)
                 if (companionState != CompanionState.THINKING) break
-                try {
-                    val mp = playerHolder[0]
-                    if (mp != null && currentAssetHolder[0] == "thinking.mp4") {
-                        mp.seekTo(0)
-                        if (!mp.isPlaying) {
-                            mp.start()
-                        }
-                    } else {
-                        switchVideo("thinking.mp4")
-                    }
-                } catch (e: Exception) {
-                    Log.w("VideoAvatarPlayer", "Thinking loop restart warning", e)
-                }
+                exoPlayer.seekTo(0L)
+                exoPlayer.playWhenReady = true
             }
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            try {
-                playerHolder[0]?.stop()
-                playerHolder[0]?.release()
-                playerHolder[0] = null
-                surfaceHolder[0]?.release()
-                surfaceHolder[0] = null
-            } catch (ignored: Exception) {}
         }
     }
 
@@ -145,42 +153,24 @@ fun VideoAvatarPlayer(
             .background(Color(0xFF070B12)),
         contentAlignment = Alignment.Center
     ) {
-        // Single, ultra-smooth TextureView with hardware acceleration
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
                 TextureView(ctx).apply {
                     setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                        override fun onSurfaceTextureAvailable(
-                            st: android.graphics.SurfaceTexture,
-                            width: Int,
-                            height: Int
-                        ) {
-                            surfaceHolder[0] = Surface(st)
-                            switchVideo(targetAsset)
-                        }
-
-                        override fun onSurfaceTextureSizeChanged(
-                            st: android.graphics.SurfaceTexture,
-                            width: Int,
-                            height: Int
-                        ) {}
-
-                        override fun onSurfaceTextureDestroyed(st: android.graphics.SurfaceTexture): Boolean {
-                            try {
-                                playerHolder[0]?.stop()
-                                playerHolder[0]?.release()
-                                playerHolder[0] = null
-                                surfaceHolder[0]?.release()
-                                surfaceHolder[0] = null
-                            } catch (ignored: Exception) {}
-                            return true
-                        }
-
-                        override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) {}
+                    addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                        applyCenterCropTransform(v as? TextureView, currentVideoSize)
                     }
+                    textureViewRef = this
+                    exoPlayer.setVideoTextureView(this)
                 }
+            },
+            update = { tv ->
+                if (textureViewRef !== tv) {
+                    textureViewRef = tv
+                    exoPlayer.setVideoTextureView(tv)
+                }
+                applyCenterCropTransform(tv, currentVideoSize)
             }
         )
 
